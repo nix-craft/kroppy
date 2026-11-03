@@ -220,6 +220,19 @@ class MainWindow(QKMainWindow):
         self.ui.actionNewSelectionGrid.triggered.connect(self.slotNewSelectionGrid)
         self.ui.actionTrimMargins.triggered.connect(self.slotTrimMargins)
         self.ui.actionTrimMarginsAll.triggered.connect(self.slotTrimMarginsAll)
+        # [trim-all-pages patch] "Trim Margins on all pages" (individual mode)
+        self.actionTrimMarginsEveryPage = QAction(self.tr("Trim Margins on all pages"), self)
+        self.actionTrimMarginsEveryPage.setObjectName("actionTrimMarginsEveryPage")
+        self.actionTrimMarginsEveryPage.setIcon(QIcon.fromTheme('transform-crop'))
+        self.actionTrimMarginsEveryPage.setShortcut(self.tr("Ctrl+Shift+T"))
+        self.actionTrimMarginsEveryPage.triggered.connect(self.slotTrimMarginsEveryPage)
+        _acts = self.ui.toolBar.actions()
+        _i = _acts.index(self.ui.actionTrimMarginsAll)
+        if _i + 1 < len(_acts):
+            self.ui.toolBar.insertAction(_acts[_i+1], self.actionTrimMarginsEveryPage)
+        else:
+            self.ui.toolBar.addAction(self.actionTrimMarginsEveryPage)
+        self.updateTrimEveryPageAction()
         self.ui.documentView.customContextMenuRequested.connect(self.slotContextMenu)
         self.ui.editCurrentPage.textEdited.connect(self.slotCurrentPageEdited)
         self.ui.radioSelAll.toggled.connect(self.slotSelectionMode)
@@ -345,6 +358,7 @@ class MainWindow(QKMainWindow):
                             "Please check the file and its permissions."))
             self.ui.actionKrop.setEnabled(not self.viewer.isEmpty())
             self.ui.actionTrimMarginsAll.setEnabled(not self.viewer.isEmpty())
+            self.updateTrimEveryPageAction()
             self.ui.editFile.setText(outputFileName)
             self.updateControls()
 
@@ -509,6 +523,7 @@ class MainWindow(QKMainWindow):
                 enableExceptions = False
                 self.selections.selectionMode = ViewerSelections.individual
             self.ui.editSelExceptions.setEnabled(enableExceptions)
+            self.updateTrimEveryPageAction()
 
     def slotSelExceptionsChanged(self):
         s = str(self.ui.editSelExceptions.text())
@@ -584,6 +599,7 @@ class MainWindow(QKMainWindow):
             popMenu.addAction(self.ui.actionTrimMargins)
         else:
             popMenu.addAction(self.ui.actionTrimMarginsAll)
+            popMenu.addAction(self.actionTrimMarginsEveryPage)
         popMenu.exec_(self.ui.documentView.mapToGlobal(pos))
 
     def slotDeleteSelection(self):
@@ -679,6 +695,50 @@ class MainWindow(QKMainWindow):
             sel = self.selections.addSelection()
             self.trimMarginsSelection(sel)
         self.pdfScene.update()
+
+    def updateTrimEveryPageAction(self):
+        # [trim-all-pages patch]
+        act = getattr(self, 'actionTrimMarginsEveryPage', None)
+        if act is None:
+            return
+        individual = self.ui.radioSelIndividual.isChecked()
+        act.setEnabled(individual and not self.viewer.isEmpty())
+        if individual:
+            act.setToolTip(self.tr("Trim margins on every page, giving each page its own crop box"))
+        else:
+            act.setToolTip(self.tr("Only available when selections apply to individual pages "
+                "(Basic tab: 'Individual pages')"))
+
+    def slotTrimMarginsEveryPage(self):
+        # [trim-all-pages patch] for every page, trim its own selections (or
+        # create one) using only that page's image
+        if self.viewer.isEmpty() or not self.ui.radioSelIndividual.isChecked():
+            return
+        n = self.viewer.numPages()
+        orig = self.viewer.currentPageIndex
+        useAll = self.ui.checkTrimUseAllPages.isChecked()
+        self.ui.checkTrimUseAllPages.setChecked(False)
+        progress = QProgressDialog(self.tr("Trimming margins..."), self.tr("Cancel"), 0, n, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(500)
+        try:
+            for idx in range(n):
+                progress.setValue(idx)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    break
+                self.viewer.currentPageIndex = idx
+                sels = [s for s in self.selections.items if s.selectionVisibleOnPage(idx)]
+                if not sels:
+                    sels = [self.selections.addSelection()]
+                for sel in sels:
+                    self.trimMarginsSelection(sel)
+            progress.setValue(n)
+        finally:
+            self.ui.checkTrimUseAllPages.setChecked(useAll)
+            self.viewer.currentPageIndex = orig
+            self.pdfScene.update()
+            self.updateControls()
 
     def slotTrimMargins(self):
         if self.selections.currentSelection is not None:
