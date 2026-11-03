@@ -49,6 +49,7 @@ def main():
     parser.add_argument('--trim-use', type=str, choices=['initial', 'all'], help='whether to inspect only the initial page or all pages (slow!) when auto trimming (default: previous value)')
     parser.add_argument('--trim-padding', help='how much padding to include when auto trimming (default: previous value)')
 
+    parser.add_argument('--log', help='append a live activity log to this file (default: $KROP_LOG; "off" disables)')
     parser.add_argument('--go', action='store_true', help='output PDF without opening the krop GUI (using the choices supplied on the command line); if used in a script without X server access, you can run krop using xvfb-run')
 
     parser.add_argument('--no-kde', action='store_true', help='do not use KDE libraries (default: use if available)')
@@ -78,8 +79,12 @@ def main():
     app.setOrganizationName("arminstraub.com")
     app.setOrganizationDomain("arminstraub.com")
 
+    import os
+    from krop.activitylog import install as _installLog, patch_classes
+    patch_classes(args.log or os.environ.get('KROP_LOG'))
     from krop.mainwindow import MainWindow
     window=MainWindow()
+    _installLog(window, args.log or os.environ.get('KROP_LOG'))
 
     if args.file is not None:
         fileName = args.file
