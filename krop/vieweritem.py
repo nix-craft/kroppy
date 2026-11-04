@@ -16,21 +16,7 @@ the Free Software Foundation; either version 3 of the License, or
 from krop.config import PYQT5
 from krop.qt import *
 
-if PYQT5:
-    try:
-        from popplerqt5 import Poppler
-    except ImportError:
-        _msg = "Please install popplerqt5 first."
-        raise RuntimeError(_msg)
-else:
-    try:
-        from popplerqt4 import Poppler
-    except ImportError:
-        _msg = "Please install popplerqt4 first."\
-            "\n\tOn recent versions of Ubuntu, the following should do the trick:"\
-            "\n\tsudo apt-get install python-poppler-qt4"\
-            "\n\t(or, if using python3) sudo apt-get install python3-poppler-qt4"
-        raise RuntimeError(_msg)
+from krop import backend
 
 from krop.viewerselections import ViewerSelections
 
@@ -147,43 +133,40 @@ class AbstractViewerItem(QGraphicsItem):
         return self.selections.cropValues(idx)
 
 
-class PopplerViewerItem(AbstractViewerItem):
-    """Viewer implementation which uses Poppler to display PDF documents."""
+class PdfViewerItem(AbstractViewerItem):
+    """Viewer implementation which uses krop.backend (PyMuPDF) to display
+    PDF documents."""
     def reset(self):
         AbstractViewerItem.reset(self)
+        if getattr(self, '_pdfdoc', None) is not None:
+            self._pdfdoc.close()
         self._pdfdoc = None
 
     def doLoad(self, filename):
-        self._pdfdoc = Poppler.Document.load(filename)
-        if self._pdfdoc:
-            self._pdfdoc.setRenderHint(Poppler.Document.Antialiasing and
-                    Poppler.Document.TextAntialiasing)
+        self._pdfdoc = backend.load(filename)
 
     def numPages(self):
-        if self._pdfdoc is None:    
+        if self._pdfdoc is None:
             return 0
         else:
             return self._pdfdoc.numPages()
 
-    def cacheImage(self, idx):        
-        page = self._pdfdoc.page(idx)
-        return page.renderToImage(96.0, 96.0)
-        # return page.renderToImage()
+    def cacheImage(self, idx):
+        return self._pdfdoc.renderPage(idx, 96.0)
 
     def cropValues(self, idx):
         def adjustForOrientation(cv):
-            if o == page.Landscape:
+            if o == 90:
                 return [ cv[1], cv[2], cv[3], cv[0] ]
-            elif o == page.UpsideDown:
+            elif o == 180:
                 return [ cv[2], cv[3], cv[0], cv[1] ]
-            elif o == page.Seascape:
+            elif o == 270:
                 return [ cv[3], cv[0], cv[1], cv[2] ]
-            else: # o == page.Portrait
+            else:
                 return cv
-        page = self._pdfdoc.page(idx)
-        o = page.orientation()
+        o = self._pdfdoc.rotation(idx)
         return [ adjustForOrientation(cv)
                 for cv in self.selections.cropValues(idx) ]
 
 
-ViewerItem = PopplerViewerItem
+ViewerItem = PdfViewerItem
