@@ -38,8 +38,19 @@ def _fmt(v):
 
 def traced(fn, name=None):
     name = name or fn.__qualname__
+    # Qt only passes extra signal args (e.g. triggered's `checked`) to slots
+    # that accept them; *a would accept everything, so drop the surplus.
+    import inspect
+    try:
+        ps = inspect.signature(fn).parameters.values()
+        nmax = None if any(p.kind == p.VAR_POSITIONAL for p in ps) else \
+            sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in ps)
+    except (TypeError, ValueError):
+        nmax = None
     @functools.wraps(fn)
     def w(*a, **k):
+        if nmax is not None:
+            a = a[:nmax]
         args = [ _fmt(x) for x in a if not hasattr(x, 'ui') ]
         args += ["%s=%s" % (kk, _fmt(vv)) for kk, vv in k.items()]
         log("CALL", "%s(%s)" % (name, ", ".join(args)))
