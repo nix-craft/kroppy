@@ -76,6 +76,9 @@ def _bounds(p, dust, mingap, maxsearch, width, solid=0.3):
     return a, n - b
 
 
+PAD_RB = 1
+
+
 def copierTrimMargins(img, r, minr, dust=4, gapfrac=0.005, searchfrac=0.25):
     r = QRect(r).intersected(img.rect())
     if r.width() < 10 or r.height() < 10:
@@ -93,6 +96,9 @@ def copierTrimMargins(img, r, minr, dust=4, gapfrac=0.005, searchfrac=0.25):
         # rotate(90) makes original columns into rows, in order
         a, b = _bounds(cols, dust, max(3, int(r.width()*gapfrac)), int(r.width()*searchfrac), cy1 - cy0)
         cx0, cx1 = x0 + a, x0 + b
+    # PyMuPDF renders the scan about half a pixel off from poppler, which left
+    # the right/bottom edge 1px tighter than krop 0.6; pad those sides by 1px.
+    cx1, cy1 = min(x1, cx1 + PAD_RB), min(y1, cy1 + PAD_RB)
     nr = QRect(cx0, cy0, cx1 - cx0, cy1 - cy0)
     if minr is not None:
         nr = nr.united(minr)
