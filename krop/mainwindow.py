@@ -29,6 +29,7 @@ from krop.viewerselections import ViewerSelections, aspectRatioFromStr
 from krop.vieweritem import ViewerItem
 from krop.pdfcropper import PdfFile, PdfCropper, PdfEncryptedError, optimizePdfGhostscript
 from krop.autotrim import autoTrimMargins
+from krop.copiertrim import copierTrimMargins
 
 
 class AspectRatioType:
@@ -217,6 +218,21 @@ class MainWindow(QMainWindow):
         else:
             self.ui.toolBar.addAction(self.actionTrimMarginsEveryPage)
         self.updateTrimEveryPageAction()
+        # [copier-trim patch] copier-aware trim + dust filter on the toolbar
+        self.checkCopierTrim = QCheckBox(self.tr("Copier trim"), self)
+        self.checkCopierTrim.setToolTip(self.tr("Skip the black scanner edge and the white gap, then trim to the page content"))
+        self.spinDust = QSpinBox(self)
+        self.spinDust.setRange(0, 500)
+        self.spinDust.setPrefix(self.tr("Dust "))
+        self.spinDust.setSuffix(" px")
+        self.spinDust.setToolTip(self.tr("Copier trim: rows/columns with fewer dark pixels than this (in krop's preview) count as blank"))
+        _s = QSettings()
+        self.checkCopierTrim.setChecked(_s.value("Trim/CopierTrim", "true") == "true")
+        self.spinDust.setValue(int(_s.value("Trim/Dust", "4")))
+        self.checkCopierTrim.toggled.connect(lambda v: QSettings().setValue("Trim/CopierTrim", "true" if v else "false"))
+        self.spinDust.valueChanged.connect(lambda v: QSettings().setValue("Trim/Dust", str(v)))
+        self.ui.toolBar.addWidget(self.checkCopierTrim)
+        self.ui.toolBar.addWidget(self.spinDust)
         self.ui.documentView.customContextMenuRequested.connect(self.slotContextMenu)
         self.ui.editCurrentPage.textEdited.connect(self.slotCurrentPageEdited)
         self.ui.radioSelAll.toggled.connect(self.slotSelectionMode)
@@ -749,7 +765,10 @@ class MainWindow(QMainWindow):
             for idx in pages:
                 # calculate values for trimming
                 img = self.viewer.getImage(idx)
-                nrect = autoTrimMargins(img, orect, nrect, sensitivity, allowedchanges)
+                if getattr(self, 'checkCopierTrim', None) is not None and self.checkCopierTrim.isChecked():
+                    nrect = copierTrimMargins(img, orect, nrect, dust=self.spinDust.value())
+                else:
+                    nrect = autoTrimMargins(img, orect, nrect, sensitivity, allowedchanges)
 
             orect = QRectF(orect)
             nrect = QRectF(nrect)
