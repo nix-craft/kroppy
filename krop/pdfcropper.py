@@ -109,6 +109,7 @@ class SemiAbstractPdfCropper(AbstractPdfCropper):
             for crop in croplist:
                 new_page = copy.copy(page)
                 new_box = computeCropBoxCoords(box, crop)
+                self.pageRememberFullBox(new_page)
                 self.pageSetCropBox(new_page, new_box)
                 self.doAddPage(new_page, rotate)
     def doAddPage(self, page, rotate):
@@ -116,6 +117,10 @@ class SemiAbstractPdfCropper(AbstractPdfCropper):
     def pageGetCropBox(self, page):
         pass
     def pageSetCropBox(self, page, box):
+        pass
+    def pageRememberFullBox(self, page):
+        """Store the uncropped page (MediaBox) in the private /KropFullBox key
+        (unless already there) so that krop can reopen the crop for editing."""
         pass
 
 class PyPdfCropper(SemiAbstractPdfCropper):
@@ -144,6 +149,12 @@ class PyPdfCropper(SemiAbstractPdfCropper):
         for page_box in (page.artbox, page.bleedbox, page.cropbox, page.mediabox, page.trimbox):
             page_box.lower_left = (x0, y0)
             page_box.upper_right = (x1, y1)
+    def pageRememberFullBox(self, page):
+        from pypdf.generic import NameObject, ArrayObject, FloatObject
+        if '/KropFullBox' not in page:
+            (a, b), (c, d) = page.mediabox.lower_left, page.mediabox.upper_right
+            page[NameObject('/KropFullBox')] = ArrayObject(
+                [FloatObject(float(v)) for v in (a, b, c, d)])
     def copyDocumentRoot(self, pdffile):
         # Copy the named destinations for links.
         # TODO: this worked for links in PyPDF2 but doesn't seem to work for pypdf
@@ -165,6 +176,12 @@ class PyPdfOldCropper(PyPdfCropper):
         for page_box in (page.artBox, page.bleedBox, page.cropBox, page.mediaBox, page.trimBox):
             page_box.lowerLeft = (x0, y0)
             page_box.upperRight = (x1, y1)
+    def pageRememberFullBox(self, page):
+        from PyPDF2.generic import NameObject, ArrayObject, FloatObject
+        if '/KropFullBox' not in page:
+            (a, b), (c, d) = page.mediaBox.lowerLeft, page.mediaBox.upperRight
+            page[NameObject('/KropFullBox')] = ArrayObject(
+                [FloatObject(float(v)) for v in (a, b, c, d)])
     def copyDocumentRoot(self, pdffile):
         # Copy the named destinations for links.
         for dest in pdffile.reader.namedDestinations.values():
@@ -193,6 +210,7 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
                 # PDF where (0,0) is the bottom-left.
                 new_box = computeCropBoxCoords(box, crop, pdf_coords=False)
                 self.pageSetCropBox(new_page, new_box)
+                self.pageShrinkMediaBox(new_page)
                 # if rotate != 0:
                 #     self.pageRotateClockwise(new_page, rotate)
     def pageGetCropBox(self, page):
@@ -208,6 +226,24 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
         except:
             # these functions did not exist prior to v1.19.4
             pass
+    def pageShrinkMediaBox(self, page):
+        """Local patch: like krop 0.6 (and the other backends), also set the
+        MediaBox to the crop so that tools ignoring the CropBox see the cropped
+        page; remember the full page in /KropFullBox for crop recovery.
+        We copy the CropBox as written in the PDF (PDF coordinates), since
+        MuPDF's page.cropbox is in MuPDF (top-left origin) coordinates."""
+        doc = page.parent
+        xref = page.xref
+        if doc.xref_get_key(xref, "KropFullBox")[0] == "null":
+            kind, mb = doc.xref_get_key(xref, "MediaBox")
+            if kind != "array":     # inherited from the page tree
+                m = page.mediabox   # PDF coordinates
+                mb = "[%g %g %g %g]" % (m.x0, m.y0, m.x1, m.y1)
+            doc.xref_set_key(xref, "KropFullBox", mb)
+        kind, cb = doc.xref_get_key(xref, "CropBox")
+        if kind == "array":
+            for key in ("MediaBox", "CropBox", "TrimBox", "ArtBox", "BleedBox"):
+                doc.xref_set_key(xref, key, cb)
     def copyDocumentRoot(self, pdffile):
         pass
 
@@ -228,6 +264,10 @@ class PikePdfCropper(SemiAbstractPdfCropper):
             return page.cropbox
         except AttributeError:
             raise RuntimeError("Please install a more recent version of pikepdf.")
+    def pageRememberFullBox(self, page):
+        from pikepdf import Name, Array
+        if Name.KropFullBox not in page.obj:
+            page.obj[Name.KropFullBox] = Array([float(v) for v in page.mediabox])
     def pageSetCropBox(self, page, box):
         page.cropbox = box
         page.mediabox = box
