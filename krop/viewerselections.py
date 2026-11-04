@@ -58,7 +58,7 @@ class ViewerSelections(object):
             self.autoSetCurrentSelection()
 
     def deleteSelections(self):
-        for s in self.items:
+        for s in list(self.items):  # copy: deleteSelection mutates items
             self.deleteSelection(s)
 
     def getCurrentSelection(self):

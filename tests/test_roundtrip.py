@@ -80,3 +80,24 @@ def test_no_recover(window, scan, tmp_path, qapp):
     # opened as-is: no recovered selections spanning less than the page
     cv = w.viewer.cropValues(0)
     assert all(max(c) < 0.01 for c in cv) or cv == [], cv
+
+
+def test_reopen_same_window(window, scan, tmp_path, qapp):
+    """Reopening the saved file in the window that cropped it must not
+    keep the old selections alongside the recovered ones."""
+    w = window
+    w.openFile(scan)
+    crops = trimmed(w)
+    out = str(tmp_path / "out.pdf")
+    w.ui.editFile.setText(out)
+    w.ui.checkGhostscript.setChecked(False)
+    w.slotKrop()
+    w.openFile(out)
+    qapp.processEvents()
+    for i in range(4):
+        cv = w.viewer.cropValues(i)
+        assert len(cv) == 1, (i + 1, cv)
+        for x, y in zip(crops[i][0], cv[0]):
+            assert abs(x - y) < 0.003
+    assert len(w.selections.items) == 4
+    no_errors(w)
