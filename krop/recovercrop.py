@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Recover existing crop boxes when opening a PDF (local patch, Nov 2026).
 
-If any page's CropBox is smaller than its MediaBox, write a copy of the PDF
-with every CropBox reset to the MediaBox (so krop shows the full page) and
-return the old crops as krop crop fractions (left, top, right, bottom).
+The full page is the private /KropFullBox that our krop writes when cropping
+(it also shrinks the MediaBox, like stock krop), else the MediaBox.  If any
+page's CropBox is smaller than its full page, write a copy with every box reset
+to the full page (so krop shows it uncropped) and return the old crops as krop
+crop fractions (left, top, right, bottom).
 """
 import os, tempfile
 
@@ -18,6 +20,13 @@ def _box(b):
     return float(x0), float(y0), float(x1), float(y1)
 
 
+def _full(p):
+    fb = p.get('/KropFullBox')
+    if fb is not None and len(fb) == 4:
+        return tuple(float(v) for v in fb)
+    return _box(p.mediaBox)
+
+
 def expandCropped(path, eps=0.5):
     """Returns (fullPdfPath, [crop fractions per page]) or None if nothing is cropped."""
     with open(path, 'rb') as f:
@@ -29,7 +38,7 @@ def expandCropped(path, eps=0.5):
             p = reader.getPage(i)
             if int(p.get('/Rotate', 0) or 0) % 360:
                 return None              # rotated pages: leave as is
-            mx0, my0, mx1, my1 = _box(p.mediaBox)
+            mx0, my0, mx1, my1 = _full(p)
             cx0, cy0, cx1, cy1 = _box(p.cropBox)
             mw, mh = mx1 - mx0, my1 - my0
             c = ((cx0 - mx0) / mw, (my1 - cy1) / mh, (mx1 - cx1) / mw, (cy0 - my0) / mh)
@@ -42,8 +51,9 @@ def expandCropped(path, eps=0.5):
         writer = PdfFileWriter()
         for i in range(reader.getNumPages()):
             p = reader.getPage(i)
-            for b in (p.cropBox, p.trimBox, p.artBox, p.bleedBox):
-                b.lowerLeft, b.upperRight = p.mediaBox.lowerLeft, p.mediaBox.upperRight
+            x0, y0, x1, y1 = _full(p)
+            for b in (p.mediaBox, p.cropBox, p.trimBox, p.artBox, p.bleedBox):
+                b.lowerLeft, b.upperRight = (x0, y0), (x1, y1)
             writer.addPage(p)
         d = os.path.join(os.path.expanduser('~/.cache'), 'krop-trimall')
         os.makedirs(d, exist_ok=True)

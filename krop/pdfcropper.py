@@ -104,8 +104,18 @@ class PyPdfCropper(AbstractPdfCropper):
         x0, x1 = x0+crop[0]*(x1-x0), x1-crop[2]*(x1-x0)
         y0, y1 = y0+crop[3]*(y1-y0), y1-crop[1]*(y1-y0)
         # Update the various PDF boxes
-        # keep the MediaBox (local patch) so the crop can be recovered and edited later
-        for box in (page.artBox, page.bleedBox, page.cropBox, page.trimBox):
+        # Like stock krop, also set the MediaBox so tools that ignore the
+        # CropBox see the cropped page.  Local patch: remember the full page in
+        # a private /KropFullBox key so krop can reopen the crop for editing.
+        try:
+            from PyPDF2.generic import NameObject, ArrayObject, FloatObject
+            if '/KropFullBox' not in page:
+                (a, b), (c, d) = page.mediaBox.lowerLeft, page.mediaBox.upperRight
+                page[NameObject('/KropFullBox')] = ArrayObject(
+                    [FloatObject(float(v)) for v in (a, b, c, d)])
+        except Exception:
+            pass
+        for box in (page.artBox, page.bleedBox, page.cropBox, page.mediaBox, page.trimBox):
             box.lowerLeft = (x0, y0)
             box.upperRight = (x1, y1)
         if rotate != 0:
