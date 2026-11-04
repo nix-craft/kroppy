@@ -401,7 +401,7 @@ class MainWindow(QMainWindow):
     def slotOpenFile(self):
         # non-native dialog so we can add the "recover crop boxes" checkbox
         dlg = QFileDialog(self, self.tr("Open PDF"), "",
-                self.tr("PDF Files (*.pdf)"))
+                self.tr("PDF Files (*.pdf *.PDF);;All Files (*)"))
         dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
         dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
         check = QCheckBox(self.tr("Show existing crop boxes as editable selections (open at full page size)"), dlg)
@@ -420,7 +420,7 @@ class MainWindow(QMainWindow):
 
     def slotSelectFile(self):
         fileName = QFileDialog.getSaveFileName(self,
-                self.tr("Save cropped PDF to ..."), "", self.tr("PDF Files (*.pdf)"))
+                self.tr("Save cropped PDF to ..."), "", self.tr("PDF Files (*.pdf *.PDF)"))
                 # None, QFileDialog.DontConfirmOverwrite)
         try:
             self.ui.editFile.setText(fileName)
