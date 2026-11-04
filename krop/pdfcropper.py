@@ -193,7 +193,11 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
     def __init__(self):
         self.output = self.pymupdf.open()
     def writeToStream(self, stream):
-        self.output.save(stream)
+        stream.write(self.output.tobytes())
+    def writeToFile(self, filename):
+        # Don't hand PyMuPDF an open file object: it saves via the object's
+        # filename and on Windows can't replace a file we hold open.
+        self.output.save(filename)
     def addPageCropped(self, pdffile, pagenumber, croplist, alwaysinclude, rotate=0):
         def addPage():
             # https://pymupdf.readthedocs.io/en/latest/the-basics.html
