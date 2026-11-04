@@ -104,7 +104,8 @@ class PyPdfCropper(AbstractPdfCropper):
         x0, x1 = x0+crop[0]*(x1-x0), x1-crop[2]*(x1-x0)
         y0, y1 = y0+crop[3]*(y1-y0), y1-crop[1]*(y1-y0)
         # Update the various PDF boxes
-        for box in (page.artBox, page.bleedBox, page.cropBox, page.mediaBox, page.trimBox):
+        # keep the MediaBox (local patch) so the crop can be recovered and edited later
+        for box in (page.artBox, page.bleedBox, page.cropBox, page.trimBox):
             box.lowerLeft = (x0, y0)
             box.upperRight = (x1, y1)
         if rotate != 0:

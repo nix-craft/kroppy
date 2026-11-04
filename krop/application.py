@@ -52,6 +52,7 @@ def main():
     parser.add_argument('--log', help='append a live activity log to this file (default: $KROP_LOG; "off" disables)')
     parser.add_argument('--go', action='store_true', help='output PDF without opening the krop GUI (using the choices supplied on the command line); if used in a script without X server access, you can run krop using xvfb-run')
 
+    parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
     parser.add_argument('--no-kde', action='store_true', help='do not use KDE libraries (default: use if available)')
     parser.add_argument('--no-qt5', action='store_true', help='do not use PyQt5 instead of PyQt4 (default: use PyQt5 if available)')
     parser.add_argument('--no-PyPDF2', action='store_true', help='do not use PyPDF2 instead of pyPdf (default: use PyPDF2 if available)')
@@ -93,7 +94,7 @@ def main():
         except AttributeError:
             # not necessary (or possible) in python3, which uses unicode
             pass
-        window.openFile(fileName)
+        window.openFile(fileName, False if args.no_recover_crops else None)
 
     if args.output is not None:
         window.ui.editFile.setText(args.output)
