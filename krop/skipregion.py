@@ -30,6 +30,26 @@ def _blank(p, dust):
     return blank
 
 
+def _close_gaps(blank, mingap):
+    """Treat white runs shorter than `mingap` that lie between two ink bands as
+    ink, so only white space at least `mingap` rows/cols long breaks a region."""
+    if mingap <= 1:
+        return blank
+    b, n, i = list(blank), len(blank), 0
+    while i < n:
+        if not b[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and b[j]:
+            j += 1
+        if i > 0 and j < n and (j - i) < mingap:
+            for k in range(i, j):
+                b[k] = False
+        i = j
+    return b
+
+
 def _skip_once(blank, touch=PAD_RB + 1):
     """Inward index of the first row of the next ink band after removing one
     ink band plus adjoining white; None if there is no further ink.
@@ -48,7 +68,7 @@ def _skip_once(blank, touch=PAD_RB + 1):
     return k if k < n else None
 
 
-def skip_region(img, rect, edge, n=1, dust=4):
+def skip_region(img, rect, edge, n=1, dust=4, mingap=1):
     """Return the new coordinate of `edge` of QRect `rect` (image pixels) after
     `n` skips, or None if there is no further ink before the opposite edge.
 
@@ -62,7 +82,7 @@ def skip_region(img, rect, edge, n=1, dust=4):
     p = _profile(img, r, edge in ("top", "bottom"))
     if edge in ("bottom", "right"):
         p = p[::-1]
-    blank = _blank(p, dust)
+    blank = _close_gaps(_blank(p, dust), mingap)
     off = 0
     for _ in range(max(1, n)):
         k = _skip_once(blank[off:])
@@ -79,10 +99,10 @@ def skip_region(img, rect, edge, n=1, dust=4):
     return min(end, end - off + PAD_RB)
 
 
-def skip_rect(img, rect, edge, n=1, dust=4):
+def skip_rect(img, rect, edge, n=1, dust=4, mingap=1):
     """Apply skip_region to a QRect; returns (newrect, moved_px) or (None, 0)."""
     r = QRect(rect).intersected(img.rect())
-    v = skip_region(img, r, edge, n, dust)
+    v = skip_region(img, r, edge, n, dust, mingap)
     if v is None:
         return None, 0
     x0, y0 = r.left(), r.top()

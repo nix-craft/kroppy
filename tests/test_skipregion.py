@@ -83,3 +83,21 @@ def test_left_right(qapp):
 def test_bad_edge(qapp):
     with pytest.raises(ValueError):
         sr(make(), "middle")
+
+
+def test_min_gap_merges_small_gaps(qapp):
+    """Header 20..39, then a 10px gap, a subheader 50..59, then the body at 100.
+    With min gap 1 the first skip stops at the subheader; with min gap 20 the
+    10px gap no longer counts as a break, so header+subheader skip together."""
+    from krop.skipregion import skip_region
+    img = make()
+    p = QPainter(img)
+    p.fillRect(QRect(50, 50, 300, 10), QColor(0, 0, 0))   # subheader 50..59
+    p.end()
+    assert skip_region(img, img.rect(), "top", 1, 4, mingap=1) == 50
+    assert skip_region(img, img.rect(), "top", 1, 4, mingap=20) == 100
+    # the 40px gap before the body still breaks at min gap 40, but not at 41
+    assert skip_region(img, img.rect(), "top", 1, 4, mingap=40) == 100
+    assert skip_region(img, img.rect(), "top", 1, 4, mingap=41) == 560
+    # starting in white: the leading margin is never merged into the region
+    assert skip_region(img, QRect(0, 5, 400, 595), "top", 1, 4, mingap=20) == 100

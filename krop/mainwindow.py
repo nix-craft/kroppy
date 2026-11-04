@@ -235,6 +235,16 @@ class MainWindow(QMainWindow):
         self.spinDust.valueChanged.connect(lambda v: QSettings().setValue("Trim/Dust", str(v)))
         self.ui.toolBar.addWidget(self.checkCopierTrim)
         self.ui.toolBar.addWidget(self.spinDust)
+        # [skip-region patch] minimum white gap that counts as a break between regions
+        self.spinMinGap = QSpinBox(self)
+        self.spinMinGap.setRange(1, 500)
+        self.spinMinGap.setPrefix(self.tr("Min gap "))
+        self.spinMinGap.setSuffix(" px")
+        self.spinMinGap.setToolTip(self.tr("Skip region: white space must be at least this many rows/columns "
+            "(in krop's preview) to count as a break; smaller gaps are skipped as part of the same region"))
+        self.spinMinGap.setValue(int(_s.value("Skip/MinGap", "1")))
+        self.spinMinGap.valueChanged.connect(lambda v: QSettings().setValue("Skip/MinGap", str(v)))
+        self.ui.toolBar.addWidget(self.spinMinGap)
         self.ui.documentView.customContextMenuRequested.connect(self.slotContextMenu)
         self.ui.editCurrentPage.textEdited.connect(self.slotCurrentPageEdited)
         self.ui.radioSelAll.toggled.connect(self.slotSelectionMode)
@@ -927,7 +937,8 @@ class MainWindow(QMainWindow):
         dust = self.spinDust.value() if getattr(self, 'spinDust', None) is not None else 4
         moved = 0
         pad = self.getPadding() or [0, 0, 0, 0]   # [top, right, bottom, left]
-        log("SKIP", "padding t,r,b,l = %s" % (pad,))
+        mingap = self.spinMinGap.value() if getattr(self, 'spinMinGap', None) is not None else 1
+        log("SKIP", "padding t,r,b,l = %s, min gap %d px, dust %d" % (pad, mingap, dust))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             for k, idx in enumerate(pages):
@@ -949,7 +960,7 @@ class MainWindow(QMainWindow):
                 img = self.viewer.getImage(idx)
                 for e in edges:
                     orect = s.mapRectToImage(s.rect).toRect()
-                    nrect, d = skip_rect(img, orect, e, n, dust)
+                    nrect, d = skip_rect(img, orect, e, n, dust, mingap)
                     if nrect is None:
                         log("SKIP", "page %d %s: no further ink, unchanged" % (idx+1, e))
                         continue
