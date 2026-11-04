@@ -75,7 +75,8 @@ jobs:
 
       - name: PyInstaller
         run: |
-          ARGS=(--noconfirm --clean --name krop --windowed
+          ARGS=(--noconfirm --clean --name krop --windowed --paths .
+                --hidden-import krop.application --hidden-import krop.mainwindow
                 --collect-submodules krop --add-data "krop/mainwindow.ui${{ runner.os == 'Windows' && ';' || ':' }}krop"
                 --exclude-module PyQt5 --exclude-module popplerqt5 --exclude-module tkinter)
           if [ "$RUNNER_OS" = "macOS" ]; then ARGS+=(--osx-bundle-identifier com.arminstraub.krop); fi
@@ -126,11 +127,13 @@ jobs:
           echo "BIN=$PWD/out/krop-trimall-${{ steps.ver.outputs.v }}-windows-x64.exe" >> $GITHUB_ENV
 
       - name: Smoke test (headless open, trim, save)
+        timeout-minutes: 10
         run: |
           python packaging/make_test_pdf.py smoke.pdf
-          "$BIN" --version
-          "$BIN" --help > /dev/null
-          if [ "$RUNNER_OS" = "Windows" ]; then T="timeout 180"; else T=""; fi
+          T=""; command -v timeout >/dev/null && T="timeout 180"
+          command -v gtimeout >/dev/null && T="gtimeout 180"
+          $T "$BIN" --version
+          $T "$BIN" --help > /dev/null
           $T "$BIN" --go --trim --trim-use all --optimize no --log off -o smoke-out.pdf smoke.pdf
           python packaging/check_output.py smoke-out.pdf
 
