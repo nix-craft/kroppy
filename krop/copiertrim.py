@@ -5,8 +5,10 @@ Scans from a copier often have: solid black at the outer edge (the lid /
 platen shadow), then a white gap, then the real page content.  For each side
 this skips the black edge band and the white gap and trims to the content.
 
-dust: a row/column with fewer than `dust` dark pixels counts as blank, so
-small dust dots in the margins are ignored.
+dust: a band of consecutive non-empty rows/columns whose dark pixels add up
+to fewer than `dust` counts as blank, so small dust dots in the margins are
+ignored while thin content (a small page number, whose rows each have only a
+few dark pixels) is kept.
 """
 
 from krop.qt import *
@@ -34,15 +36,27 @@ def _profile(img, r, horizontal):
     return out
 
 
-def _bounds(p, dust, mingap, maxsearch):
+def _bounds(p, dust, mingap, maxsearch, width, solid=0.3):
     n = len(p)
-    blank = [c < dust for c in p]
+    blank = [c == 0 for c in p]
+    i = 0
+    while i < n:                     # drop small isolated bands (dust)
+        if blank[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not blank[j]:
+            j += 1
+        if sum(p[i:j]) < dust:
+            for k in range(i, j):
+                blank[k] = True
+        i = j
 
     def side(idx):
         first = next((k for k, i in enumerate(idx) if not blank[i]), None)
         if first is None:
             return None
-        edge = max(2, n // 50)
+        edge = max(8, n // 100)       # black edge must start within ~1% of the side
         if first > edge:             # margin already white at the edge
             return first
         run = 0                      # black at the edge: find the white gap
@@ -73,11 +87,11 @@ def copierTrimMargins(img, r, minr, dust=4, gapfrac=0.005, searchfrac=0.25):
     cy0, cy1 = y0 + r.height()//5, y1 - r.height()//5
     for _ in range(3):
         rows = _profile(img, QRect(cx0, y0, cx1 - cx0, y1 - y0), True)
-        a, b = _bounds(rows, dust, max(3, int(r.height()*gapfrac)), int(r.height()*searchfrac))
+        a, b = _bounds(rows, dust, max(3, int(r.height()*gapfrac)), int(r.height()*searchfrac), cx1 - cx0)
         cy0, cy1 = y0 + a, y0 + b
         cols = _profile(img, QRect(x0, cy0, x1 - x0, cy1 - cy0), False)
         # rotate(90) makes original columns into rows, in order
-        a, b = _bounds(cols, dust, max(3, int(r.width()*gapfrac)), int(r.width()*searchfrac))
+        a, b = _bounds(cols, dust, max(3, int(r.width()*gapfrac)), int(r.width()*searchfrac), cy1 - cy0)
         cx0, cx1 = x0 + a, x0 + b
     nr = QRect(cx0, cy0, cx1 - cx0, cy1 - cy0)
     if minr is not None:
