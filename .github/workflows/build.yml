@@ -1,9 +1,7 @@
 name: build
 
 on:
-  push:
-    branches: [next]
-    tags: ['v*']
+  # Manual only (Nick, Nov 4 2026): run from the Actions tab or `gh workflow run build`.
   workflow_dispatch:
 
 permissions:
