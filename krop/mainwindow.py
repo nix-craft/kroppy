@@ -343,12 +343,25 @@ class MainWindow(QMainWindow):
         self.selAspectRatioTypes.saveTypes(settings)
         self.deviceTypes.saveTypes(settings)
 
-    def openFile(self, fileName):
+    def openFile(self, fileName, recoverCrops=None):
         if fileName:
-            self.viewer.load(fileName)
+            if recoverCrops is None:
+                recoverCrops = self.recoverCrops
+            recovered = None
+            if recoverCrops:
+                try:
+                    from krop.recovercrop import expandCropped
+                    recovered = expandCropped(fileName)
+                except Exception as e:
+                    sys.stderr.write("krop: could not recover crop boxes: %r\n" % e)
+            self.viewer.load(recovered[0] if recovered else fileName)
             if not self.viewer.isEmpty():
-                self.fileName = fileName
+                # crop from the full-page copy, but name output after the original
+                self.fileName = recovered[0] if recovered else fileName
+                self.originalFileName = fileName
                 outputFileName = "%s-cropped.pdf" % splitext(fileName)[0]
+                if recovered:
+                    self.applyRecoveredCrops(recovered[1])
                 self.slotFitInView(self.ui.actionFitInView.isChecked())
             else:
                 self.fileName = ''
@@ -356,18 +369,54 @@ class MainWindow(QMainWindow):
                 self.showWarning(self.tr("Something got in our way"),
                         self.tr("The PDF file couldn't be read. "
                             "Please check the file and its permissions."))
-            self.setWindowFilePath(self.fileName)
+            self.setWindowFilePath(fileName if self.fileName else '')
             self.ui.actionKrop.setEnabled(not self.viewer.isEmpty())
             self.ui.actionTrimMarginsAll.setEnabled(not self.viewer.isEmpty())
             self.updateTrimEveryPageAction()
             self.ui.editFile.setText(outputFileName)
             self.updateControls()
 
+    def applyRecoveredCrops(self, crops):
+        """Show each page's previous crop as an individual, editable selection."""
+        sels = self.selections
+        sels.deleteSelections()
+        self.ui.radioSelIndividual.setChecked(True)
+        sels.selectionMode = ViewerSelections.individual
+        cur = self.viewer.currentPageIndex
+        for idx, (l, t, r, b) in enumerate(crops):
+            self.viewer.currentPageIndex = idx
+            img = self.viewer.getImage(idx)
+            w, h = img.width(), img.height()
+            s = sels.addSelection()
+            s.pageIndex = idx
+            s.rect = s.mapRectFromImage(QRectF(l*w, t*h, w*(1-l-r), h*(1-t-b)))
+            s.adjustBoundingRect()
+        self.viewer.currentPageIndex = cur if cur < len(crops) else 0
+        sels.updateSelectionVisibility()
+
+    @property
+    def recoverCrops(self):
+        return QSettings().value("Open/RecoverCrops", "true") != "false"
+
     def slotOpenFile(self):
-        fileName = QFileDialog.getOpenFileName(self,
-             self.tr("Open PDF"), "", self.tr("PDF Files (*.pdf)"));
-        fileName = fileName[0]
-        self.openFile(fileName)
+        # non-native dialog so we can add the "recover crop boxes" checkbox
+        dlg = QFileDialog(self, self.tr("Open PDF"), "",
+                self.tr("PDF Files (*.pdf)"))
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        check = QCheckBox(self.tr("Show existing crop boxes as editable selections (open at full page size)"), dlg)
+        check.setChecked(self.recoverCrops)
+        lay = dlg.layout()
+        try:
+            lay.addWidget(check, lay.rowCount(), 0, 1, -1)
+        except TypeError:
+            lay.addWidget(check)
+        if not dlg.exec():
+            return
+        QSettings().setValue("Open/RecoverCrops", "true" if check.isChecked() else "false")
+        files = dlg.selectedFiles()
+        if files:
+            self.openFile(files[0], check.isChecked())
 
     def slotSelectFile(self):
         fileName = QFileDialog.getSaveFileName(self,

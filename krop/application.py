@@ -55,6 +55,7 @@ def main():
     parser.add_argument('--log', help='append a live activity log to this file (default: $KROP_LOG, else a temporary log in ~/.local/state/krop-trimall that is deleted on clean exit; "off" disables)')
     parser.add_argument('--go', action='store_true', help='output PDF without opening the krop GUI (using the choices supplied on the command line); if used in a script without X server access, you can run krop using xvfb-run')
 
+    parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
     parser.add_argument('--use-qt5', action='store_true', help='use PyQt5 instead of PyQt6 (default: use PyQt6 if available)')
     parser.add_argument('--use-pymupdf', action='store_true', help='use PyMuPDF for rendering and cropping (default)')
     parser.add_argument('--use-pikepdf', action='store_true', help='use pikepdf for cropping (PyQt5 only, default: use PyMuPDF)')
@@ -82,7 +83,7 @@ def main():
 
     if args.file is not None:
         fileName = args.file
-        window.openFile(fileName)
+        window.openFile(fileName, False if args.no_recover_crops else None)
 
     if args.output is not None:
         window.ui.editFile.setText(args.output)
