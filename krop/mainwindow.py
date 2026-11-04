@@ -30,6 +30,8 @@ from krop.vieweritem import ViewerItem
 from krop.pdfcropper import PdfFile, PdfCropper, PdfEncryptedError, optimizePdfGhostscript
 from krop.autotrim import autoTrimMargins
 from krop.copiertrim import copierTrimMargins
+from krop.activitylog import log
+from krop.skipregion import skip_rect, EDGES
 
 
 class AspectRatioType:
@@ -649,9 +651,12 @@ class MainWindow(QMainWindow):
         if menuForSelection:
             popMenu.addAction(self.ui.actionDeleteSelection)
             popMenu.addAction(self.ui.actionTrimMargins)
+            self.addSkipRegionMenu(popMenu, item, pos)
         else:
             popMenu.addAction(self.ui.actionTrimMarginsAll)
             popMenu.addAction(self.actionTrimMarginsEveryPage)
+        if getattr(self, '_skipUndo', None):
+            popMenu.addAction(self.tr("Undo last skip region"), self.slotUndoSkipRegion)
         popMenu.exec(self.ui.documentView.mapToGlobal(pos))
 
     def slotDeleteSelection(self):
@@ -791,6 +796,203 @@ class MainWindow(QMainWindow):
             self.viewer.currentPageIndex = orig
             self.pdfScene.update()
             self.updateControls()
+
+    # [skip-region patch] right-click > "Skip next region inward"
+    SKIP_SCOPES = ("page", "toend", "all")
+
+    def nearestEdge(self, item, pos):
+        from krop.viewerselections import SelectionHandleItem
+        roles = {SelectionHandleItem.TopHandle: "top", SelectionHandleItem.BottomHandle: "bottom",
+                 SelectionHandleItem.LeftHandle: "left", SelectionHandleItem.RightHandle: "right"}
+        if isinstance(item, SelectionHandleItem):
+            return roles[item.role]
+        sel = item.selection
+        pt = sel.mapFromScene(self.ui.documentView.mapToScene(pos))
+        r = sel.rect
+        d = {"top": abs(pt.y()-r.top()), "bottom": abs(pt.y()-r.bottom()),
+             "left": abs(pt.x()-r.left()), "right": abs(pt.x()-r.right())}
+        return min(d, key=d.get)
+
+    def addSkipRegionMenu(self, popMenu, item, pos):
+        sel = item.selection
+        near = self.nearestEdge(item, pos)
+        m = popMenu.addMenu(self.tr("Skip next region inward"))
+        names = {"top": self.tr("Top edge"), "bottom": self.tr("Bottom edge"),
+                 "left": self.tr("Left edge"), "right": self.tr("Right edge")}
+        order = [near] + [e for e in EDGES if e != near]
+        for e in order:
+            label = names[e] + (self.tr(" (nearest)") if e == near else "")
+            m.addAction(label, lambda e=e: self.skipRegion(sel, [e]))
+        m.addAction(self.tr("All four edges"), lambda: self.skipRegion(sel, list(EDGES)))
+        m.addSeparator()
+        grp = QActionGroup(m)
+        cur = self.skipScope
+        for key, label in zip(self.SKIP_SCOPES, (self.tr("This page only"),
+                self.tr("This page to end"), self.tr("All pages"))):
+            a = m.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(key == cur)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: setattr(self, 'skipScope', k))
+        if getattr(self, '_skipUndo', None):
+            m.addSeparator()
+            m.addAction(self.tr("Undo last skip region"), self.slotUndoSkipRegion)
+        return m
+
+    def getSkipScope(self):
+        v = QSettings().value("Skip/Scope", "page")
+        return v if v in self.SKIP_SCOPES else "page"
+
+    def setSkipScope(self, v):
+        QSettings().setValue("Skip/Scope", v)
+
+    skipScope = property(getSkipScope, setSkipScope)
+
+    def _selFrac(self, sel):
+        r, p = sel.mapRectToParent(sel.rect), self.viewer.irect
+        return ((r.left()-p.left())/p.width(), (r.top()-p.top())/p.height(),
+                r.width()/p.width(), r.height()/p.height())
+
+    def _setSelFrac(self, sel, f):
+        p = self.viewer.irect
+        r = QRectF(p.left()+f[0]*p.width(), p.top()+f[1]*p.height(), f[2]*p.width(), f[3]*p.height())
+        r = sel.mapRectFromParent(r)
+        sel.setBoundingRect(r.topLeft(), r.bottomRight())
+
+    def _splitToIndividual(self, undo):
+        """Give every page its own copy of each shared selection."""
+        sels = self.selections
+        n = self.viewer.numPages()
+        orig = self.viewer.currentPageIndex
+        undo["mode"] = (sels.selectionMode, sels.selectionExceptions)
+        shared = [(s, [i for i in range(n) if s.selectionVisibleOnPage(i)]) for s in sels.items]
+        sels.selectionExceptions = []
+        self.ui.radioSelIndividual.setChecked(True)
+        sels.selectionMode = ViewerSelections.individual
+        for s, pages in shared:
+            self.viewer.currentPageIndex = s.pageIndex
+            f = self._selFrac(s)
+            for i in pages:
+                if i == s.pageIndex:
+                    continue
+                self.viewer.currentPageIndex = i
+                c = sels.addSelection()
+                c.pageIndex = i
+                c.aspectRatioData = list(s.aspectRatioData)
+                self._setSelFrac(c, f)
+                undo["created"].append(c)
+        self.viewer.currentPageIndex = orig
+        sels.updateSelectionVisibility()
+        log("SKIP", "split shared selections into individual per-page selections (%d created)" % len(undo["created"]))
+
+    def _matchSel(self, f, idx):
+        """Selection on page idx that best overlaps fraction-rect f."""
+        best, bo = None, -1.0
+        for s in self.selections.items:
+            if not s.selectionVisibleOnPage(idx):
+                continue
+            g = self._selFrac(s)
+            ow = min(f[0]+f[2], g[0]+g[2]) - max(f[0], g[0])
+            oh = min(f[1]+f[3], g[1]+g[3]) - max(f[1], g[1])
+            o = max(0, ow) * max(0, oh)
+            if o > bo:
+                best, bo = s, o
+        return best
+
+    def skipRegion(self, sel, edges, scope=None, n=1):
+        if self.viewer.isEmpty() or sel is None:
+            return
+        scope = scope or self.skipScope
+        npages = self.viewer.numPages()
+        cur = self.viewer.currentPageIndex
+        pages = {"page": [cur], "toend": list(range(cur, npages)), "all": list(range(npages))}[scope]
+        undo = {"rects": [], "created": [], "mode": None, "page": cur}
+        log("SKIP", "edges=%s scope=%s pages=%d-%d" % (",".join(edges), scope, pages[0]+1, pages[-1]+1))
+        if npages > 1 and self.selections.selectionMode != ViewerSelections.individual:
+            self._splitToIndividual(undo)
+            if not sel.selectionVisibleOnPage(cur):
+                # the shared selection now belongs to its own page; use this page's copy
+                sel = self._matchSel(self._selFrac(sel), cur) or sel
+        f0 = self._selFrac(sel)
+        multi = len(pages) > 1
+        progress = None
+        if multi:
+            progress = QProgressDialog(self.tr("Skipping regions..."), self.tr("Cancel"), 0, len(pages), self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500)
+        dust = self.spinDust.value() if getattr(self, 'spinDust', None) is not None else 4
+        moved = 0
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for k, idx in enumerate(pages):
+                if progress is not None:
+                    progress.setValue(k)
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        log("SKIP", "canceled at page %d" % (idx+1))
+                        break
+                self.viewer.currentPageIndex = idx
+                s = sel if idx == cur else self._matchSel(f0, idx)
+                if s is None:
+                    s = self.selections.addSelection()
+                    s.pageIndex = idx
+                    self._setSelFrac(s, f0)
+                    undo["created"].append(s)
+                else:
+                    undo["rects"].append((s, idx, self._selFrac(s)))
+                img = self.viewer.getImage(idx)
+                for e in edges:
+                    orect = s.mapRectToImage(s.rect).toRect()
+                    nrect, d = skip_rect(img, orect, e, n, dust)
+                    if nrect is None:
+                        log("SKIP", "page %d %s: no further ink, unchanged" % (idx+1, e))
+                        continue
+                    o = {"top": orect.top(), "left": orect.left(),
+                         "bottom": orect.top()+orect.height(), "right": orect.left()+orect.width()}[e]
+                    nv = {"top": nrect.top(), "left": nrect.left(),
+                          "bottom": nrect.top()+nrect.height(), "right": nrect.left()+nrect.width()}[e]
+                    r = s.mapRectFromImage(QRectF(nrect))
+                    s.setBoundingRect(r.topLeft(), r.bottomRight())
+                    moved += 1
+                    log("SKIP", "page %d %s: %d -> %d (%d px)" % (idx+1, e, o, nv, d))
+                self.pdfScene.update()
+                if multi:
+                    QApplication.processEvents()
+            if progress is not None:
+                progress.setValue(len(pages))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.viewer.currentPageIndex = cur
+            self.selections.updateSelectionVisibility()
+            if sel.scene() is not None:
+                self.selections.currentSelection = sel
+            self.pdfScene.update()
+            self.updateControls()
+        self._skipUndo = undo
+        return moved
+
+    def slotUndoSkipRegion(self):
+        undo = getattr(self, '_skipUndo', None)
+        if not undo:
+            return
+        self._skipUndo = None
+        orig = self.viewer.currentPageIndex
+        for s, idx, f in undo["rects"]:
+            self.viewer.currentPageIndex = idx
+            self._setSelFrac(s, f)
+        for s in undo["created"]:
+            if s in self.selections.items:
+                self.selections.deleteSelection(s)
+        if undo["mode"] is not None:
+            mode, exc = undo["mode"]
+            {ViewerSelections.all: self.ui.radioSelAll, ViewerSelections.evenodd: self.ui.radioSelEvenOdd,
+             ViewerSelections.individual: self.ui.radioSelIndividual}[mode].setChecked(True)
+            self.selections.selectionMode = mode
+            self.selections.selectionExceptions = exc
+        self.viewer.currentPageIndex = orig
+        self.selections.updateSelectionVisibility()
+        self.pdfScene.update()
+        log("SKIP", "undo: restored %d selection(s), removed %d" % (len(undo["rects"]), len(undo["created"])))
 
     def slotTrimMargins(self):
         if self.selections.currentSelection is not None:
