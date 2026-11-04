@@ -128,6 +128,8 @@ def main():
         from krop.qt import QTimer
         QTimer.singleShot(0, window.slotKrop)
         QTimer.singleShot(0, window.close)
+        # the window was never shown, so closing it doesn't end the event loop
+        QTimer.singleShot(0, app.quit)
     else:
         window.show()
         window.slotFitInView(window.ui.actionFitInView.isChecked())
