@@ -95,7 +95,10 @@ jobs:
           cp com.arminstraub.krop.desktop $APPDIR/usr/share/applications/
           cp com.arminstraub.krop.svg $APPDIR/
           cp com.arminstraub.krop.svg $APPDIR/usr/share/icons/hicolor/scalable/apps/
-          ln -sf com.arminstraub.krop.svg $APPDIR/.DirIcon
+          # appimagetool requires .DirIcon to be a PNG
+          sudo apt-get install -y -q librsvg2-bin
+          rsvg-convert -w 256 -h 256 com.arminstraub.krop.svg -o $APPDIR/.DirIcon
+          file $APPDIR/.DirIcon
           cat > $APPDIR/AppRun <<'EOS'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
