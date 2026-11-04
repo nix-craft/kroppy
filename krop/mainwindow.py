@@ -822,7 +822,11 @@ class MainWindow(QMainWindow):
         order = [near] + [e for e in EDGES if e != near]
         for e in order:
             label = names[e] + (self.tr(" (nearest)") if e == near else "")
-            m.addAction(label, lambda e=e: self.skipRegion(sel, [e]))
+            a = m.addAction(label, lambda e=e: self.skipRegion(sel, [e]))
+            if e == near:
+                nearAct = a
+        # highlight the nearest edge when the submenu opens, so Enter picks it
+        m.aboutToShow.connect(lambda: QTimer.singleShot(0, lambda: m.setActiveAction(nearAct)))
         m.addAction(self.tr("All four edges"), lambda: self.skipRegion(sel, list(EDGES)))
         m.addSeparator()
         grp = QActionGroup(m)
