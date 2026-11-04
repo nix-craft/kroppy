@@ -926,6 +926,8 @@ class MainWindow(QMainWindow):
             progress.setMinimumDuration(500)
         dust = self.spinDust.value() if getattr(self, 'spinDust', None) is not None else 4
         moved = 0
+        pad = self.getPadding() or [0, 0, 0, 0]   # [top, right, bottom, left]
+        log("SKIP", "padding t,r,b,l = %s" % (pad,))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             for k, idx in enumerate(pages):
@@ -955,7 +957,17 @@ class MainWindow(QMainWindow):
                          "bottom": orect.top()+orect.height(), "right": orect.left()+orect.width()}[e]
                     nv = {"top": nrect.top(), "left": nrect.left(),
                           "bottom": nrect.top()+nrect.height(), "right": nrect.left()+nrect.width()}[e]
-                    r = s.mapRectFromImage(QRectF(nrect))
+                    # back off by the app's Padding field (same units as Trim), never past the old edge
+                    nf = QRectF(nrect)
+                    if e == "top":
+                        nf.setTop(max(orect.top(), nf.top() - pad[0]))
+                    elif e == "right":
+                        nf.setRight(min(orect.left() + orect.width(), nf.right() + pad[1]))
+                    elif e == "bottom":
+                        nf.setBottom(min(orect.top() + orect.height(), nf.bottom() + pad[2]))
+                    else:
+                        nf.setLeft(max(orect.left(), nf.left() - pad[3]))
+                    r = s.mapRectFromImage(nf)
                     s.setBoundingRect(r.topLeft(), r.bottomRight())
                     moved += 1
                     log("SKIP", "page %d %s: %d -> %d (%d px)" % (idx+1, e, o, nv, d))
