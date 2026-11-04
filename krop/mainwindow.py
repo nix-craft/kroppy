@@ -652,7 +652,7 @@ class MainWindow(QMainWindow):
         else:
             popMenu.addAction(self.ui.actionTrimMarginsAll)
             popMenu.addAction(self.actionTrimMarginsEveryPage)
-        popMenu.exec_(self.ui.documentView.mapToGlobal(pos))
+        popMenu.exec(self.ui.documentView.mapToGlobal(pos))
 
     def slotDeleteSelection(self):
         if self.selections.currentSelection is not None:
