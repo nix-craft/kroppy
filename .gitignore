@@ -3,3 +3,6 @@ dist/
 .pybuild/
 MANIFEST
 krop.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
