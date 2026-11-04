@@ -202,7 +202,11 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
         def addPage():
             # https://pymupdf.readthedocs.io/en/latest/the-basics.html
             r = pdffile.reader[pagenumber].rotation + rotate
-            self.output.insert_pdf(pdffile.reader, from_page=pagenumber, to_page=pagenumber, rotate=r)
+            # final=False keeps PyMuPDF's graft map for this source between
+            # calls, so objects shared by several source pages (e.g. one image
+            # XObject drawn on many pages) are copied once and stay shared,
+            # instead of being duplicated per page.
+            self.output.insert_pdf(pdffile.reader, from_page=pagenumber, to_page=pagenumber, rotate=r, final=False)
         if not croplist and alwaysinclude:
             addPage()
         else:
