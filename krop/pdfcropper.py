@@ -192,11 +192,20 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
     """Implementation of PdfCropper using PyMuPDF"""
     def __init__(self):
         self.output = self.pymupdf.open()
+        # Stashed in copyDocumentRoot (called before pages are added) and
+        # applied in writeTo* after pages exist. insert_pdf copies page content
+        # / links / annots but never the document outline or page labels.
+        self._src_toc = None
+        self._src_page_labels = None
+        # source 0-based page -> first output 0-based page
+        self._src_page_to_out = {}
     def writeToStream(self, stream):
+        self._apply_document_root()
         stream.write(self.output.tobytes())
     def writeToFile(self, filename):
         # Don't hand PyMuPDF an open file object: it saves via the object's
         # filename and on Windows can't replace a file we hold open.
+        self._apply_document_root()
         self.output.save(filename)
     def addPageCropped(self, pdffile, pagenumber, croplist, alwaysinclude, rotate=0):
         def addPage():
@@ -207,6 +216,10 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
             # XObject drawn on many pages) are copied once and stay shared,
             # instead of being duplicated per page.
             self.output.insert_pdf(pdffile.reader, from_page=pagenumber, to_page=pagenumber, rotate=r, final=False)
+            # First output page for this source page wins (multi-crop → TOC
+            # points at the first crop).
+            if pagenumber not in self._src_page_to_out:
+                self._src_page_to_out[pagenumber] = self.output.page_count - 1
         if not croplist and alwaysinclude:
             addPage()
         else:
@@ -253,7 +266,57 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
             for key in ("MediaBox", "CropBox", "TrimBox", "ArtBox", "BleedBox"):
                 doc.xref_set_key(xref, key, cb)
     def copyDocumentRoot(self, pdffile):
-        pass
+        # Called before pages are added; stash catalog extras for write time.
+        try:
+            self._src_toc = pdffile.reader.get_toc(simple=True)
+        except Exception:
+            self._src_toc = None
+        try:
+            labels = pdffile.reader.get_page_labels()
+            self._src_page_labels = labels or None
+        except Exception:
+            self._src_page_labels = None
+
+    def _apply_document_root(self):
+        """Copy outline (and page labels when remappable) onto the output."""
+        if self._src_toc:
+            # source 1-based page number -> output 1-based
+            src1_to_out1 = {
+                src0 + 1: out0 + 1
+                for src0, out0 in self._src_page_to_out.items()
+            }
+            new_toc = []
+            for entry in self._src_toc:
+                # [level, title, page] ; page is 1-based in the source
+                level, title, page = entry[0], entry[1], entry[2]
+                if not isinstance(page, int) or page not in src1_to_out1:
+                    continue
+                level = int(level)
+                if new_toc:
+                    # set_toc requires levels to rise by at most one
+                    level = min(level, new_toc[-1][0] + 1)
+                level = max(level, 1)
+                new_toc.append([level, title, src1_to_out1[page]])
+            if new_toc:
+                self.output.set_toc(new_toc)
+        if self._src_page_labels and self._src_page_to_out:
+            # Remap startpage for labels whose start page was included; drop
+            # the rest. Only rewrite when at least one rule survives.
+            new_labels = []
+            for rule in self._src_page_labels:
+                start = int(rule.get("startpage", 0))
+                if start not in self._src_page_to_out:
+                    continue
+                new_rule = dict(rule)
+                new_rule["startpage"] = self._src_page_to_out[start]
+                new_labels.append(new_rule)
+            if new_labels:
+                # rules must be sorted by startpage
+                new_labels.sort(key=lambda r: r["startpage"])
+                try:
+                    self.output.set_page_labels(new_labels)
+                except Exception:
+                    pass
 
 
 class PikePdfCropper(SemiAbstractPdfCropper):
