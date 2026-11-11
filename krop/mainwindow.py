@@ -153,6 +153,8 @@ class MainWindow(QMainWindow):
         self.analysisPanel.page_requested.connect(self.slotShowAnalysisPage)
         self.analysisPanel.focus_changed.connect(self._refocusAnalysis)
         self.analysisPanel.threshold_changed.connect(self._reanalyze)
+        self.analysisPanel.highlight_requested.connect(self._showImageHighlight)
+        self.analysisPanel.visibilityChanged.connect(self._analysisDockVisibility)
         try:
             dock_right = Qt.DockWidgetArea.RightDockWidgetArea
         except AttributeError:
@@ -1280,6 +1282,16 @@ class MainWindow(QMainWindow):
                 job.wait(60000)
         except RuntimeError:
             pass
+
+    def _showImageHighlight(self, xref):
+        if not xref or not self.analysisPanel.isVisible():
+            self.viewer.clearImageHighlight()
+            return
+        self.viewer.showImageHighlight(int(xref))
+
+    def _analysisDockVisibility(self, visible):
+        if not visible:
+            self.viewer.clearImageHighlight()
 
     def _refocusAnalysis(self, page):
         job = self._analysis_job

@@ -19,6 +19,63 @@ from krop.config import PYQT6
 from krop.qt import *
 
 from krop.viewerselections import ViewerSelections
+from krop.imagehighlight import VIEW_DPI, map_image_rects
+
+
+class ImageHighlightItem(QGraphicsItem):
+    """Shaded outline of an image placement. Not a crop selection."""
+
+    def __init__(self, parent):
+        QGraphicsItem.__init__(self, parent)
+        self._rects = []
+        self.setZValue(-1)
+        try:
+            self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        except AttributeError:
+            self.setAcceptedMouseButtons(Qt.NoButton)
+        try:
+            selectable = QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            focusable = QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
+        except AttributeError:
+            selectable = QGraphicsItem.ItemIsSelectable
+            focusable = QGraphicsItem.ItemIsFocusable
+        self.setFlag(selectable, False)
+        self.setFlag(focusable, False)
+        self.hide()
+
+    def set_rects(self, rects):
+        self.prepareGeometryChange()
+        self._rects = list(rects or [])
+        self.setVisible(bool(self._rects))
+        self.update()
+
+    def rects(self):
+        return list(self._rects)
+
+    def boundingRect(self):
+        if not self._rects:
+            return QRectF()
+        x0 = min(r[0] for r in self._rects)
+        y0 = min(r[1] for r in self._rects)
+        x1 = max(r[0] + r[2] for r in self._rects)
+        y1 = max(r[1] + r[3] for r in self._rects)
+        return QRectF(x0, y0, x1 - x0, y1 - y0).adjusted(-3, -3, 3, 3)
+
+    def paint(self, painter, option, widget):
+        for rect in self._rects:
+            primary = len(rect) > 4 and rect[4]
+            box = QRectF(rect[0], rect[1], rect[2], rect[3])
+            if primary:
+                fill = QColor(214, 112, 18, 110)
+                line = QColor(120, 40, 0)
+                width = 3
+            else:
+                fill = QColor(214, 112, 18, 60)
+                line = QColor(70, 40, 140)
+                width = 2
+            painter.setPen(QPen(line, width))
+            painter.setBrush(QBrush(fill))
+            painter.drawRect(box)
 
 
 class AbstractViewerItem(QGraphicsItem):
@@ -27,14 +84,20 @@ class AbstractViewerItem(QGraphicsItem):
     def __init__(self, mainwindow):
         QGraphicsItem.__init__(self)
         self.selections = ViewerSelections(self)
+        self._highlight = None
+        self._highlight_xref = None
         self.reset()
         self.mainwindow = mainwindow
+        self._highlight = ImageHighlightItem(self)
 
     def reset(self):
         self._currentPageIndex = 0
         self.brect = QRectF()
         self.irect = QRectF()
         self._images = []
+        self._highlight_xref = None
+        if getattr(self, "_highlight", None) is not None:
+            self._highlight.set_rects([])
         self.selections.deleteSelections()
 
     def boundingRect(self):
@@ -81,6 +144,66 @@ class AbstractViewerItem(QGraphicsItem):
         self.brect = QRectF(0,0,rect.width()+2*padding,rect.height()+2*padding)
         self.irect = QRectF(padding,padding,rect.width(),rect.height())
         self.scene().setSceneRect(self.brect)
+        self.refreshImageHighlight()
+
+    def showImageHighlight(self, xref):
+        """Shade every placement of xref on the current page."""
+        try:
+            self._highlight_xref = int(xref) if xref else None
+        except (TypeError, ValueError):
+            self._highlight_xref = None
+        self.refreshImageHighlight()
+
+    def clearImageHighlight(self):
+        self._highlight_xref = None
+        if getattr(self, "_highlight", None) is not None:
+            self._highlight.set_rects([])
+
+    def refreshImageHighlight(self):
+        if getattr(self, "_highlight", None) is None:
+            return
+        xref = self._highlight_xref
+        if not xref:
+            self._highlight.set_rects([])
+            return
+        rects = self.imagePlacementRects(xref)
+        if not rects:
+            self._highlight_xref = None
+            self._highlight.set_rects([])
+            return
+        self._highlight.set_rects(rects)
+
+    def imageHighlightRects(self):
+        if getattr(self, "_highlight", None) is None:
+            return []
+        return self._highlight.rects()
+
+    def imagePlacementRects(self, xref):
+        """Viewer rectangles for xref, or [] when it is not on this page."""
+        page = None
+        doc = getattr(self, "_pdfdoc", None)
+        if doc is not None and hasattr(doc, "__getitem__"):
+            try:
+                page = doc[self.currentPageIndex]
+            except Exception:
+                page = None
+        if page is None or not hasattr(page, "get_image_rects"):
+            return []
+        try:
+            raw = page.get_image_rects(int(xref))
+        except Exception:
+            return []
+        tuples = []
+        for item in raw or []:
+            rect = item[0] if isinstance(item, (tuple, list)) and item and hasattr(item[0], "x0") else item
+            if not hasattr(rect, "x0"):
+                continue
+            tuples.append((rect.x0, rect.y0, rect.x1, rect.y1))
+        crop = getattr(page, "cropbox", None) or page.rect
+        return map_image_rects(
+            tuples, getattr(page, "rotation", 0) or 0,
+            float(crop.width), float(crop.height), VIEW_DPI,
+            (self.irect.left(), self.irect.top()))
 
     currentPageIndex = property(getCurrentPageIndex, setCurrentPageIndex)
 
@@ -170,7 +293,7 @@ class PopplerViewerItem(AbstractViewerItem):
 
     def cacheImage(self, idx):        
         page = self._pdfdoc.page(idx)
-        return page.renderToImage(96.0, 96.0) # dpi = 96
+        return page.renderToImage(float(VIEW_DPI), float(VIEW_DPI))
         # return page.renderToImage() # default dpi = 72
 
     def pageGetRotation(self, idx):        
@@ -206,7 +329,7 @@ class MuPDFViewerItem(AbstractViewerItem):
 
     def cacheImage(self, idx):        
         page = self._pdfdoc[idx]
-        pix = page.get_pixmap(alpha=False, dpi=96) # default dpi is 72
+        pix = page.get_pixmap(alpha=False, dpi=VIEW_DPI) # default dpi is 72
         return QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
         # It might be faster to use samples_ptr but the code results in crashes.
         # https://pymupdf.readthedocs.io/en/latest/tutorial.html

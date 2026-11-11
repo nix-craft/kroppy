@@ -12,6 +12,20 @@ try:
     _XREF = int(_USER) + 1
 except Exception:
     _XREF = 257
+_PAGES = _XREF + 1
+
+
+def _page_list(pages, fallback):
+    values = pages or ([fallback] if fallback else [])
+    return ",".join(str(int(p)) for p in values)
+
+
+def _blocker_xref(blocker):
+    import re
+    if not blocker or blocker.get("kind") != "image":
+        return None
+    match = re.search(r"xref\s+(\d+)", blocker.get("text") or "")
+    return int(match.group(1)) if match else None
 
 try:
     _SINGLE = QAbstractItemView.SelectionMode.SingleSelection
@@ -88,6 +102,7 @@ class AnalysisPanel(QDockWidget):
     page_requested = pyqtSignal(int)
     focus_changed = pyqtSignal(int)
     threshold_changed = pyqtSignal(float)
+    highlight_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         QDockWidget.__init__(self, "Analysis", parent)
@@ -245,6 +260,7 @@ class AnalysisPanel(QDockWidget):
         child = QTreeWidgetItem(["", "", "", "", "", ""])
         child.setData(0, _USER, page_no)
         child.setData(0, _XREF, xref)
+        child.setData(0, _PAGES, _page_list(im.get("pages"), page_no))
         self._paint_image(child, im)
         row.insertChild(0, child)
 
@@ -292,11 +308,16 @@ class AnalysisPanel(QDockWidget):
             child = QTreeWidgetItem(["", "", "", "", "", ""])
             child.setData(0, _USER, page["page"])
             child.setData(0, _XREF, im.get("xref"))
+            child.setData(0, _PAGES, _page_list(im.get("pages"), page["page"]))
             self._paint_image(child, im)
             row.addChild(child)
         for blocker in page.get("blockers") or []:
             child = QTreeWidgetItem(["", blocker["text"], "", "", "", ""])
             child.setData(0, _USER, page["page"])
+            xref = _blocker_xref(blocker)
+            if xref:
+                child.setData(0, _XREF, xref)
+                child.setData(0, _PAGES, _page_list(None, page["page"]))
             row.addChild(child)
         for note in page.get("notes") or []:
             child = QTreeWidgetItem(["", note, "", "", "", ""])
@@ -355,15 +376,46 @@ class AnalysisPanel(QDockWidget):
             self.tree.scrollToItem(item)
         finally:
             self._selecting = False
+        self.highlight_requested.emit(0)
+
+    def _xref_of(self, item):
+        if item is None:
+            return None
+        xref = item.data(0, _XREF)
+        try:
+            return int(xref) if xref else None
+        except (TypeError, ValueError):
+            return None
+
+    def _pages_of(self, item):
+        if item is None:
+            return []
+        raw = item.data(0, _PAGES)
+        if raw:
+            try:
+                return [int(part) for part in str(raw).split(",") if part]
+            except ValueError:
+                pass
+        page = self._page_of(item)
+        return [page] if page else []
 
     def _request(self, item):
         if self._selecting:
             return
         page = self._page_of(item)
-        if not page or self._pending_nav == page:
+        if not page:
+            return
+        xref = self._xref_of(item)
+        pages = self._pages_of(item)
+        # A shared image is highlighted on the page already on screen.
+        if xref and self._follow_page in pages:
+            self.highlight_requested.emit(int(xref))
+            return
+        if self._pending_nav == page:
             return
         self._pending_nav = page
         self.page_requested.emit(page)
+        self.highlight_requested.emit(int(xref) if xref else 0)
         QTimer.singleShot(0, self._clear_pending)
 
     def _clear_pending(self):
