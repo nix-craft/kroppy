@@ -81,6 +81,97 @@ def test_navigation_reprioritizes_and_does_not_prefill():
     assert fresh.claim_next_page("/tmp/doc.pdf", 4.0, 1, later) is None
 
 
+def _jpeg_row(panel, qapp):
+    image = {
+        "xref": 5, "page": 1, "pages": [1], "share_key": "x5",
+        "detail": "xref 5", "target": "keep", "chosen_target": "keep",
+        "recommended_target": "keep", "target_text": "keep",
+        "filter_name": "DCT", "colorspace_text": "DeviceRGB", "bpc": 8,
+        "bytes": 1000, "keep_text": "keep: JPEG (DCT) RGB 8bpc, 1000 B",
+        "candidates": [
+            {"id": "jpeg-85", "label": "3ch 24bpp JPEG q85", "pending": True, "over": False},
+            {"id": "keep", "label": "keep: JPEG (DCT) RGB 8bpc, 1000 B",
+             "over": False, "error_mae": 0, "est_bytes": 1000},
+        ],
+    }
+    page = {"page": 1, "images": [image], "label": "COLOR", "target": "color",
+            "image_count": 1, "blocker_count": 0, "image_bytes": 1000,
+            "image_est": 1000, "savings_pct": 0}
+    panel.begin(1)
+    panel.add_page(page)
+    qapp.processEvents()
+    return image
+
+
+def test_p0_exception_clears_the_busy_overlay(window, qapp):
+    from krop.qt import Qt
+    panel = window.analysisPanel
+    viewer = window.viewer
+    _jpeg_row(panel, qapp)
+    rects = [(10, 12, 40, 24, True)]
+    viewer.showBusy(5, 2, rects)
+    panel._watch = (5, "jpeg-85", 2)
+    try:
+        raise AttributeError("module 'PIL.Image' has no attribute 'Dither'")
+    except AttributeError as exc:
+        panel._fail_p0({
+            "kind": "preview", "xref": 5, "target": "jpeg-85", "token": 2,
+        }, exc)
+    qapp.processEvents()
+    assert not viewer.busyVisible()
+    combo = panel.tree.itemWidget(panel.tree.topLevelItem(0).child(0), 2)
+    text = combo.itemText(combo.findData("jpeg-85"))
+    assert "failed:" in text
+    assert "Dither" in text
+    try:
+        tip_role = Qt.ItemDataRole.ToolTipRole
+    except AttributeError:
+        tip_role = Qt.ToolTipRole
+    tip = combo.itemData(combo.findData("jpeg-85"), tip_role)
+    assert "Traceback" in tip
+    assert "Dither" in tip
+    logged = open(window.logPath).read()
+    assert "Traceback" in logged
+    assert "Dither" in logged
+    # The original page is what remains: the failed preview is not stored.
+    assert viewer.previewImage(5, "jpeg-85", 0) is None
+
+
+def test_preview_timeout_clears_the_overlay(window, qapp):
+    panel = window.analysisPanel
+    viewer = window.viewer
+    _jpeg_row(panel, qapp)
+    panel._preview_timeout_ms = 40
+    viewer.showBusy(5, 2, [(10, 12, 40, 24, True)])
+    panel._arm_preview_watch(5, "jpeg-85", 2)
+    deadline = time.time() + 2
+    while time.time() < deadline and viewer.busyVisible():
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert not viewer.busyVisible()
+    combo = panel.tree.itemWidget(panel.tree.topLevelItem(0).child(0), 2)
+    assert "preview timed out" in combo.itemText(combo.findData("jpeg-85"))
+    # A late result for that token is discarded.
+    rgba = np.zeros((2, 2, 4), np.uint8)
+    assert viewer.deliverPreview({
+        "xref": 5, "target": "jpeg-85", "rotation": 0, "token": 2, "rgba": rgba,
+    }) is False
+
+
+def test_chosen_preview_starts_without_waiting_for_the_ladder(window):
+    panel = window.analysisPanel
+    panel._work_stop.set()
+    panel._wake.set()
+    panel._worker.wait(2000)
+    started = []
+    panel._start_p0 = lambda payload: started.append(payload)
+    panel._scheduler.add(("page", 3), {"kind": "page", "page": 3, "cheap": True, "_key": ("page", 3)})
+    panel.enqueue_preview("/tmp/x.pdf", 5, "jpeg-85", 0, 2, 0)
+    assert started and started[0]["kind"] == "preview"
+    assert started[0]["target"] == "jpeg-85"
+    assert ("preview", 5, "jpeg-85", 0) not in panel._scheduler.jobs
+
+
 def test_busy_overlay_tracks_the_newest_preview_token(window, qapp):
     from krop.qt import Qt
     viewer = window.viewer

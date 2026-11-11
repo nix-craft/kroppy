@@ -115,6 +115,14 @@ def test_rotated_preview_matches_the_mapped_corners():
     doc.close()
 
 
+def test_limit_edge_shrinks_a_large_preview_source():
+    from krop.preview import limit_edge
+    arr = np.zeros((100, 400, 3), np.uint8)
+    out = limit_edge(arr, 80)
+    assert max(out.shape[:2]) == 80
+    assert limit_edge(arr, 1000).shape == arr.shape
+
+
 def test_soft_mask_stays_transparent(tmp_path):
     color = np.full((16, 16, 3), (220, 10, 10), np.uint8)
     mask = np.zeros((16, 16), np.uint8)

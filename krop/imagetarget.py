@@ -83,6 +83,23 @@ def _neutral(sample):
     return float(np.percentile(chroma, 99)) <= 0.03
 
 
+def pil_namespace(image, enum_name):
+    """Pillow 9.1 put constants on enums. Pillow 8 and 9.0 keep them on Image."""
+    return getattr(image, enum_name, image)
+
+
+def pil_const(image, enum_name, name, default):
+    return getattr(pil_namespace(image, enum_name), name, default)
+
+
+def _quantize_image(im, n, method, dither):
+    """Call Image.quantize. Pillow before 9.1 has no dither argument."""
+    try:
+        return im.quantize(colors=int(n), method=method, dither=dither)
+    except TypeError:
+        return im.quantize(colors=int(n), method=method)
+
+
 def _indexed(sample, n, dither=False):
     """Return (reconstructed uint8 array, ok). Median-cut, dither optional."""
     try:
@@ -95,22 +112,19 @@ def _indexed(sample, n, dither=False):
     else:
         rgb = sample[..., :3]
     im = Image.fromarray(rgb.astype("uint8"), "RGB")
-    dith = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+    # Image.Dither / Image.Quantize exist only from Pillow 9.1. Older releases
+    # expose the same integers as Image.FLOYDSTEINBERG, Image.NONE, Image.MEDIANCUT.
+    dith = pil_const(Image, "Dither", "FLOYDSTEINBERG" if dither else "NONE", 3 if dither else 0)
+    median = pil_const(Image, "Quantize", "MEDIANCUT", 0)
+    octree = pil_const(Image, "Quantize", "FASTOCTREE", 2)
     try:
-        method = Image.Quantize.MEDIANCUT
-    except AttributeError:
-        method = None
-    try:
-        if method is not None:
-            q = im.quantize(colors=int(n), method=method, dither=dith)
-        else:
-            q = im.quantize(colors=int(n), dither=dith)
+        q = _quantize_image(im, n, median, dith)
     except Exception:
         try:
-            q = im.quantize(colors=int(n), method=Image.Quantize.FASTOCTREE, dither=dith)
+            q = _quantize_image(im, n, octree, dith)
         except Exception:
             try:
-                q = im.quantize(colors=int(n), dither=dith)
+                q = _quantize_image(im, n, None, dith)
             except Exception:
                 return None, False
     back = np.asarray(q.convert("RGB"))

@@ -46,7 +46,7 @@ setup(
             'pymupdf',
             'pikepdf',
             'numpy',
-            'Pillow',
+            'Pillow>=8',
         ],
         entry_points = {
             'console_scripts': [

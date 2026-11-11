@@ -119,8 +119,32 @@ def _run_queued(payload):
     if kind == "preview":
         from krop.preview import preview_rgba
         return preview_rgba(
-            payload["path"], payload["xref"], payload["target"], payload.get("rotation") or 0)
+            payload["path"], payload["xref"], payload["target"], payload.get("rotation") or 0,
+            payload.get("max_edge") or 1600)
     return None
+
+
+class _P0Job(QThread):
+    """One chosen target, started immediately so it does not wait on the ladder."""
+    done = pyqtSignal(object)
+
+    def __init__(self, payload):
+        QThread.__init__(self)
+        self.payload = payload
+
+    def run(self):
+        import time
+        started = time.perf_counter()
+        error = None
+        result = None
+        try:
+            result = _run_queued(self.payload)
+        except Exception as exc:
+            error = exc
+        self.done.emit({
+            "payload": self.payload, "result": result, "error": error,
+            "elapsed": time.perf_counter() - started, "p0": True,
+        })
 
 
 class _WorkThread(QThread):
@@ -262,6 +286,12 @@ class AnalysisPanel(QDockWidget):
         self._worker = _WorkThread(self._scheduler, self._wake, self._work_stop)
         self._worker.done.connect(self._on_work)
         self._worker.start()
+        self._p0_jobs = []
+        self._preview_timeout_ms = 15000
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._on_preview_timeout)
+        self._watch = None
         self._idle_timer = QTimer(self)
         self._idle_timer.setInterval(400)
         self._idle_timer.timeout.connect(self._submit_available)
@@ -418,7 +448,7 @@ class AnalysisPanel(QDockWidget):
                 cand = item
                 break
         if cand is None or cand.get("pending") or cand.get("est_bytes") is None:
-            self._scheduler.add(("measure", int(xref), str(target_id)), {
+            self._start_p0({
                 "kind": "measure", "path": self._path, "xref": int(xref),
                 "target": str(target_id), "page": page_index, "lane": "choice",
                 "share": im.get("share_key") or "", "stored": int(im.get("bytes") or 0),
@@ -433,12 +463,57 @@ class AnalysisPanel(QDockWidget):
             page_index = int(im.get("page") or 1) - 1
         else:
             page_index = (self._follow_page or 1) - 1
-        self._scheduler.add(("preview", int(xref), str(target), int(rotation or 0)), {
+        payload = {
             "kind": "preview", "path": path, "xref": int(xref), "target": str(target),
             "rotation": int(rotation or 0), "token": token, "page": page_index,
             "lane": "choice" if priority <= 0 else "page", "gen": self._ladder_gen,
-        })
+            "max_edge": self._preview_edge(xref),
+        }
+        if priority <= 0:
+            # The chosen preview runs on its own thread, not behind the ladder.
+            self._start_p0(payload)
+            self._arm_preview_watch(int(xref), str(target), token)
+            return
+        self._scheduler.add(("preview", int(xref), str(target), int(rotation or 0)), payload)
         self._wake.set()
+
+    def _preview_edge(self, xref):
+        viewer = getattr(self.parent(), "viewer", None)
+        if viewer is None:
+            return 1600
+        try:
+            rects = viewer.imagePlacementRects(int(xref))
+        except Exception:
+            rects = []
+        edge = 0
+        for rect in rects or []:
+            edge = max(edge, int(rect[2]), int(rect[3]))
+        return edge or 1600
+
+    def _start_p0(self, payload):
+        job = _P0Job(payload)
+        job.done.connect(self._on_p0)
+        self._p0_jobs.append(job)
+        job.finished.connect(lambda done=job: self._p0_jobs.remove(done) if done in self._p0_jobs else None)
+        job.start()
+
+    def _arm_preview_watch(self, xref, target, token):
+        self._watch = (int(xref), str(target), token)
+        self._preview_timer.start(int(self._preview_timeout_ms))
+
+    def _on_preview_timeout(self):
+        watch = getattr(self, "_watch", None)
+        if not watch:
+            return
+        xref, target, token = watch
+        viewer = getattr(self.parent(), "viewer", None)
+        if viewer is None or not viewer.busyVisible() or viewer._busy_token != token:
+            return
+        self._close_preview(xref, token)
+        self._mark_target_note(
+            xref, target, "preview timed out",
+            "Preview did not finish within %d seconds." % (int(self._preview_timeout_ms) // 1000))
+        self._log_p0("preview xref %s %s: timed out" % (xref, str(target).replace("-", "")), None)
 
     def job_order(self):
         return list(self._scheduler.order())
@@ -562,13 +637,104 @@ class AnalysisPanel(QDockWidget):
             self._refresh_progress()
             self._submit_available()
         elif kind == "preview":
-            viewer = getattr(self.parent(), "viewer", None)
-            if viewer is not None:
-                viewer.deliverPreview({
-                    "xref": payload.get("xref"), "target": payload.get("target"),
-                    "rotation": payload.get("rotation") or 0, "token": payload.get("token"),
-                    "rgba": message.get("result"),
-                })
+            self._finish_preview(payload, message.get("result"), message.get("error"), message.get("elapsed"))
+
+    def _on_p0(self, message):
+        payload = message.get("payload") or {}
+        if payload.get("gen") not in (None, self._ladder_gen):
+            return
+        kind = payload.get("kind")
+        elapsed = message.get("elapsed")
+        label = "%s xref %s %s: %.1f s" % (
+            kind, payload.get("xref"), str(payload.get("target")).replace("-", ""), float(elapsed or 0))
+        self._log_p0(label, message.get("error"))
+        if kind == "measure":
+            if message.get("error") is not None or message.get("result") is None:
+                self._fail_p0(payload, message.get("error") or RuntimeError("measurement returned nothing"))
+                return
+            self._apply_measure(payload, message.get("result"))
+            self._refresh_progress()
+            return
+        self._finish_preview(payload, message.get("result"), message.get("error"), elapsed)
+
+    def _finish_preview(self, payload, result, error, elapsed):
+        xref = payload.get("xref")
+        target = str(payload.get("target"))
+        token = payload.get("token")
+        watch = getattr(self, "_watch", None)
+        if watch and token is not None and watch[2] != token:
+            return
+        if error is not None or result is None:
+            self._fail_p0(payload, error or RuntimeError("preview returned nothing"))
+            return
+        viewer = getattr(self.parent(), "viewer", None)
+        if viewer is not None:
+            viewer.deliverPreview({
+                "xref": xref, "target": target,
+                "rotation": payload.get("rotation") or 0, "token": token, "rgba": result,
+            })
+        if watch and watch[2] == token:
+            self._preview_timer.stop()
+
+    def _fail_p0(self, payload, exc):
+        """A chosen preview or measurement failed. Drop the spinner and say why."""
+        import traceback
+        xref = payload.get("xref")
+        target = str(payload.get("target"))
+        token = payload.get("token")
+        self._close_preview(xref, token)
+        short = str(exc).strip().splitlines()[0] if exc else "unknown"
+        if len(short) > 80:
+            short = short[:77] + "..."
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else short
+        self._mark_target_note(xref, target, "failed: " + short, detail)
+        self._log_p0("failed %s xref %s %s: %s" % (payload.get("kind"), xref, target, short), exc)
+
+    def _close_preview(self, xref, token):
+        viewer = getattr(self.parent(), "viewer", None)
+        if viewer is None:
+            return
+        if viewer._busy_token is not None and token is not None and viewer._busy_token != token:
+            return
+        viewer.clearBusy()
+        tokens = getattr(viewer, "_preview_tokens", None)
+        if tokens is not None and xref is not None:
+            tokens[int(xref)] = (token, "closed")
+
+    def _mark_target_note(self, xref, target, note, detail):
+        _holder, matches = self._matching_images(xref, "")
+        if not matches:
+            im = self._find_image(xref)
+            matches = [im] if im else []
+        for im in matches:
+            if im is None:
+                continue
+            for cand in im.get("candidates") or []:
+                if str(cand.get("id")) == str(target):
+                    cand["note"] = note
+                    cand["note_detail"] = detail
+                    cand["pending"] = False
+            page_no = im.get("page")
+            row = self._row_for_page(page_no) if page_no else None
+            if row is not None:
+                self._refresh_image_texts(row, im)
+
+    def _log_p0(self, line, exc):
+        import sys
+        import traceback
+        sys.stderr.write(line + "\n")
+        try:
+            from krop.activitylog import log
+            log("ANALYZE", line)
+            if exc is not None:
+                tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                sys.stderr.write(tb)
+                if not tb.endswith("\n"):
+                    sys.stderr.write("\n")
+                for row in tb.splitlines():
+                    log("ANALYZE", row)
+        except Exception:
+            pass
 
     def _matching_images(self, xref, share):
         holder = self._holder()
@@ -1179,6 +1345,8 @@ def _candidate_label(cand, image=None, limit=None):
             text += "  mae 0"
         return text
     label = cand.get("label") or cand.get("id") or ""
+    if cand.get("note"):
+        return "%s  %s" % (label, cand.get("note"))
     if cand.get("pending"):
         return "%s  measuring…" % label
     bits = [label]
@@ -1209,6 +1377,10 @@ def _candidate_tip(cand, image=None, limit=None):
     shown = _limit_text(limit)
     if cand.get("id") == "keep":
         return "Original encoding, mean error 0. " + _candidate_label(cand, image, limit)
+    if cand.get("note_detail"):
+        return cand.get("note_detail")
+    if cand.get("note"):
+        return cand.get("note")
     if cand.get("pending"):
         return "measuring… means the size and error are still being computed."
     if cand.get("over"):

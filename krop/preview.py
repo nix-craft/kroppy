@@ -105,9 +105,29 @@ def load_image(path, xref):
         doc.close()
 
 
-def preview_rgba(path, xref, target_id, rotation=0):
-    """Quantized RGBA for one image, oriented for the page rotation."""
+def limit_edge(arr, max_edge):
+    """Shrink an array so its longer side is at most max_edge pixels."""
+    if arr is None or not max_edge:
+        return arr
+    height, width = arr.shape[:2]
+    edge = max(height, width)
+    if edge <= int(max_edge):
+        return arr
+    scale = float(max_edge) / float(edge)
+    return _resize_nearest(arr, max(1, int(round(height * scale))), max(1, int(round(width * scale))))
+
+
+def preview_rgba(path, xref, target_id, rotation=0, max_edge=1600):
+    """Quantized RGBA for one image, oriented for the page rotation.
+
+    Large images are reduced to about the size they occupy on screen before
+    the encode, so one chosen target does not resample a full print-resolution
+    scan.
+    """
     color, alpha = load_image(path, xref)
+    color = limit_edge(color, max_edge)
+    if alpha is not None:
+        alpha = limit_edge(alpha, max_edge)
     rgb = quantize_pixels(color, target_id)
     rgb = orient_for_page(rgb, rotation)
     if alpha is None:
