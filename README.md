@@ -6,6 +6,8 @@ It is written in Python and relies on PyQt and PyMuPDF (or a suitable subset of 
 
 The command is `kroppy`. `krop` and `krop-trimall` run the same program.
 
+A running window can take local commands on a Unix socket. It is off unless you pass `--control [PATH]` or set `KROPPY_CONTROL`. See [docs/control.md](docs/control.md). `python -m krop.ctl` (or `kroppyctl`) sends one command.
+
 kroppy is built from [krop](https://arminstraub.com/software/krop) by Armin Straub.
 
 ![Screenshot](https://arminstraub.com/images/krop/screenshot.png)

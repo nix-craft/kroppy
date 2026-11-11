@@ -142,7 +142,8 @@ def main():
     parser.add_argument('--go', action='store_true', help='output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb-run')
     parser.add_argument('--analyze-only', action='store_true', help='print a color/bit-depth recommendation and exit without opening the window')
     parser.add_argument('--analyze-json', metavar='FILE', help='write the full analysis JSON to FILE and exit without opening the window')
-    parser.add_argument('--analyze-error', type=float, default=None, metavar='MAE', help='mean absolute error (0-255) allowed when recommending a smaller image encoding (default: 4). The maximum error must also stay within max(16, 4 times this value)')
+    parser.add_argument('--analyze-error', type=float, default=None, metavar='MAE', help='mean absolute error (0-255) allowed when recommending a smaller image encoding (default: 4). The 99.5th percentile of absolute error must also stay within max(16, 4 times this value)')
+    parser.add_argument('--control', nargs='?', const='default', default=None, metavar='PATH', help='listen for kroppyctl on a user-only local socket. With no PATH, uses $XDG_RUNTIME_DIR/kroppy-<pid>.sock or /tmp/kroppy-$USER.sock. KROPPY_CONTROL=PATH enables the same socket. Off unless set')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
     parser.add_argument('--use-qt5', action='store_true', help='use PyQt5 instead of PyQt6 (default: use PyQt6 if available)')
@@ -170,6 +171,13 @@ def main():
 
     import os
     from krop.activitylog import install as _installLog, patch_classes
+    from krop.control import resolve_control_path, start_control
+    _control_path = resolve_control_path(getattr(args, "control", None), os.environ.get("KROPPY_CONTROL"))
+    if _control_path:
+        try:
+            start_control(window, _control_path)
+        except Exception as exc:
+            sys.stderr.write("kroppy: control socket failed: %s\n" % exc)
     _logPath = args.log or os.environ.get('KROP_LOG')
     _explicit_log = _logPath and str(_logPath).lower() not in ("off", "0", "no", "false")
     patch_classes("off" if args.log_keep == "never" and not _explicit_log else _logPath)

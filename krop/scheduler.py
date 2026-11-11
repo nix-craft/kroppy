@@ -245,6 +245,26 @@ class Scheduler(object):
                     return True
             return False
 
+    def queue_summary(self):
+        """How many jobs sit at each tier right now, plus anything not yet eligible."""
+        now = _now()
+        with self._lock:
+            queued = {"0": 0, "1": 0, "2": 0, "3": 0}
+            waiting = 0
+            for job in self.jobs.values():
+                tier = self._tier_unlocked(job, now)
+                if tier is None:
+                    waiting += 1
+                else:
+                    queued[str(int(tier))] += 1
+            page = self.running_page
+            return {
+                "queued": queued,
+                "waiting": waiting,
+                "running_tier": None if self.running_tier is None else int(self.running_tier),
+                "running_page": None if page is None else int(page) + 1,
+            }
+
     def set_running(self, tier, page):
         with self._lock:
             if self.running_tier == P3 and tier != P3:

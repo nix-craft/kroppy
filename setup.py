@@ -53,6 +53,7 @@ setup(
                 'kroppy = krop.__main__:main',
                 'krop = krop.__main__:main',
                 'krop-trimall = krop.__main__:main',
+                'kroppyctl = krop.ctl:main',
             ]
         },
         data_files = [
