@@ -1,17 +1,17 @@
 # -*- coding: iso-8859-1 -*-
 
 """
-krop: A tool to crop PDF files
+kroppy: A tool to crop PDF files
 
 You can use command line arguments in addition to (or, to a degree, instead of) the graphical interface.
 
 For instance, to automatically undo 4 pages print onto a single page:
-    krop --go --grid=2x2 file.pdf
+    kroppy --go --grid=2x2 file.pdf
 To additionally trim each of these pages:
-    krop --go --grid=2x2 --trim --trim-use=all file.pdf
+    kroppy --go --grid=2x2 --trim --trim-use=all file.pdf
 
 Automatically crop the margins every single page individually:
-    krop --go --selections=individual --grid=1@all --trim file.pdf
+    kroppy --go --selections=individual --grid=1@all --trim file.pdf
 Omit the --go to further edit the selections in the graphical interface before cropping.
 
 Copyright (C) 2010-2025 Armin Straub, http://arminstraub.com
@@ -29,9 +29,38 @@ import sys
 from krop.version import __version__
 
 
+def migrate_qsettings():
+    """Copy settings saved when the application name was "krop", once.
+
+    The organization stays arminstraub.com. Only the application name changes,
+    which is what selects the QSettings file (or registry key, or plist).
+    """
+    from krop.qt import QApplication, QSettings
+    app = QApplication.instance()
+    if app is None:
+        return
+    new_name = app.applicationName()
+    if new_name == "krop":
+        return
+    app.setApplicationName(new_name)
+    if QSettings().value("MigratedFrom/krop") == "true":
+        return
+    app.setApplicationName("krop")
+    old = QSettings()
+    old.sync()
+    saved = [(key, old.value(key)) for key in old.allKeys()]
+    app.setApplicationName(new_name)
+    new = QSettings()
+    for key, value in saved:
+        if not new.contains(key):
+            new.setValue(key, value)
+    new.setValue("MigratedFrom/krop", "true")
+    new.sync()
+
+
 def main():
     from argparse import ArgumentParser, RawTextHelpFormatter
-    parser = ArgumentParser(prog='krop', description=__doc__,
+    parser = ArgumentParser(prog='kroppy', description=__doc__,
             formatter_class=RawTextHelpFormatter)
 
     parser.add_argument('-v', '--version', action='version', version='%(prog)s ' + __version__)
@@ -53,8 +82,8 @@ def main():
     parser.add_argument('--trim-use', type=str, choices=['initial', 'all'], help='whether to inspect only the initial page or all pages (slow!) when auto trimming (default: previous value)')
     parser.add_argument('--trim-padding', help='how much padding to include when auto trimming (default: previous value)')
 
-    parser.add_argument('--log', help='run log to append to, one flushed line per event (default: <input>.krop.log beside the PDF, with a session header of version, platform and time; if that folder is not writable, a file under ~/.local/state/krop-trimall). "off" disables. $KROP_LOG is used when this option is omitted')
-    parser.add_argument('--go', action='store_true', help='output PDF without opening the krop GUI (using the choices supplied on the command line); if used in a script without X server access, you can run krop using xvfb-run')
+    parser.add_argument('--log', help='run log to append to, one flushed line per event (default: <input>.kroppy.log beside the PDF, with a session header of version, platform and time; if that folder is not writable, a file under ~/.local/state/kroppy). "off" disables. $KROP_LOG is used when this option is omitted')
+    parser.add_argument('--go', action='store_true', help='output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb-run')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
     parser.add_argument('--use-qt5', action='store_true', help='use PyQt5 instead of PyQt6 (default: use PyQt6 if available)')
@@ -68,11 +97,11 @@ def main():
 
     from krop.qt import QApplication
     app = QApplication(sys.argv)
-    app.setApplicationName("krop")
-    app.setApplicationDisplayName("krop")
-
     app.setOrganizationName("arminstraub.com")
     app.setOrganizationDomain("arminstraub.com")
+    app.setApplicationName("kroppy")
+    app.setApplicationDisplayName("kroppy")
+    migrate_qsettings()
 
     import os
     from krop.activitylog import install as _installLog, patch_classes

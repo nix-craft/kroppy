@@ -134,6 +134,14 @@ class MainWindow(QMainWindow):
 
         self.ui=Ui_MainWindow()
         self.ui.setupUi(self)
+        self.setWindowTitle("kroppy")
+        about = QAction(self.tr("About kroppy"), self)
+        menu_role = getattr(QAction, "MenuRole", None)
+        about_role = getattr(menu_role, "AboutRole", None) if menu_role else getattr(QAction, "AboutRole", None)
+        if about_role is not None:
+            about.setMenuRole(about_role)
+        about.triggered.connect(self.slotAbout)
+        self.menuBar().addMenu(self.tr("&Help")).addAction(about)
 
         # these options are awkwardly named and possibly confusing, so they are
         # not shown by default
@@ -227,7 +235,7 @@ class MainWindow(QMainWindow):
         self.spinDust.setRange(0, 500)
         self.spinDust.setPrefix(self.tr("Dust "))
         self.spinDust.setSuffix(" px")
-        self.spinDust.setToolTip(self.tr("Copier trim: rows/columns with fewer dark pixels than this (in krop's preview) count as blank"))
+        self.spinDust.setToolTip(self.tr("Copier trim: rows/columns with fewer dark pixels than this (in kroppy's preview) count as blank"))
         _s = QSettings()
         self.checkCopierTrim.setChecked(_s.value("Trim/CopierTrim", "true") == "true")
         self.spinDust.setValue(int(_s.value("Trim/Dust", "4")))
@@ -241,7 +249,7 @@ class MainWindow(QMainWindow):
         self.spinMinGap.setPrefix(self.tr("Min gap "))
         self.spinMinGap.setSuffix(" px")
         self.spinMinGap.setToolTip(self.tr("Skip region: white space must be at least this many rows/columns "
-            "(in krop's preview) to count as a break; smaller gaps are skipped as part of the same region"))
+            "(in kroppy's preview) to count as a break; smaller gaps are skipped as part of the same region"))
         self.spinMinGap.setValue(int(_s.value("Skip/MinGap", "1")))
         self.spinMinGap.valueChanged.connect(lambda v: QSettings().setValue("Skip/MinGap", str(v)))
         self.ui.toolBar.addWidget(self.spinMinGap)
@@ -358,6 +366,12 @@ class MainWindow(QMainWindow):
         self.selAspectRatioTypes.saveTypes(settings)
         self.deviceTypes.saveTypes(settings)
 
+    def slotAbout(self):
+        from krop.version import __version__
+        QMessageBox.about(self, self.tr("About kroppy"),
+                self.tr("<h3>kroppy %s</h3>"
+                    "<p>A tool to crop PDF files.</p>") % __version__)
+
     def openFile(self, fileName, recoverCrops=None):
         if fileName:
             from krop.activitylog import attach_input
@@ -374,7 +388,7 @@ class MainWindow(QMainWindow):
                     from krop.recovercrop import expandCropped
                     recovered = expandCropped(fileName)
                 except Exception as e:
-                    sys.stderr.write("krop: could not recover crop boxes: %r\n" % e)
+                    sys.stderr.write("kroppy: could not recover crop boxes: %r\n" % e)
             self.viewer.load(recovered[0] if recovered else fileName)
             if not self.viewer.isEmpty():
                 # crop from the full-page copy, but name output after the original
@@ -564,7 +578,7 @@ class MainWindow(QMainWindow):
             hardcrop_file(outputFileName)
         except Exception as err:
             log("HARD", "hard crop failed: %r" % err)
-            sys.stderr.write("krop: hard crop failed (%s); output left as cropped by krop\n" % err)
+            sys.stderr.write("kroppy: hard crop failed (%s); output left as cropped by kroppy\n" % err)
 
     def slotZoomIn(self):
         self.ui.actionFitInView.setChecked(False)

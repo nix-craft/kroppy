@@ -5,14 +5,14 @@
   <launchable type="desktop-id">com.arminstraub.krop.desktop</launchable>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0+</project_license>
-  <name>krop</name>
+  <name>kroppy</name>
   <developer id="com.arminstraub">
     <name>Armin Straub</name>
   </developer>
   <summary>Crop PDF files</summary>
   <description>
     <p>
-        krop is a simple graphical tool to crop the pages of PDF files. It is written in Python and relies on PyQt and PyMuPDF (or a suitable subset of pypdf/pikepdf/python-poppler-qt) for its functionality. A unique feature of krop is its ability to automatically split pages into subpages to fit the limited screen size of devices such as eReaders. This is particularly useful, if your eReader does not support convenient scrolling.
+        kroppy is a simple graphical tool to crop the pages of PDF files. It is written in Python and relies on PyQt and PyMuPDF (or a suitable subset of pypdf/pikepdf/python-poppler-qt) for its functionality. A unique feature of krop is its ability to automatically split pages into subpages to fit the limited screen size of devices such as eReaders. This is particularly useful, if your eReader does not support convenient scrolling.
     </p>
   </description>
   <keywords>
@@ -24,7 +24,7 @@
   <screenshots>
     <screenshot type="default">
       <image type="source" width="1024" height="576">https://arminstraub.com/images/krop/screenshot-appdata.png</image>
-      <caption>Main window of krop</caption>
+      <caption>Main window of kroppy</caption>
     </screenshot>
   </screenshots>
   <url type="homepage">https://arminstraub.com/software/krop</url>

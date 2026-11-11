@@ -1,5 +1,6 @@
 build/
 dist/
+packaging/codecs/
 .pybuild/
 MANIFEST
 krop.egg-info/

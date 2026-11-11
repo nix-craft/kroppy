@@ -10,8 +10,9 @@ XObjects (and the cm that places them) change.  Text and vector drawing are
 untouched, and page boxes (CropBox, MediaBox, KropFullBox) are kept.
 
 Images that cannot be cropped without changing their encoding are left as they
-are.  JPEG needs jpegtran and JBIG2 needs the jbig2 encoder on PATH; when
-either tool is missing that image is left unchanged.
+are.  JPEG needs jpegtran and JBIG2 needs the jbig2 encoder plus jbig2dec.
+Bundled copies (next to a frozen app, or under sys._MEIPASS/codecs) are used
+before programs on PATH.  When a tool is missing that image is left unchanged.
 """
 
 """
@@ -193,9 +194,64 @@ def fix_pred(p, W, w):
     q = Dictionary(dict(p.items())); q.Columns = w
     return q
 
-def _require_tool(name):
-    if shutil.which(name) is None:
+_CODECS = ("jbig2", "jbig2dec", "jpegtran")
+_bundled_ready = False
+
+
+def bundled_codec_dirs():
+    """Directories that may hold jbig2, jbig2dec, and jpegtran shipped with the app."""
+    dirs = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(os.path.join(meipass, "codecs"))
+        dirs.append(meipass)
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        dirs.append(os.path.join(exe_dir, "codecs"))
+        dirs.append(exe_dir)
+        # macOS .app: the executable lives in Contents/MacOS
+        dirs.append(os.path.normpath(os.path.join(exe_dir, "..", "Resources", "codecs")))
+    seen = []
+    for d in dirs:
+        d = os.path.abspath(d)
+        if d not in seen and os.path.isdir(d):
+            seen.append(d)
+    return seen
+
+
+def prefer_bundled_codecs():
+    """Put bundled codec directories at the front of PATH, once.
+
+    pikepdf invokes ``jbig2dec`` by name, so PATH is how that decoder is found.
+    """
+    global _bundled_ready
+    if _bundled_ready:
+        return
+    _bundled_ready = True
+    names = []
+    for base in _CODECS:
+        names.append(base)
+        names.append(base + ".exe")
+    extra = []
+    for d in bundled_codec_dirs():
+        try:
+            entries = set(os.listdir(d))
+        except OSError:
+            continue
+        if any(n in entries for n in names):
+            extra.append(d)
+    if not extra:
+        return
+    os.environ["PATH"] = os.pathsep.join(extra + [os.environ.get("PATH", "")])
+
+
+def tool_path(name):
+    """Absolute path of a codec program, preferring a bundled copy."""
+    prefer_bundled_codecs()
+    found = shutil.which(name)
+    if not found:
         raise Unsupported("%s is not available" % name)
+    return found
 
 def crop_image(pdf, st, L, T, R, B, tmp, ncomp_fn=None):
     """Return (new_stream, (L,T,R,B) actually used). Encoding is preserved."""
@@ -226,20 +282,20 @@ def crop_image(pdf, st, L, T, R, B, tmp, ncomp_fn=None):
         if im.size != (W, H) or im.mode != "1": raise Unsupported("JBIG2 decode gave %s %s" % (im.mode, im.size))
         a = np.array(im, dtype=bool)[T:B, L:R]                       # True = sample 1
         w, h = R - L, B - T
-        _require_tool("jbig2")
+        jbig2 = tool_path("jbig2")
         pbm = os.path.join(tmp, "c.pbm")                             # PBM: 1 = black = sample 0
         with open(pbm, "wb") as fh:
             fh.write(b"P4\n%d %d\n" % (w, h) + np.packbits(~a, axis=1).tobytes())
-        proc = subprocess.run(["jbig2", "-p", pbm], check=False, capture_output=True)
+        proc = subprocess.run([jbig2, "-p", pbm], check=False, capture_output=True)
         if proc.returncode != 0 or not proc.stdout:
             raise Unsupported("jbig2 failed: %s" % proc.stderr.decode("utf-8", "replace")[:200])
         out = proc.stdout
         ncp = None                                                   # generic region, no Globals
     elif codec == "dct":
-        _require_tool("jpegtran")
+        jpegtran = tool_path("jpegtran")
         src = os.path.join(tmp, "s.jpg"); dst = os.path.join(tmp, "d.jpg")
         with open(src, "wb") as fh: fh.write(payload)
-        proc = subprocess.run(["jpegtran", "-copy", "all", "-crop", "%dx%d+%d+%d" % (R-L, B-T, L, T),
+        proc = subprocess.run([jpegtran, "-copy", "all", "-crop", "%dx%d+%d+%d" % (R-L, B-T, L, T),
                         "-outfile", dst, src], check=False, capture_output=True)
         if proc.returncode != 0 or not os.path.exists(dst):
             raise Unsupported("jpegtran failed: %s" % proc.stderr.decode("utf-8", "replace")[:200])
@@ -684,6 +740,7 @@ def hardcrop_file(path):
     A page or image that cannot be cropped safely is left as it is and logged.
     Returns the stats dict, or None if the file could not be opened.
     """
+    prefer_bundled_codecs()
     pdf = None
     hc = None
     tmp = None

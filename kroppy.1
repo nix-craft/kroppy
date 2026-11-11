@@ -1,0 +1,79 @@
+.TH kroppy 1
+.SH NAME
+kroppy, krop, krop-trimall \- a tool to crop PDF files
+.SH SYNOPSIS
+.B kroppy
+.RI [ options ]
+.RI [ file ]
+.br
+.SH DESCRIPTION
+This manual page briefly documents the
+.B kroppy
+command.
+.B krop
+and
+.B krop-trimall
+are the same program.
+.PP
+\fBkroppy\fP is a simple graphical tool to crop the pages of PDF files. It is written
+in Python and relies on PyQt and PyMuPDF (or a suitable subset of pypdf/pikepdf/
+python-poppler-qt) for its functionality.  A unique feature of kroppy is its
+ability to automatically split pages into subpages to fit the limited screen
+size of devices such as eReaders. This is particularly useful, if your eReader
+does not support convenient scrolling.
+.SH OPTIONS
+A summary of options is included below.
+For a complete description, use the \fB\-\-help\fP option.
+.SS "Arguments:"
+.TP
+.B file
+PDF file to open
+.SS "Options:"
+.TP
+.B \-h, \-\-help
+show help, including all options, and exit
+.TP
+.B \-v, \-\-version
+show program's version number and exit
+.TP
+.B \-o OUTPUT, \-\-output OUTPUT
+where to save the cropped PDF
+.TP
+.B \-\-whichpages WHICHPAGES
+which pages (e.g. "1\-5" or "1,3\-") to include in cropped PDF (default: all)
+.TP
+.B \-\-rotate {0,90,180,270}
+how much to rotate the cropped pdf clockwise (default: 0)
+.TP
+.B \-\-optimize {gs,no}
+whether to optimize the final PDF using ghostscript (default: previous choice)
+.TP
+.B \-\-hard\-crop
+hard-crop embedded images to the visible page box when saving, keeping their original encoding (default: previous choice, initially off)
+.TP
+.B \-\-grid GRID
+if set to 2x3, for instance, creates a 2x3 grid of selections on initial page; if only one number is specified, the number of columns/rows is determined according to whether the page is landscape or portrait
+.TP
+.B \-\-initialpage INITIALPAGE
+which page to open initially (default: 1)
+.TP
+.B \-\-selections {all,evenodd,individual}
+to which pages should selections apply
+.TP
+.B \-\-exceptions EXCEPTIONS
+pages (e.g. "1\-5" or "1,3\-") which require individual selections
+.TP
+.B \-\-trim
+if specified, will auto trim initial selections
+.TP
+.B \-\-trim-use {initial,all}
+whether to inspect only the initial page or all pages (slow!) when auto trimming (default: previous value)
+.TP
+.B \-\-trim\-padding TRIM_PADDING
+how much padding to include when auto trimming (default: previous value)
+.TP
+.B \-\-log LOG
+run log to append to (default: <input>.kroppy.log beside the PDF; if that folder is not writable, a file under ~/.local/state/kroppy). "off" disables. $KROP_LOG is used when this option is omitted
+.TP
+.B \-\-go
+output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb\-run

@@ -378,8 +378,8 @@ class Ui_MainWindow(object):
     def retranslateUi(self, MainWindow):
         _translate = QtCore.QCoreApplication.translate
         self.groupSaveTo.setTitle(_translate("MainWindow", "Save cropped PDF to"))
-        self.editFile.setToolTip(_translate("MainWindow", "<p>This is where the cropped PDF will be saved after you choose <i>Krop!</i> in the menu.</p>"))
-        self.buttonFileSelect.setToolTip(_translate("MainWindow", "<p>This is where the cropped PDF will be saved after you choose <i>Krop!</i> in the menu.</p>"))
+        self.editFile.setToolTip(_translate("MainWindow", "<p>This is where the cropped PDF will be saved after you choose <i>Kroppy!</i> in the menu.</p>"))
+        self.buttonFileSelect.setToolTip(_translate("MainWindow", "<p>This is where the cropped PDF will be saved after you choose <i>Kroppy!</i> in the menu.</p>"))
         self.checkHardCrop.setToolTip(_translate("MainWindow", "<p>Crop each embedded image to the visible page box while keeping its original encoding. Text and vector drawing are left unchanged. An image that cannot be cropped safely is left as it is.</p>"))
         self.checkHardCrop.setText(_translate("MainWindow", "Hard Crop on Save"))
         self.groupPDFOperations.setTitle(_translate("MainWindow", "Extra operations on the final PDF"))
@@ -424,7 +424,7 @@ class Ui_MainWindow(object):
         self.tabWidget.setTabText(self.tabWidget.indexOf(self.tabAdvanced), _translate("MainWindow", "Advanced"))
         self.labelHelp.setText(_translate("MainWindow", "<h3>Getting started</h3>\n"
 "<p>Using your mouse, create one or more selections on the pdf document. These are the regions that will be included into the cropped file.</p>\n"
-"<p>When you are done, click <i>Krop!</i> in the menu to create a cropped version of your document.</p>\n"
+"<p>When you are done, click <i>Kroppy!</i> in the menu to create a cropped version of your document.</p>\n"
 "<h3>Hints</h3>\n"
 "<p>Right-click the page to create a selection for the full page (or a grid of selections).</p>\n"
 "<p>Right-click a selection to delete it. Or simply press the Delete key.</p>\n"
@@ -449,7 +449,7 @@ class Ui_MainWindow(object):
         self.actionOpenFile.setText(_translate("MainWindow", "Open"))
         self.actionOpenFile.setShortcut(_translate("MainWindow", "Ctrl+O"))
         self.actionFitInView.setText(_translate("MainWindow", "Fit In View"))
-        self.actionKrop.setText(_translate("MainWindow", "Krop!"))
+        self.actionKrop.setText(_translate("MainWindow", "Kroppy!"))
         self.actionDeleteSelection.setText(_translate("MainWindow", "Delete Selection"))
         self.actionDeleteSelection.setShortcut(_translate("MainWindow", "Del"))
         self.actionFirstPage.setText(_translate("MainWindow", "First Page"))

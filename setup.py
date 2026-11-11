@@ -32,18 +32,22 @@ setup(
         author = 'Armin Straub',
         author_email = 'mail@arminstraub.com',
         url = 'https://arminstraub.com/software/krop',
-        description = 'A tool to crop PDF files',
-        long_description = 'krop is a simple graphical tool to crop the pages of PDF files. It is written in Python and relies on PyQt and PyMuPDF (or a suitable subset of pypdf/pikepdf/python-poppler-qt) for its functionality. A unique feature of krop is its ability to automatically split pages into subpages to fit the limited screen size of devices such as eReaders. This is particularly useful, if your eReader does not support convenient scrolling.',
+        description = 'kroppy: a tool to crop PDF files',
+        long_description = 'kroppy is a simple graphical tool to crop the pages of PDF files. It is written in Python and relies on PyQt and PyMuPDF (or a suitable subset of pypdf/pikepdf/python-poppler-qt) for its functionality. A unique feature of kroppy is its ability to automatically split pages into subpages to fit the limited screen size of devices such as eReaders. This is particularly useful, if your eReader does not support convenient scrolling.',
         # this is redundant but the egg/wheel produced by setuptools otherwise reports "License: UNKNOWN"
         license = 'GPL-3.0-or-later',
         keywords = 'pdf crop ereader',
         packages = ['krop'],
         entry_points = {
-            'console_scripts': ['krop = krop.__main__:main']
+            'console_scripts': [
+                'kroppy = krop.__main__:main',
+                'krop = krop.__main__:main',
+                'krop-trimall = krop.__main__:main',
+            ]
         },
         data_files = [
             ('share/applications', ['com.arminstraub.krop.desktop']),
-            ('share/man/man1', ['krop.1']),
+            ('share/man/man1', ['kroppy.1', 'krop.1']),
             ('share/metainfo', ['com.arminstraub.krop.metainfo.xml']),
             ('share/icons/hicolor/scalable/apps', ['com.arminstraub.krop.svg'])
         ],
