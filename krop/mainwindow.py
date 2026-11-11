@@ -325,6 +325,7 @@ class MainWindow(QMainWindow):
                 settings.value("Trim/Sensitivity", "5"))
 
         self.ui.checkGhostscript.setChecked(settings.value("PDF/Optimize", "gs") == "gs")
+        self.ui.checkHardCrop.setChecked(settings.value("PDF/HardCrop", "") == "true")
         self.ui.checkIncludePagesWithoutSelections.setChecked(
                 settings.value("PDF/IncludePagesWithoutSelections", "") == "true")
 
@@ -349,6 +350,8 @@ class MainWindow(QMainWindow):
 
         settings.setValue("PDF/Optimize", "gs" if
                 self.ui.checkGhostscript.isChecked() else "no")
+        settings.setValue("PDF/HardCrop", "true" if
+                self.ui.checkHardCrop.isChecked() else "false")
         settings.setValue("PDF/IncludePagesWithoutSelections", "true" if
                 self.ui.checkIncludePagesWithoutSelections.isChecked() else "false")
 
@@ -505,6 +508,8 @@ class MainWindow(QMainWindow):
                     os.remove(fp.name)
             else:
                 cropper.writeToFile(outputFileName)
+            if self.ui.checkHardCrop.isChecked():
+                self.hardCropFile(outputFileName)
             QApplication.restoreOverrideCursor()
         except PdfEncryptedError as err:
             QApplication.restoreOverrideCursor()
@@ -526,6 +531,15 @@ class MainWindow(QMainWindow):
                     self.tr("The following unexpected error has occured:"
                     "\n\n{0}").format(err))
             raise err
+
+    def hardCropFile(self, outputFileName):
+        """Physically crop embedded images to the visible box. Never fails the save."""
+        try:
+            from krop.hardcrop import hardcrop_file
+            hardcrop_file(outputFileName)
+        except Exception as err:
+            log("HARD", "hard crop failed: %r" % err)
+            sys.stderr.write("krop: hard crop failed (%s); output left as cropped by krop\n" % err)
 
     def slotZoomIn(self):
         self.ui.actionFitInView.setChecked(False)

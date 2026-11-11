@@ -65,6 +65,19 @@
           </widget>
          </item>
          <item>
+          <widget class="QCheckBox" name="checkHardCrop">
+           <property name="toolTip">
+            <string>&lt;p&gt;Crop each embedded image to the visible page box while keeping its original encoding. Text and vector drawing are left unchanged. An image that cannot be cropped safely is left as it is.&lt;/p&gt;</string>
+           </property>
+           <property name="text">
+            <string>Hard Crop on Save</string>
+           </property>
+           <property name="checked">
+            <bool>false</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QGroupBox" name="groupPDFOperations">
            <property name="title">
             <string>Extra operations on the final PDF</string>

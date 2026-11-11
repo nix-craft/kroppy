@@ -44,6 +44,9 @@ how much to rotate the cropped pdf clockwise (default: 0)
 .B \-\-optimize {gs,no}
 whether to optimize the final PDF using ghostscript (default: previous choice)
 .TP
+.B \-\-hard\-crop
+hard-crop embedded images to the visible page box when saving, keeping their original encoding (default: previous choice, initially off)
+.TP
 .B \-\-grid GRID
 if set to 2x3, for instance, creates a 2x3 grid of selections on initial page; if only one number is specified, the number of columns/rows is determined according to whether the page is landscape or portrait
 .TP
