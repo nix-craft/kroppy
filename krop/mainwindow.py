@@ -146,6 +146,24 @@ class MainWindow(QMainWindow):
         log_prefs = QAction(self.tr("Run log..."), self)
         log_prefs.triggered.connect(self.slotLogPreferences)
         settings_menu.addAction(log_prefs)
+        self._analysis_job = None
+        self._analysis_jobs = []
+        from krop.analyzepanel import AnalysisPanel
+        self.analysisPanel = AnalysisPanel(self)
+        self.analysisPanel.page_requested.connect(self.slotShowAnalysisPage)
+        try:
+            dock_right = Qt.DockWidgetArea.RightDockWidgetArea
+        except AttributeError:
+            dock_right = Qt.RightDockWidgetArea
+        self.addDockWidget(dock_right, self.analysisPanel)
+        view_menu = self.menuBar().addMenu(self.tr("&View"))
+        self.actionAnalysis = QAction(self.tr("Analysis"), self)
+        self.actionAnalysis.setCheckable(True)
+        self.actionAnalysis.setChecked(False)
+        self.actionAnalysis.toggled.connect(self.analysisPanel.setVisible)
+        self.analysisPanel.visibilityChanged.connect(self.actionAnalysis.setChecked)
+        view_menu.addAction(self.actionAnalysis)
+        self.analysisPanel.hide()
 
         # these options are awkwardly named and possibly confusing, so they are
         # not shown by default
@@ -327,6 +345,8 @@ class MainWindow(QMainWindow):
         if splitter:
             self.ui.splitter.restoreState(splitter)
         self.ui.actionFitInView.setChecked(settings.value("Window/FitInView", "") == "true")
+        if settings.value("Window/Analysis", "") == "true":
+            self.actionAnalysis.setChecked(True)
 
         self.ui.checkTrimUseAllPages.setChecked(settings.value("Trim/UseAllPages", "") == "true")
         self.ui.editPadding.setText(
@@ -350,6 +370,8 @@ class MainWindow(QMainWindow):
         settings.setValue("Window/Splitter", self.ui.splitter.saveState())
         settings.setValue("Window/FitInView", "true" if
                 self.ui.actionFitInView.isChecked() else "false")
+        settings.setValue("Window/Analysis", "true" if
+                self.analysisPanel.isVisible() else "false")
 
         settings.setValue("Trim/UseAllPages", "true" if
                 self.ui.checkTrimUseAllPages.isChecked() else "false")
@@ -458,6 +480,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.statusBar().showMessage(self.tr("Run log: %s") % fallback)
             log("OPEN", fileName)
+            self.startAnalysis(fileName)
             if recoverCrops is None:
                 recoverCrops = self.recoverCrops
             recovered = None
@@ -1220,5 +1243,48 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         self.slotFitInView(self.ui.actionFitInView.isChecked())
 
+    def startAnalysis(self, path):
+        self.cancelAnalysis()
+        if not path or not getattr(self, "analyzeOnOpen", True):
+            return
+        from krop.analyzepanel import AnalyzeJob
+        job = AnalyzeJob(path)
+        job.done.connect(self._onAnalysis)
+        job.finished.connect(job.deleteLater)
+        self._analysis_job = job
+        self._analysis_jobs.append(job)
+        self.analysisPanel.set_running(path)
+        job.start()
+
+    def cancelAnalysis(self, wait=False):
+        job = self._analysis_job
+        if job is None:
+            return
+        job.cancel.set()
+        try:
+            job.done.disconnect(self._onAnalysis)
+        except Exception:
+            pass
+        self._analysis_job = None
+        if wait and job.isRunning():
+            job.wait(60000)
+
+    def _onAnalysis(self, data):
+        self.analysisPanel.set_result(data)
+        if not data or data.get("error"):
+            log("ANALYZE", "failed" if not data else "failed: %s" % data["error"].splitlines()[-1])
+            return
+        from krop.analyze import analyze_lines
+        for line in analyze_lines(data):
+            log("ANALYZE", line)
+
+    def slotShowAnalysisPage(self, page):
+        if self.viewer.isEmpty():
+            return
+        self.viewer.currentPageIndex = max(0, int(page) - 1)
+        self.updateControls()
+        self.slotFitInView(self.ui.actionFitInView.isChecked())
+
     def closeEvent(self, event):
+        self.cancelAnalysis(wait=True)
         self.writeSettings()
