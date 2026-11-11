@@ -142,6 +142,10 @@ class MainWindow(QMainWindow):
             about.setMenuRole(about_role)
         about.triggered.connect(self.slotAbout)
         self.menuBar().addMenu(self.tr("&Help")).addAction(about)
+        settings_menu = self.menuBar().addMenu(self.tr("&Settings"))
+        log_prefs = QAction(self.tr("Run log..."), self)
+        log_prefs.triggered.connect(self.slotLogPreferences)
+        settings_menu.addAction(log_prefs)
 
         # these options are awkwardly named and possibly confusing, so they are
         # not shown by default
@@ -366,6 +370,76 @@ class MainWindow(QMainWindow):
         self.selAspectRatioTypes.saveTypes(settings)
         self.deviceTypes.saveTypes(settings)
 
+    def makeLogPreferencesDialog(self):
+        """Dialog for where the run log goes and when it is deleted."""
+        from krop.activitylog import user_log_dir
+        settings = QSettings()
+        keep = settings.value("Log/Keep", "on-error") or "on-error"
+        place = settings.value("Log/Location", "beside") or "beside"
+        dlg = QDialog(self)
+        dlg.setWindowTitle(self.tr("Run log"))
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(self.tr("When to keep the log")))
+        keep_group = QButtonGroup(dlg)
+        keep_buttons = {}
+        for key, label in (
+                ("on-error", self.tr("Delete after clean save (default)")),
+                ("always", self.tr("Always keep")),
+                ("off", self.tr("Off (no log)"))):
+            button = QRadioButton(label)
+            button.setObjectName("logKeep-" + key)
+            keep_group.addButton(button)
+            layout.addWidget(button)
+            keep_buttons[key] = button
+        keep_buttons.get(keep, keep_buttons["on-error"]).setChecked(True)
+        layout.addWidget(QLabel(self.tr("Where to write it")))
+        place_group = QButtonGroup(dlg)
+        place_buttons = {}
+        for key, label in (
+                ("beside", self.tr("Beside the PDF")),
+                ("central", self.tr("Central folder (%s)") % user_log_dir())):
+            button = QRadioButton(label)
+            button.setObjectName("logPlace-" + key)
+            place_group.addButton(button)
+            layout.addWidget(button)
+            place_buttons[key] = button
+        place_buttons.get(place, place_buttons["beside"]).setChecked(True)
+        try:
+            ok = QDialogButtonBox.StandardButton.Ok
+            cancel = QDialogButtonBox.StandardButton.Cancel
+        except AttributeError:
+            ok = QDialogButtonBox.Ok
+            cancel = QDialogButtonBox.Cancel
+        buttons = QDialogButtonBox(ok | cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        dlg._keep_buttons = keep_buttons
+        dlg._place_buttons = place_buttons
+        return dlg
+
+    def applyLogPreferencesDialog(self, dlg):
+        keep = "on-error"
+        for key, button in dlg._keep_buttons.items():
+            if button.isChecked():
+                keep = key
+        place = "beside"
+        for key, button in dlg._place_buttons.items():
+            if button.isChecked():
+                place = key
+        settings = QSettings()
+        settings.setValue("Log/Keep", keep)
+        settings.setValue("Log/Location", place)
+        settings.sync()
+        from krop.activitylog import apply_preferences
+        apply_preferences()
+
+    def slotLogPreferences(self):
+        dlg = self.makeLogPreferencesDialog()
+        runner = getattr(dlg, "exec", None) or getattr(dlg, "exec_")
+        if runner():
+            self.applyLogPreferencesDialog(dlg)
+
     def slotAbout(self):
         from krop.version import __version__
         QMessageBox.about(self, self.tr("About kroppy"),
@@ -377,8 +451,12 @@ class MainWindow(QMainWindow):
             from krop.activitylog import attach_input
             fallback = attach_input(fileName)
             if fallback:
-                self.statusBar().showMessage(self.tr(
-                    "Could not write a log beside the PDF. Logging to %s") % fallback)
+                from krop.activitylog import log_where
+                if log_where() == "fallback":
+                    self.statusBar().showMessage(self.tr(
+                        "Could not write a log beside the PDF. Logging to %s") % fallback)
+                else:
+                    self.statusBar().showMessage(self.tr("Run log: %s") % fallback)
             log("OPEN", fileName)
             if recoverCrops is None:
                 recoverCrops = self.recoverCrops
@@ -534,6 +612,8 @@ class MainWindow(QMainWindow):
                 cropper.writeToFile(outputFileName)
             if self.ui.checkHardCrop.isChecked():
                 self.hardCropFile(outputFileName)
+            from krop.activitylog import note_clean_save
+            note_clean_save()
             QApplication.restoreOverrideCursor()
         except PdfEncryptedError as err:
             QApplication.restoreOverrideCursor()
