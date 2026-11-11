@@ -242,9 +242,16 @@ def test_preview_toggle_shows_quantized_pixels_and_does_not_write(window, tmp_pa
     assert ready, "preview did not arrive"
     xref, target, rotation = ready[0]
     assert target != "keep"
-    image = w.viewer.previewImage(xref, target, rotation)
+    # The page pixmap itself is MuPDF's render of the replaced image.
+    rects = w.viewer.imagePlacementRects(xref)
+    assert rects
+    x, y, rw, rh = rects[0][:4]
+    image = w.viewer.getImage(w.viewer.currentPageIndex)
+    px = int(x - w.viewer.irect.left() + rw / 2)
+    py = int(y - w.viewer.irect.top() + rh / 2)
     expect = quantize_pixels(np.full((24, 24), 100, np.uint8), target)
-    assert image.pixelColor(image.width() // 2, image.height() // 2).red() == int(expect[0, 0, 0])
+    got = image.pixelColor(px, py).red()
+    assert abs(got - int(expect[0, 0, 0])) <= 2, (got, int(expect[0, 0, 0]), target)
     assert src.read_bytes() == original
 
     # Hold Alt to compare with the original. Releasing it brings the preview back.

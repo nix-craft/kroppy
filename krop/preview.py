@@ -143,10 +143,12 @@ def preview_rgba(path, xref, target_id, rotation=0, max_edge=None):
     not use this image at all.
     """
     color, alpha = load_image(path, xref)
-    color = limit_edge(color, max_edge)
+    # Quantize at full resolution, then downscale. Doing it the other way
+    # averages thin black text into the background before a palette is chosen.
+    rgb = quantize_pixels(color, target_id)
+    rgb = limit_edge(rgb, max_edge)
     if alpha is not None:
         alpha = limit_edge(alpha, max_edge)
-    rgb = quantize_pixels(color, target_id)
     rgb = orient_for_page(rgb, rotation)
     if alpha is None:
         alpha = np.full(rgb.shape[:2], 255, np.uint8)

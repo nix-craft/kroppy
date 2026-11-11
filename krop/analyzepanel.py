@@ -117,10 +117,15 @@ def _run_queued(payload):
             payload["path"], payload["xref"], payload["target"],
             payload.get("stored") or 0, payload.get("filt") or "")
     if kind == "preview":
-        from krop.preview import preview_rgba
-        return preview_rgba(
-            payload["path"], payload["xref"], payload["target"], payload.get("rotation") or 0,
-            payload.get("max_edge"))
+        from krop.imagetarget import encode_file_image
+        from krop.pdfimage import cached_encoded
+        entry = encode_file_image(
+            payload["path"], payload["xref"], payload["target"],
+            payload.get("stored") or 0, payload.get("filt") or "")
+        return {
+            "entry": entry,
+            "encoded": cached_encoded(payload["path"], payload["xref"], payload["target"]),
+        }
     return None
 
 
@@ -678,7 +683,14 @@ class AnalysisPanel(QDockWidget):
             self._fail_p0(payload, error or RuntimeError("preview returned nothing"))
             return
         viewer = getattr(self.parent(), "viewer", None)
-        if viewer is not None:
+        if isinstance(result, dict) and result.get("encoded"):
+            if result.get("entry"):
+                self._apply_measure(payload, result["entry"])
+            if viewer is not None:
+                viewer.install_preview(
+                    payload.get("path"), int(xref), target, result["encoded"], token,
+                    int(payload.get("rotation") or 0))
+        elif viewer is not None:
             viewer.deliverPreview({
                 "xref": xref, "target": target,
                 "rotation": payload.get("rotation") or 0, "token": token, "rgba": result,

@@ -1339,11 +1339,10 @@ class MainWindow(QMainWindow):
         viewer.setPreviewPlan(path, plan, rotation)
         urgent = panel.urgent()
         if urgent and urgent[1] != "keep":
-            cached = viewer.previewImage(urgent[0], urgent[1], rotation)
-            if cached is None:
-                viewer.showBusy(urgent[0], urgent[2])
-            else:
+            if viewer.hasPreview(urgent[0], urgent[1], rotation):
                 viewer.clearBusy()
+            else:
+                viewer.showBusy(urgent[0], urgent[2])
         else:
             viewer.clearBusy()
         for xref, target, rot in viewer.missingPreviews():

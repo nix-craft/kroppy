@@ -100,43 +100,198 @@ def pil_const(image, enum_name, name, default):
     return getattr(pil_namespace(image, enum_name), name, default)
 
 
-def _quantize_image(im, n, method, dither):
-    """Call Image.quantize. Pillow before 9.1 has no dither argument."""
+def dither_supported():
+    """True when Image.quantize accepts a dither argument.
+
+    Pillow applies that argument only together with palette=. A build that
+    has no dither parameter cannot honor an indexed-N-d candidate.
+    """
+    import inspect
     try:
-        return im.quantize(colors=int(n), method=method, dither=dither)
+        from PIL import Image
+        return "dither" in inspect.signature(Image.Image.quantize).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _has_libimagequant():
+    try:
+        from PIL import features
+        return bool(features.check_feature("libimagequant"))
+    except Exception:
+        return False
+
+
+def _quantize_colors(im, n, method):
+    """Build a palette image. The dither argument is ignored without palette=."""
+    try:
+        return im.quantize(colors=int(n), method=method, dither=0)
     except TypeError:
         return im.quantize(colors=int(n), method=method)
 
 
-def _indexed(sample, n, dither=False):
-    """Return (reconstructed uint8 array, ok). Median-cut, dither optional."""
+def _rgb_to_lab(rgb):
+    """rgb float array (..., 3) in 0..255 to Lab."""
+    import numpy as np
+    x = np.clip(rgb.astype(np.float32) / 255.0, 0, 1)
+    lin = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+    m = np.array([
+        [0.4124, 0.3576, 0.1805],
+        [0.2126, 0.7152, 0.0722],
+        [0.0193, 0.1192, 0.9505],
+    ], np.float32)
+    xyz = lin @ m.T
+    xyz = xyz / np.array([0.95047, 1.0, 1.08883], np.float32)
+    delta = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16.0 / 116.0)
+    lab = np.empty_like(xyz)
+    lab[..., 0] = 116.0 * delta[..., 1] - 16.0
+    lab[..., 1] = 500.0 * (delta[..., 0] - delta[..., 1])
+    lab[..., 2] = 200.0 * (delta[..., 1] - delta[..., 2])
+    return lab
+
+
+def _fit_palette(rgb, n):
+    """n RGB colors. Median-cut (or libimagequant), then k-means with extremes pinned.
+
+    The fit uses a downscaled copy. Darkest and lightest pixels stay in the
+    palette so thin black text is not spent on JPEG-noise shades of blue.
+    """
+    import numpy as np
+    from PIL import Image
+    n = max(2, min(256, int(n)))
+    sample = rgb
+    if max(rgb.shape[0], rgb.shape[1]) > 240:
+        from krop.preview import limit_edge
+        sample = limit_edge(np.ascontiguousarray(rgb[..., :3]), 240)
+    flat = np.ascontiguousarray(sample[..., :3]).reshape(-1, 3).astype(np.float32)
+    if flat.shape[0] > 40000:
+        step = int(flat.shape[0] / 40000) + 1
+        flat = flat[::step]
+    luma = flat @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    dark = flat[int(np.argmin(luma))]
+    light = flat[int(np.argmax(luma))]
+    im = Image.fromarray(np.ascontiguousarray(sample[..., :3], dtype=np.uint8), "RGB")
+    method = pil_const(Image, "Quantize", "MEDIANCUT", 0)
+    if _has_libimagequant():
+        method = pil_const(Image, "Quantize", "LIBIMAGEQUANT", method)
+    try:
+        q = _quantize_colors(im, n, method)
+        pal = np.array(q.getpalette()[:n * 3], np.float32).reshape(n, 3)
+    except Exception:
+        octree = pil_const(Image, "Quantize", "FASTOCTREE", 2)
+        q = _quantize_colors(im, n, octree)
+        pal = np.array(q.getpalette()[:n * 3], np.float32).reshape(n, 3)
+    pins = []
+    for color in (dark, light):
+        dist = ((pal - color) ** 2).sum(axis=1)
+        slot = int(np.argmin(dist))
+        if slot in pins and n > len(pins):
+            order = np.argsort(dist)
+            for cand in order[::-1]:
+                if int(cand) not in pins:
+                    slot = int(cand)
+                    break
+        pal[slot] = color
+        pins.append(slot)
+    lab_s = _rgb_to_lab(flat)
+    centers = _rgb_to_lab(pal)
+    for _ in range(4):
+        dist = ((lab_s[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        assign = np.argmin(dist, axis=1)
+        for i in range(n):
+            if i in pins:
+                continue
+            members = flat[assign == i]
+            if len(members):
+                pal[i] = members.mean(axis=0)
+        centers = _rgb_to_lab(pal)
+    return np.clip(np.rint(pal), 0, 255).astype(np.uint8)
+
+
+def _palette_image(pal):
+    from PIL import Image
+    image = Image.new("P", (1, 1))
+    data = []
+    for row in pal:
+        data.extend(int(v) for v in row)
+    data.extend([0] * (768 - len(data)))
+    image.putpalette(data[:768])
+    return image
+
+
+def _map_palette(im, pal, dither):
+    """Map an RGB image through pal. Dither uses quantize(palette=, dither=)."""
+    import numpy as np
+    from PIL import Image
+    pal_img = _palette_image(pal)
+    none = pil_const(Image, "Dither", "NONE", 0)
+    floyd = pil_const(Image, "Dither", "FLOYDSTEINBERG", 3)
+    # NONE is 0, which is also NEAREST. It is only passed as the dither argument.
+    which = floyd if dither else none
+    if dither and not dither_supported():
+        raise TypeError("dither is not supported")
+    try:
+        out = im.quantize(palette=pal_img, dither=which)
+    except TypeError:
+        if dither:
+            raise
+        # method must be an int: Pillow looks up Quantize only when it is omitted,
+        # and that name does not exist on Pillow 9.0.
+        out = im.quantize(palette=pal_img, method=0)
+    return np.asarray(out.convert("RGB"))
+
+
+def _denoise_chroma(rgb):
+    """3x3 box blur of chroma only. Luma stays so text edges remain."""
+    import numpy as np
+    x = rgb.astype(np.float32)
+    r, g, b = x[..., 0], x[..., 1], x[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
+
+    def box(ch):
+        p = np.pad(ch, 1, mode="edge")
+        return (
+            p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+            + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
+            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]
+        ) / 9.0
+
+    cb, cr = box(cb), box(cr)
+    cb = cb - 128.0
+    cr = cr - 128.0
+    r = y + 1.402 * cr
+    g = y - 0.344136 * cb - 0.714136 * cr
+    b = y + 1.772 * cb
+    return np.clip(np.rint(np.stack([r, g, b], axis=-1)), 0, 255).astype(np.uint8)
+
+
+def _indexed(sample, n, dither=False, smooth=False):
+    """Return (reconstructed uint8 array, ok).
+
+    The palette is fit on a downscale, with the darkest and lightest colors
+    kept, then the full image is mapped. Dither is Floyd-Steinberg through
+    quantize(palette=). smooth blurs chroma before the fit and the map;
+    the caller still compares the result with the original.
+    """
     try:
         import numpy as np
         from PIL import Image
     except Exception:
         return None, False
-    if sample.ndim == 2:
-        rgb = np.repeat(sample[:, :, None], 3, axis=2)
-    else:
-        rgb = sample[..., :3]
-    im = Image.fromarray(rgb.astype("uint8"), "RGB")
-    # Image.Dither / Image.Quantize exist only from Pillow 9.1. Older releases
-    # expose the same integers as Image.FLOYDSTEINBERG, Image.NONE, Image.MEDIANCUT.
-    dith = pil_const(Image, "Dither", "FLOYDSTEINBERG" if dither else "NONE", 3 if dither else 0)
-    median = pil_const(Image, "Quantize", "MEDIANCUT", 0)
-    octree = pil_const(Image, "Quantize", "FASTOCTREE", 2)
+    if dither and not dither_supported():
+        return None, False
+    rgb = sample[..., :3] if getattr(sample, "ndim", 0) == 3 else np.repeat(sample[:, :, None], 3, axis=2)
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+    src = _denoise_chroma(rgb) if smooth else rgb
     try:
-        q = _quantize_image(im, n, median, dith)
+        pal = _fit_palette(src, n)
+        im = Image.fromarray(src, "RGB")
+        back = _map_palette(im, pal, dither)
     except Exception:
-        try:
-            q = _quantize_image(im, n, octree, dith)
-        except Exception:
-            try:
-                q = _quantize_image(im, n, None, dith)
-            except Exception:
-                return None, False
-    back = np.asarray(q.convert("RGB"))
-    return back, True
+        return None, False
+    return np.ascontiguousarray(back, dtype=np.uint8), True
 
 
 def _pack_gray(y, bpp):
@@ -311,16 +466,11 @@ def notation(target_id):
     if tid.startswith("jpeg-"):
         return "3ch 24bpp JPEG q%s" % tid.split("-", 1)[1]
     if tid.startswith("indexed-"):
-        dither = tid.endswith("-d")
-        num = tid[len("indexed-"):]
-        if dither:
-            num = num[:-2]
-        try:
-            n = int(num)
-        except ValueError:
-            n = 0
+        n, dither, smooth = _indexed_flags(tid)
         bits = 1 if n <= 2 else 2 if n <= 4 else 4 if n <= 16 else 8
         label = structure_text(1, bits, n or None)
+        if smooth:
+            label += " smooth"
         if dither:
             label += " dither"
         return label
@@ -344,9 +494,14 @@ def ladder_ids(kind, bpc, filt):
         ids.append("rgb-24")
     for quality in (95, 85, 75, 60, 45):
         ids.append("jpeg-%d" % quality)
+    offer_dither = dither_supported()
     for colors in (256, 128, 64, 32, 16, 8, 4):
         ids.append("indexed-%d" % colors)
-        ids.append("indexed-%d-d" % colors)
+        if offer_dither:
+            ids.append("indexed-%d-d" % colors)
+        # Chroma denoise is a separate candidate so its error is visible.
+        if colors <= 32:
+            ids.append("indexed-%d-s" % colors)
     ids.extend(["gray-8", "gray-4", "gray-2", "gray-jpeg-85", "gray-jpeg-60", "1bpp"])
     if _jbig2_available():
         ids.append("jbig2")
@@ -399,14 +554,27 @@ def reconstruct(arr, target_id):
         back, _size = _jpeg_roundtrip(_rgb(arr), int(tid.split("-", 1)[1]))
         return np.ascontiguousarray(back, dtype=np.uint8)
     if tid.startswith("indexed-"):
-        dither = tid.endswith("-d")
-        num = tid[len("indexed-"):]
-        if dither:
-            num = num[:-2]
-        back, ok = _indexed(_rgb(arr), int(num), dither=dither)
+        n, dither, smooth = _indexed_flags(tid)
+        back, ok = _indexed(_rgb(arr), n, dither=dither, smooth=smooth)
         if ok:
             return np.ascontiguousarray(back, dtype=np.uint8)
     return _rgb(arr)
+
+
+def _indexed_flags(target_id):
+    """Return (colors, dither, smooth) for an indexed target id."""
+    body = str(target_id)[len("indexed-"):]
+    dither = body.endswith("-d")
+    if dither:
+        body = body[:-2]
+    smooth = body.endswith("-s")
+    if smooth:
+        body = body[:-2]
+    try:
+        n = int(body)
+    except ValueError:
+        n = 0
+    return n, dither, smooth
 
 
 def _indexed_est(recon, scale):
@@ -638,7 +806,38 @@ def fill_pending_file(path, xref, candidates, stored, filt, threshold, width, he
 
 
 def encode_file_image(path, xref, target_id, stored_bytes, filt):
-    """Trial-encode one candidate for xref. Safe to call off the UI thread."""
+    """Trial-encode one candidate for xref. Safe to call off the UI thread.
+
+    The size is the encoded stream length, not an estimate. The error is
+    MuPDF's decode of that stream against the full-resolution original.
+    The bytes are cached for the working-copy preview and a later save.
+    """
+    import os
+    from krop.pdfimage import cached_entry, decode_stream, encode_stream, remember
+    stored = int(stored_bytes or 0)
+    target_id = str(target_id)
+    if target_id == "keep":
+        return _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
+    hit = cached_entry(path, xref, target_id)
+    if hit is not None:
+        return hit
+    arr = _load_xref_array(path, xref)
+    encoded = encode_stream(arr, target_id)
+    try:
+        recon = decode_stream(encoded)
+    except Exception:
+        recon = encoded.get("recon")
+    threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
+    mae, p995, mx = _error_against(_rgb(arr), recon)
+    over = mae > threshold or p995 > max_ok
+    entry = _entry(
+        target_id, mae, p995, mx, over, len(encoded["data"]),
+        encoded.get("codec") or "", stored)
+    remember(os.path.abspath(path), int(xref), target_id, encoded, entry)
+    return entry
+
+
+def _load_xref_array(path, xref):
     import numpy as np
     import pymupdf
     doc = pymupdf.open(path)
@@ -653,13 +852,6 @@ def encode_file_image(path, xref, target_id, stored_bytes, filt):
         arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n).copy()
         if n == 1:
             arr = arr[:, :, 0]
-        width, height = pix.w, pix.h
+        return arr
     finally:
         doc.close()
-    stored = int(stored_bytes or 0)
-    if target_id == "keep":
-        return _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
-    viewed, _step = _sample(arr)
-    full_pixels = max(1, int(width) * int(height))
-    threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
-    return _eval_target(viewed, target_id, filt or "", full_pixels, stored, threshold, max_ok)

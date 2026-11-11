@@ -51,9 +51,10 @@ def test_indexed_quantize_without_pillow_91_enums(monkeypatch):
     assert ok
     assert back.shape == arr.shape
     assert len({tuple(int(v) for v in px) for px in back.reshape(-1, 3)}) <= 4
+    from krop.imagetarget import dither_supported
+    assert dither_supported() is False
     dithered, ok_d = _indexed(arr, 4, dither=True)
-    assert ok_d
-    assert dithered.shape == arr.shape
+    assert dithered is None and ok_d is False
 
     # Image.NONE is 0, which is also NEAREST. The preview resampler must not
     # pass that into resize when the Resampling enum is missing. Pillow 13's

@@ -366,6 +366,13 @@ class AbstractViewerItem(QGraphicsItem):
         self._preview_pending = set()
         self._preview_jobs = []
         self._preview_gen = getattr(self, "_preview_gen", 0) + 1
+        self._preview_doc = None
+        self._preview_plan = []
+        self._preview_path = None
+        self._ready_streams = {}
+        self._preview_choices = ()
+        self._working = None
+        self._preview_zoom = 1.0
 
     def boundingRect(self):
         return self.brect
@@ -462,26 +469,118 @@ class AbstractViewerItem(QGraphicsItem):
         return [item for item in getattr(self, "_outlines", []) or [] if item.scene() is not None]
 
     def clearPreviews(self):
-        """Hide previews. Cached images are kept so they can return at once."""
+        """Show the original page again. Encoded streams stay cached."""
         self._preview_wanted = set()
+        self._preview_doc = None
+        self._preview_choices = ()
+        if self._images:
+            self._images = [None for _ in self._images]
         self.clearBusy()
         self.update()
 
-    def setPreviewPlan(self, path, plan, rotation):
-        """Remember which previews the current page should show.
+    def preview_cache_key(self):
+        """(page, zoom, choices) of the working-copy render, or None."""
+        if self._preview_doc is None:
+            return None
+        return (int(self.currentPageIndex), float(self._preview_zoom), tuple(self._preview_choices))
 
-        Encoding is queued by the analysis panel so a chosen target can jump
-        the line. path is unused here and kept so callers stay the same.
+    def _zoom_bucket(self):
+        zoom = 1.0
+        scene = self.scene() if hasattr(self, "scene") else None
+        if scene is not None:
+            for view in scene.views():
+                try:
+                    zoom = max(zoom, abs(float(view.transform().m11())))
+                except Exception:
+                    continue
+        return round(zoom, 2)
+
+    def setPreviewPlan(self, path, plan, rotation):
+        """Remember which images should be drawn from the working copy.
+
+        Streams that are already encoded are installed immediately. The page
+        pixmap then comes from MuPDF, at the viewer's usual resolution, scaled
+        by the view to the current zoom.
         """
         rot = int(rotation or 0)
         wanted = set()
+        items = []
         for item in plan or []:
             try:
-                wanted.add((int(item["xref"]), str(item["target"]), rot))
+                xref = int(item["xref"])
+                target = str(item["target"])
             except (TypeError, ValueError, KeyError):
                 continue
+            if not target or target == "keep":
+                continue
+            wanted.add((xref, target, rot))
+            items.append({"xref": xref, "target": target})
+        self._preview_path = path
+        self._preview_plan = items
         self._preview_wanted = wanted
+        if not items:
+            self._preview_doc = None
+            self._preview_choices = ()
+            if self._images:
+                self._images = [None for _ in self._images]
+        elif self._apply_ready_streams():
+            for xref, target, rot in wanted:
+                self._preview_cache[(xref, target, rot)] = True
         self.update()
+
+    def install_preview(self, path, xref, target, encoded, token, rotation=0):
+        """Store one encoded image and redraw the page from the working copy."""
+        try:
+            xref = int(xref)
+        except (TypeError, ValueError):
+            return False
+        expected = (getattr(self, "_preview_tokens", None) or {}).get(xref)
+        if expected is not None and token != expected:
+            return False
+        if not hasattr(self, "_ready_streams"):
+            self._ready_streams = {}
+        self._ready_streams[(xref, str(target))] = encoded
+        self._preview_path = path or self._preview_path
+        applied = self._apply_ready_streams()
+        if applied:
+            self._preview_cache[(xref, str(target), int(rotation or 0))] = True
+            if self._busy_token is not None and token == self._busy_token and xref == self._busy_xref:
+                self.clearBusy()
+        self.update()
+        return applied
+
+    def _apply_ready_streams(self):
+        plan = getattr(self, "_preview_plan", None) or []
+        path = getattr(self, "_preview_path", None)
+        if not plan or not path:
+            return False
+        choices = {}
+        blobs = {}
+        ready = getattr(self, "_ready_streams", {}) or {}
+        for item in plan:
+            key = (int(item["xref"]), str(item["target"]))
+            blob = ready.get(key)
+            if blob is None:
+                continue
+            choices[key[0]] = key[1]
+            blobs[key] = blob
+        if not choices:
+            return False
+        import os
+        from krop.pdfimage import WorkingCopy
+        working = getattr(self, "_working", None)
+        if working is None or working.path != os.path.abspath(path):
+            if working is not None:
+                working.close()
+            working = WorkingCopy(path)
+            self._working = working
+        working.rebuild(choices, blobs)
+        self._preview_doc = working.doc
+        self._preview_choices = tuple(sorted(choices.items()))
+        self._preview_zoom = self._zoom_bucket()
+        if self._images:
+            self._images = [None for _ in self._images]
+        return True
 
     def missingPreviews(self):
         wanted = getattr(self, "_preview_wanted", None) or set()
@@ -548,8 +647,18 @@ class AbstractViewerItem(QGraphicsItem):
     def previewReady(self):
         return [key for key in self._preview_wanted if key in self._preview_cache]
 
+    def hasPreview(self, xref, target, rotation=0):
+        key = (int(xref), str(target))
+        if key in dict(getattr(self, "_preview_choices", ()) or ()):
+            return True
+        return (key[0], key[1], int(rotation or 0)) in (getattr(self, "_preview_cache", None) or {})
+
     def previewImage(self, xref, target, rotation):
-        return self._preview_cache.get((int(xref), str(target), int(rotation or 0)))
+        image = (getattr(self, "_preview_cache", None) or {}).get(
+            (int(xref), str(target), int(rotation or 0)))
+        if not isinstance(image, QImage):
+            return None
+        return image
 
     def _paint_previews(self, painter):
         wanted = getattr(self, "_preview_wanted", None)
@@ -564,7 +673,7 @@ class AbstractViewerItem(QGraphicsItem):
         painter.setRenderHint(hint, True)
         for key in list(wanted):
             image = cache.get(key)
-            if image is None:
+            if not isinstance(image, QImage):
                 continue
             xref = key[0]
             for rect in self.imagePlacementRects(xref):
@@ -726,9 +835,18 @@ class MuPDFViewerItem(AbstractViewerItem):
             return len(self._pdfdoc)
 
     def cacheImage(self, idx):        
-        page = self._pdfdoc[idx]
+        doc = self._pdfdoc
+        if getattr(self, "_preview_doc", None) is not None and getattr(self, "_preview_wanted", None):
+            doc = self._preview_doc
+        page = doc[idx]
         pix = page.get_pixmap(alpha=False, dpi=VIEW_DPI) # default dpi is 72
-        return QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+        try:
+            fmt = QImage.Format.Format_RGB888
+        except AttributeError:
+            fmt = QImage.Format_RGB888
+        # Copy: the pixmap buffer dies with pix, and a later working-copy
+        # rebuild must not invalidate a QImage that still aliases it.
+        return QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
         # It might be faster to use samples_ptr but the code results in crashes.
         # https://pymupdf.readthedocs.io/en/latest/tutorial.html
         # pix = page.get_pixmap()
