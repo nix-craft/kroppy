@@ -83,8 +83,8 @@ def _neutral(sample):
     return float(np.percentile(chroma, 99)) <= 0.03
 
 
-def _indexed(sample, n):
-    """Return (reconstructed uint8 array, ok). Uses Pillow without dithering."""
+def _indexed(sample, n, dither=False):
+    """Return (reconstructed uint8 array, ok). Median-cut, dither optional."""
     try:
         import numpy as np
         from PIL import Image
@@ -95,13 +95,24 @@ def _indexed(sample, n):
     else:
         rgb = sample[..., :3]
     im = Image.fromarray(rgb.astype("uint8"), "RGB")
+    dith = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
     try:
-        q = im.quantize(colors=int(n), method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
+        method = Image.Quantize.MEDIANCUT
+    except AttributeError:
+        method = None
+    try:
+        if method is not None:
+            q = im.quantize(colors=int(n), method=method, dither=dith)
+        else:
+            q = im.quantize(colors=int(n), dither=dith)
     except Exception:
         try:
-            q = im.quantize(colors=int(n), dither=Image.Dither.NONE)
+            q = im.quantize(colors=int(n), method=Image.Quantize.FASTOCTREE, dither=dith)
         except Exception:
-            return None, False
+            try:
+                q = im.quantize(colors=int(n), dither=dith)
+            except Exception:
+                return None, False
     back = np.asarray(q.convert("RGB"))
     return back, True
 
@@ -215,10 +226,12 @@ def _error_against(sample, recon):
     return _mae_max(src, got)
 
 
-def _encode_gray(y, bpp, source_filter, full_pixels, sample_pixels):
+def _encode_gray(y, bpp, source_filter, full_pixels, sample_pixels, allow_jbig2=True):
     """Return (nbytes, codec) for a gray image of bpp bits."""
     scale = 1.0
-    if full_pixels > _ENCODE_PIXELS and sample_pixels and sample_pixels < full_pixels:
+    if full_pixels > sample_pixels and sample_pixels:
+        scale = float(full_pixels) / float(sample_pixels)
+    elif full_pixels > _ENCODE_PIXELS and sample_pixels and sample_pixels < full_pixels:
         scale = float(full_pixels) / float(sample_pixels)
     enc = y
     if bpp == 1:
@@ -227,7 +240,7 @@ def _encode_gray(y, bpp, source_filter, full_pixels, sample_pixels):
         ccitt = _ccitt_size(bits)
         if ccitt:
             sizes.append((int(ccitt * scale), "CCITT"))
-        jbig = _jbig2_size(bits) if scale == 1.0 else None
+        jbig = _jbig2_size(bits) if allow_jbig2 and scale == 1.0 else None
         if jbig:
             sizes.append((jbig, "JBIG2"))
         if sizes:
@@ -251,63 +264,186 @@ def structure_text(channels, bpc, indexed_colors=None):
     return "%dch %dbpp" % (channels, channels * max(bpc, 0))
 
 
+
+def _jbig2_available():
+    return shutil.which("jbig2") is not None
+
+
 def notation(target_id):
-    """Same channels-and-bits notation for a storage target id."""
-    if target_id in ("1bpp", "gray-1"):
+    """Channels-and-bits label for a storage target id."""
+    tid = str(target_id or "keep")
+    if tid in ("1bpp", "gray-1"):
         return "1ch 1bpp"
-    if target_id == "gray-2":
+    if tid == "jbig2":
+        return "1ch 1bpp JBIG2"
+    if tid == "gray-2":
         return "1ch 2bpp"
-    if target_id == "gray-4":
+    if tid == "gray-4":
         return "1ch 4bpp"
-    if target_id == "gray-8":
+    if tid == "gray-8":
         return "1ch 8bpp"
-    if target_id and str(target_id).startswith("indexed-"):
+    if tid == "rgb-24":
+        return "3ch 24bpp Flate"
+    if tid.startswith("gray-jpeg-"):
+        return "1ch 8bpp JPEG q%s" % tid.rsplit("-", 1)[-1]
+    if tid.startswith("jpeg-"):
+        return "3ch 24bpp JPEG q%s" % tid.split("-", 1)[1]
+    if tid.startswith("indexed-"):
+        dither = tid.endswith("-d")
+        num = tid[len("indexed-"):]
+        if dither:
+            num = num[:-2]
         try:
-            n = int(str(target_id).split("-", 1)[1])
+            n = int(num)
         except ValueError:
             n = 0
         bits = 1 if n <= 2 else 2 if n <= 4 else 4 if n <= 16 else 8
-        return structure_text(1, bits, n or None)
-    if target_id == "keep":
+        label = structure_text(1, bits, n or None)
+        if dither:
+            label += " dither"
+        return label
+    if tid == "keep":
         return "keep"
-    return str(target_id or "keep")
+    return tid
 
 
-def _candidate_specs(neutral):
-    specs = [("1bpp", 1, None), ("gray-2", 2, None), ("gray-4", 4, None), ("gray-8", 8, None)]
-    if not neutral:
-        for n in (2, 4, 16, 256):
-            specs.append(("indexed-%d" % n, None, n))
-    return specs
+def ladder_ids(kind, bpc, filt):
+    """Target ids offered for an image, smallest-looking first, keep last."""
+    filt = filt or ""
+    if kind in ("bilevel", "undecodable", None):
+        ids = ["1bpp", "gray-2", "gray-4", "gray-8"]
+        if _jbig2_available():
+            ids.append("jbig2")
+        ids.append("keep")
+        return ids
+    ids = []
+    already_rgb = kind == "color" and int(bpc or 8) >= 8 and filt in ("Flate", "LZW")
+    if not already_rgb:
+        ids.append("rgb-24")
+    for quality in (95, 85, 75, 60, 45):
+        ids.append("jpeg-%d" % quality)
+    for colors in (256, 128, 64, 32, 16, 8, 4):
+        ids.append("indexed-%d" % colors)
+        ids.append("indexed-%d-d" % colors)
+    ids.extend(["gray-8", "gray-4", "gray-2", "gray-jpeg-85", "gray-jpeg-60", "1bpp"])
+    if _jbig2_available():
+        ids.append("jbig2")
+    ids.append("keep")
+    return ids
 
 
-def _measure(viewed, gray, bpp, ncolors):
-    if ncolors:
-        back, ok = _indexed(viewed, ncolors)
-        if not ok:
+def _rgb(arr):
+    import numpy as np
+    if arr.ndim == 2:
+        return np.repeat(arr[:, :, None], 3, axis=2)
+    return np.ascontiguousarray(arr[..., :3], dtype=np.uint8)
+
+
+def _jpeg_roundtrip(arr, quality):
+    """Return (decoded uint8 array, jpeg byte size)."""
+    import numpy as np
+    from PIL import Image
+    mode = "L" if getattr(arr, "ndim", 0) == 2 else "RGB"
+    data = np.ascontiguousarray(arr if mode == "L" else arr[..., :3], dtype=np.uint8)
+    im = Image.fromarray(data, mode)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=int(quality))
+    raw = buf.getvalue()
+    back = np.asarray(Image.open(io.BytesIO(raw)).convert(mode))
+    return back, len(raw)
+
+
+def reconstruct(arr, target_id):
+    """Pixels a target would show, including a real JPEG round-trip."""
+    import numpy as np
+    tid = str(target_id or "keep")
+    if tid in ("keep", "rgb-24"):
+        return _rgb(arr)
+    if tid in ("1bpp", "jbig2"):
+        y = _quantize_gray(_as_gray(arr), 1)
+        return np.repeat(y[:, :, None], 3, axis=2)
+    if tid in ("gray-2", "gray-4", "gray-8"):
+        bpp = int(tid.split("-")[1])
+        y = _as_gray(arr)
+        if bpp < 8:
+            y = _quantize_gray(y, bpp)
+        return np.repeat(y[:, :, None], 3, axis=2)
+    if tid.startswith("gray-jpeg-"):
+        back, _size = _jpeg_roundtrip(_as_gray(arr), int(tid.rsplit("-", 1)[-1]))
+        if back.ndim == 3:
+            back = back[:, :, 0]
+        return np.repeat(back[:, :, None], 3, axis=2)
+    if tid.startswith("jpeg-"):
+        back, _size = _jpeg_roundtrip(_rgb(arr), int(tid.split("-", 1)[1]))
+        return np.ascontiguousarray(back, dtype=np.uint8)
+    if tid.startswith("indexed-"):
+        dither = tid.endswith("-d")
+        num = tid[len("indexed-"):]
+        if dither:
+            num = num[:-2]
+        back, ok = _indexed(_rgb(arr), int(num), dither=dither)
+        if ok:
+            return np.ascontiguousarray(back, dtype=np.uint8)
+    return _rgb(arr)
+
+
+def _indexed_est(recon, scale):
+    import numpy as np
+    flat = np.ascontiguousarray(recon[..., :3]).reshape(-1, 3)
+    _colors, inverse = np.unique(flat, axis=0, return_inverse=True)
+    raw = inverse.astype(np.uint8).tobytes()
+    est = _flate_size(raw) + int(_colors.shape[0]) * 3
+    return int(est * scale), "Flate"
+
+
+def _eval_target(viewed, target_id, filt, full_pixels, stored, threshold, max_ok):
+    """Error, estimated size, and codec for one ladder step. None if unavailable."""
+    import numpy as np
+    tid = str(target_id)
+    sample_pixels = max(1, int(viewed.shape[0]) * int(viewed.shape[1]))
+    scale = float(full_pixels) / float(sample_pixels) if full_pixels > sample_pixels else 1.0
+    if tid.startswith("jpeg-") or tid.startswith("gray-jpeg-"):
+        quality = int(tid.rsplit("-", 1)[-1])
+        src = _as_gray(viewed) if tid.startswith("gray-jpeg-") else _rgb(viewed)
+        try:
+            back, nbytes = _jpeg_roundtrip(src, quality)
+        except Exception:
             return None
-        return _error_against(viewed, back)
-    if bpp >= 8 and viewed.ndim == 2:
-        return 0.0, 0
-    q = _quantize_gray(gray, bpp)
-    return _error_against(viewed, q)
-
-
-def _encode_measured(viewed, gray, bpp, ncolors, filt, full_pixels, stored):
-    sample_pixels = max(1, viewed.shape[0] * viewed.shape[1])
-    if ncolors:
-        back, ok = _indexed(viewed, ncolors)
-        if not ok:
+        if getattr(back, "ndim", 0) == 2:
+            recon = np.repeat(back[:, :, None], 3, axis=2)
+        else:
+            recon = back
+        est, codec = int(nbytes * scale), "DCT"
+    elif tid == "jbig2":
+        y = _quantize_gray(_as_gray(viewed), 1)
+        recon = np.repeat(y[:, :, None], 3, axis=2)
+        jbig = _jbig2_size(y) if scale == 1.0 else None
+        if not jbig:
             return None
-        import numpy as np
-        flat = back.reshape(-1, 3)
-        _colors, inverse = np.unique(flat, axis=0, return_inverse=True)
-        raw = inverse.astype(np.uint8).tobytes()
-        est = _flate_size(raw) + int(_colors.shape[0]) * 3
-        est = int(est * (float(full_pixels) / float(sample_pixels)))
-        return est, "Flate"
-    est, codec = _encode_gray(gray, bpp or 8, filt, full_pixels, sample_pixels)
-    return est, codec
+        est, codec = int(jbig), "JBIG2"
+    elif tid == "1bpp":
+        y = _quantize_gray(_as_gray(viewed), 1)
+        recon = np.repeat(y[:, :, None], 3, axis=2)
+        est, codec = _encode_gray(y, 1, filt, full_pixels, sample_pixels, allow_jbig2=False)
+    elif tid in ("gray-2", "gray-4", "gray-8"):
+        bpp = int(tid.split("-")[1])
+        y = _as_gray(viewed)
+        if bpp < 8:
+            y = _quantize_gray(y, bpp)
+        recon = np.repeat(np.ascontiguousarray(y)[:, :, None], 3, axis=2)
+        est, codec = _encode_gray(y, bpp, filt, full_pixels, sample_pixels, allow_jbig2=False)
+    elif tid == "rgb-24":
+        recon = _rgb(viewed)
+        est = int(_flate_size(np.ascontiguousarray(recon).tobytes()) * scale)
+        codec = "Flate"
+    elif tid.startswith("indexed-"):
+        recon = reconstruct(viewed, tid)
+        est, codec = _indexed_est(recon, scale)
+    else:
+        return None
+    mae, mx = _error_against(viewed, recon)
+    over = mae > threshold or mx > max_ok
+    return _entry(tid, mae, mx, over, est, codec, stored)
 
 
 def _entry(target_id, mae, mx, over, est, codec, stored):
@@ -350,7 +486,6 @@ def _keep(stored, filt):
     return _result("keep", 0.0, 0, stored, stored, filt or "keep", None)
 
 
-
 def _finish(chosen, candidates, stored, filt, bpp):
     out = _result(
         chosen["id"], chosen.get("error_mae") or 0, chosen.get("error_max") or 0,
@@ -363,71 +498,118 @@ def _finish(chosen, candidates, stored, filt, bpp):
     return out
 
 
-def recommend(sample, kind, bpc, filt, threshold, width, height, stored_bytes):
-    """Pick a storage target for one decoded image.
+def _bpp_of(target_id):
+    tid = str(target_id or "")
+    if tid in ("1bpp", "jbig2"):
+        return 1
+    if tid.startswith("gray-") and tid[5:6].isdigit():
+        return int(tid.split("-")[1])
+    return None
 
-    sample is a uint8 array HxW or HxWxC, or None when the image was not
-    decoded (already 1-bit, or undecodable). Every valid candidate is
-    measured. Only the recommended one is encoded.
+
+def _is_heavy(target_id):
+    tid = str(target_id or "")
+    return tid == "rgb-24" or tid.startswith("jpeg-") or tid.startswith("indexed-") or tid.startswith("gray-jpeg-")
+
+
+def choose_smallest(candidates, stored):
+    """Smallest option under the error limit. Pending options are not eligible."""
+    eligible = [
+        c for c in candidates or []
+        if c.get("id") != "keep" and not c.get("over") and not c.get("pending")
+        and c.get("est_bytes") is not None and (not stored or c["est_bytes"] < stored)
+    ]
+    if not eligible:
+        for cand in candidates or []:
+            if cand.get("id") == "keep":
+                return cand
+        return None
+    return min(eligible, key=lambda c: (c["est_bytes"], c["id"]))
+
+
+def recommend(sample, kind, bpc, filt, threshold, width, height, stored_bytes, defer_heavy=False):
+    """Pick the smallest stored target whose error stays under the threshold.
+
+    Heavy steps (JPEG, palette) can be left pending so the UI thread's
+    analysis pass stays quick. ``fill_pending_file`` measures them later.
+    Nothing here is written back into the PDF.
     """
     threshold, max_ok = _limit(threshold if threshold is not None else DEFAULT_ERROR_MAE)
     stored = int(stored_bytes or 0)
     filt = filt or ""
-    if sample is None or kind == "undecodable":
+    if sample is None or kind in ("undecodable", "bilevel"):
         keep = _entry("keep", 0, 0, False, stored, filt or "keep", stored)
-        candidates = [keep]
-        bpp = None
-        if kind == "bilevel":
-            one = _entry("1bpp", 0, 0, False, stored if filt in ("CCITT", "JBIG2") else None,
-                         filt if filt in ("CCITT", "JBIG2") else None, stored)
-            for name in ("gray-2", "gray-4", "gray-8"):
-                pass
-            extras = [
-                _entry(name, 0, 0, False, None, None, stored)
-                for name in ("gray-2", "gray-4", "gray-8")]
-            candidates = [one] + extras + [keep]
-            bpp = 1
-            if filt in ("CCITT", "JBIG2"):
-                return _finish(keep, candidates, stored, filt, 1)
-        return _finish(keep, candidates, stored, filt or "keep", bpp)
+        candidates = []
+        for tid in ladder_ids("bilevel" if kind == "bilevel" else kind, bpc, filt):
+            if tid == "keep":
+                continue
+            candidates.append(_entry(tid, 0 if tid in ("1bpp", "jbig2") else None,
+                                      0 if tid in ("1bpp", "jbig2") else None,
+                                      False, stored if tid == "1bpp" and filt in ("CCITT", "JBIG2") else None,
+                                      filt if tid == "1bpp" and filt in ("CCITT", "JBIG2") else None,
+                                      stored))
+        candidates.append(keep)
+        if kind == "bilevel" and filt in ("CCITT", "JBIG2"):
+            return _finish(keep, candidates, stored, filt, 1)
+        return _finish(keep, candidates, stored, filt or "keep", 1 if kind == "bilevel" else None)
     viewed, _step = _sample(sample)
-    gray = _as_gray(viewed)
-    neutral = kind == "gray" or _neutral(viewed)
     full_pixels = max(1, int(width or sample.shape[1]) * int(height or sample.shape[0]))
     candidates = []
-    chosen = None
-    for name, bpp, ncolors in _candidate_specs(neutral):
-        measured = _measure(viewed, gray, bpp, ncolors)
-        if measured is None:
+    for tid in ladder_ids(kind, bpc, filt):
+        if tid == "keep":
             continue
-        mae, mx = measured
-        over = mae > threshold or mx > max_ok
-        entry = _entry(name, mae, mx, over, None, None, stored)
-        candidates.append(entry)
-        if chosen is not None or over:
+        if defer_heavy and _is_heavy(tid):
+            pending = _entry(tid, None, None, False, None, None, stored)
+            pending["pending"] = True
+            candidates.append(pending)
             continue
-        if name == "gray-8" and neutral and filt in ("Flate", "LZW") and (bpc or 8) >= 8:
-            continue
-        encoded = _encode_measured(viewed, gray, bpp, ncolors, filt, full_pixels, stored)
-        if not encoded:
-            continue
-        est, codec = encoded
-        entry["est_bytes"] = int(est)
-        entry["codec"] = codec
-        entry["savings_pct"] = round((stored - est) * 100.0 / stored, 1) if stored else 0.0
-        if stored and est >= stored:
-            continue
-        chosen = entry
+        entry = _eval_target(viewed, tid, filt, full_pixels, stored, threshold, max_ok)
+        if entry is not None:
+            candidates.append(entry)
     keep = _entry("keep", 0, 0, False, stored, filt or "keep", stored)
     candidates.append(keep)
-    if chosen is None:
-        chosen = keep
-    bpp_out = None
-    if chosen["id"] == "1bpp":
-        bpp_out = 1
-    elif str(chosen["id"]).startswith("gray-"):
-        bpp_out = int(str(chosen["id"]).split("-")[1])
-    return _finish(chosen, candidates, stored, filt, bpp_out)
+    chosen = choose_smallest(candidates, stored) or keep
+    return _finish(chosen, candidates, stored, filt, _bpp_of(chosen["id"]))
+
+
+def fill_pending_file(path, xref, candidates, stored, filt, threshold, width, height):
+    """Measure ladder steps that were left pending. Safe off the UI thread."""
+    import numpy as np
+    import pymupdf
+    pending = [c for c in candidates or [] if c.get("pending")]
+    if not pending:
+        return list(candidates or [])
+    doc = pymupdf.open(path)
+    try:
+        pix = pymupdf.Pixmap(doc, int(xref))
+        if pix.alpha:
+            pix = pymupdf.Pixmap(pix, 0)
+        if pix.colorspace and pix.colorspace.n == 4:
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        n = pix.n
+        arr = np.frombuffer(pix.samples, np.uint8)
+        arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n).copy()
+        if n == 1:
+            arr = arr[:, :, 0]
+    finally:
+        doc.close()
+    viewed, _step = _sample(arr)
+    full_pixels = max(1, int(width or arr.shape[1]) * int(height or arr.shape[0]))
+    limit, max_ok = _limit(threshold if threshold is not None else DEFAULT_ERROR_MAE)
+    filled = []
+    for cand in candidates:
+        if not cand.get("pending"):
+            filled.append(dict(cand))
+            continue
+        measured = _eval_target(viewed, cand.get("id"), filt or "", full_pixels, int(stored or 0), limit, max_ok)
+        if measured is None:
+            skipped = dict(cand)
+            skipped["pending"] = False
+            filled.append(skipped)
+        else:
+            measured["pending"] = False
+            filled.append(measured)
+    return filled
 
 
 def encode_file_image(path, xref, target_id, stored_bytes, filt):
@@ -449,30 +631,10 @@ def encode_file_image(path, xref, target_id, stored_bytes, filt):
         width, height = pix.w, pix.h
     finally:
         doc.close()
+    stored = int(stored_bytes or 0)
     if target_id == "keep":
-        stored = int(stored_bytes or 0)
         return _entry("keep", 0, 0, False, stored, filt or "keep", stored)
     viewed, _step = _sample(arr)
-    gray = _as_gray(viewed)
     full_pixels = max(1, int(width) * int(height))
-    ncolors = None
-    bpp = None
-    if str(target_id).startswith("indexed-"):
-        ncolors = int(str(target_id).split("-", 1)[1])
-    elif target_id == "1bpp":
-        bpp = 1
-    elif str(target_id).startswith("gray-"):
-        bpp = int(str(target_id).split("-")[1])
-    else:
-        return None
-    measured = _measure(viewed, gray, bpp, ncolors)
-    if measured is None:
-        return None
-    mae, mx = measured
-    encoded = _encode_measured(viewed, gray, bpp, ncolors, filt, full_pixels, stored_bytes)
-    if not encoded:
-        return None
-    est, codec = encoded
     threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
-    over = mae > threshold or mx > max_ok
-    return _entry(target_id, mae, mx, over, est, codec, int(stored_bytes or 0))
+    return _eval_target(viewed, target_id, filt or "", full_pixels, stored, threshold, max_ok)

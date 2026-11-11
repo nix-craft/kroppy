@@ -508,6 +508,10 @@ def test_image_detail_gray_target_and_uses(tmp_path):
     assert "1ch 8bpp" in im["detail"] and "dpi" in im["detail"]
     assert im["chosen_target"] == im["recommended_target"] == "gray-2"
     assert any(c["id"] == "1bpp" and c["over"] for c in im["candidates"])
+    gids = [c["id"] for c in im["candidates"]]
+    for required in ("rgb-24", "jpeg-85", "gray-jpeg-60", "gray-8", "gray-4", "gray-2", "1bpp", "keep"):
+        assert required in gids
+    assert any("mae" in (c.get("label") or "") or c.get("error_mae") is not None for c in im["candidates"])
     assert im["rep_bytes"] < im["bytes"]
     assert page["savings_pct"] > 0
     blob = "\n".join(__import__("krop.analyze", fromlist=["analyze_lines"]).analyze_lines(data))
@@ -695,6 +699,35 @@ def test_shared_image_row_appears_before_later_page(window, qapp):
     assert "p1, p3" in row.child(0).toolTip(1)
 
 
+def test_heavy_ladder_is_pending_until_filled(tmp_path):
+    """JPEG and palette sizes are computed after the cheap default, off the UI pass."""
+    import numpy as np
+    from krop.imagetarget import choose_smallest, fill_pending_file
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((16, 16, 3), np.uint8)
+    arr[:, :8] = (180, 40, 40)
+    arr[:, 8:] = (40, 40, 180)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, 16, 16, arr.tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(72, 72, 180, 180), pixmap=pix)
+    path = str(tmp_path / "defer.pdf")
+    _save(doc, path)
+    quick = analyze_file(path, defer_heavy=True)["pages"][0]["images"][0]
+    ids = [c["id"] for c in quick["candidates"]]
+    assert "jpeg-85" in ids and "indexed-16" in ids and "gray-jpeg-60" in ids
+    assert any(c["id"] == "jpeg-85" and c.get("pending") for c in quick["candidates"])
+    filled = fill_pending_file(
+        path, xref, quick["candidates"], quick["bytes"], quick.get("filter_name") or "",
+        4.0, quick["width"], quick["height"])
+    assert all(not c.get("pending") for c in filled)
+    jpeg = next(c for c in filled if c["id"] == "jpeg-45")
+    assert jpeg["est_bytes"] and jpeg["error_mae"] is not None and jpeg["codec"] == "DCT"
+    best = choose_smallest(filled, quick["bytes"])
+    full = analyze_file(path)["pages"][0]["images"][0]
+    assert best["id"] == full["target"]
+    assert full["chosen_target"] == full["recommended_target"] == full["target"]
+
+
 def test_indexed_target_for_two_colors(tmp_path):
     import numpy as np
     doc = pymupdf.open()
@@ -710,10 +743,23 @@ def test_indexed_target_for_two_colors(tmp_path):
     im = data["pages"][0]["images"][0]
     assert data["summary"]["label"] == "COLOR"
     assert im["structure"] == "3ch 24bpp"
-    assert im["target"] == "indexed-2"
-    assert im["target_label"] == "idx 1bpp (2 colors)"
-    assert im["error_mae"] <= 1
-    assert im["codec"] == "Flate"
+    ids = [c["id"] for c in im["candidates"]]
+    for required in ("jpeg-95", "jpeg-85", "jpeg-75", "jpeg-60", "jpeg-45",
+                     "indexed-256", "indexed-128", "indexed-64", "indexed-32",
+                     "indexed-16", "indexed-8", "indexed-4",
+                     "indexed-4-d", "gray-8", "gray-4", "gray-2",
+                     "gray-jpeg-85", "gray-jpeg-60", "1bpp", "keep"):
+        assert required in ids
+    under = [c for c in im["candidates"]
+             if c["id"] != "keep" and not c["over"] and c.get("est_bytes") is not None]
+    smallest = min(under, key=lambda c: (c["est_bytes"], c["id"]))
+    assert im["target"] == im["recommended_target"] == im["chosen_target"] == smallest["id"]
+    assert im["error_mae"] <= 4
+    assert "rgb-24" not in ids or im["filter_name"] not in ("Flate", "LZW")
+    assert all(c.get("error_mae") is not None and c.get("est_bytes") is not None
+               for c in im["candidates"] if c["id"] != "keep")
+    blob = __import__("json").dumps(data)
+    assert '"chosen_target"' in blob and '"candidates"' in blob
 
 
 def test_error_threshold_changes_target(tmp_path):

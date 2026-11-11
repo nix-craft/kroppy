@@ -827,7 +827,7 @@ def _catalog_images(doc):
     return catalog
 
 
-def _image_records(doc, page, page_no, placements, threshold=None, decoded=None, catalog=None, analyzed=None, on_image=None):
+def _image_records(doc, page, page_no, placements, threshold=None, decoded=None, catalog=None, analyzed=None, on_image=None, defer_heavy=False):
     import numpy as np
     import pymupdf
     by_name = {}
@@ -926,7 +926,7 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None,
             _link_image(rec, info)
             fresh = not _reuse_target(rec, analyzed)
             if fresh:
-                _apply_target(rec, None, threshold)
+                _apply_target(rec, None, threshold, defer_heavy)
                 fresh = _remember_target(rec, analyzed)
             _describe_image(rec)
             if fresh and on_image is not None:
@@ -962,12 +962,12 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None,
                 rec.update(kind="gray", levels=levels, suggested_bpp=bpp_for_levels(levels))
             if rec["kind"] == "gray":
                 rec["photo"] = (rec["levels"] or 0) > 16
-            _apply_target(rec, arr, threshold)
+            _apply_target(rec, arr, threshold, defer_heavy)
             fresh = _remember_target(rec, analyzed)
         except Exception as exc:
             rec.update(kind="undecodable", est_bytes=raw_len, rep_bytes=raw_len)
             rec["error"] = str(exc)[:120]
-            _apply_target(rec, None, threshold)
+            _apply_target(rec, None, threshold, defer_heavy)
             fresh = _remember_target(rec, analyzed)
         _describe_image(rec)
         if fresh and on_image is not None:
@@ -1057,13 +1057,14 @@ def _remember_target(rec, analyzed):
     return True
 
 
-def _apply_target(rec, samples, threshold):
+def _apply_target(rec, samples, threshold, defer_heavy=False):
     from krop.imagetarget import DEFAULT_ERROR_MAE, recommend
     got = recommend(
         samples, rec.get("kind") or "gray", rec.get("bpc") or 0,
         rec.get("filter_name") or "",
         DEFAULT_ERROR_MAE if threshold is None else threshold,
-        rec.get("width") or 0, rec.get("height") or 0, rec.get("bytes") or 0)
+        rec.get("width") or 0, rec.get("height") or 0, rec.get("bytes") or 0,
+        defer_heavy=defer_heavy)
     bpp = rec.get("suggested_bpp")
     rec.update(got)
     if got.get("suggested_bpp") is None and bpp:
@@ -1670,7 +1671,7 @@ def _owned_image_bytes(images, page_no):
     return current, estimate
 
 
-def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None, on_image=None):
+def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None, on_image=None, defer_heavy=False):
     """Analyze path. cancel is an optional threading.Event checked between pages.
 
     focus is a 0-based page index, or a callable returning one, so a running
@@ -1721,7 +1722,7 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
                 _add_blocker(contrib, "stream", "content stream could not be parsed (%s) p{p}" % exc, "check")
             images = _image_records(
                 doc, page, page_no, contrib["placements"], threshold, decoded,
-                catalog, analyzed, on_image)
+                catalog, analyzed, on_image, defer_heavy)
             for im in images:
                 if im["xref"] in seen_xrefs:
                     continue

@@ -24,32 +24,10 @@ def orient_for_page(arr, rotation):
 def quantize_pixels(arr, target_id):
     """Return uint8 HxWx3 pixels for a storage target id.
 
-    ``keep`` returns the original color. Gray targets use ``_quantize_gray``.
-    Indexed targets use ``_indexed``. Both are the functions the trial encode
-    measures.
+    JPEG targets are a real encode/decode, so the preview shows the artifacts.
     """
-    from krop.imagetarget import _as_gray, _indexed, _quantize_gray
-    target_id = str(target_id or "keep")
-    if arr.ndim == 2:
-        source = arr
-        rgb = np.repeat(arr[:, :, None], 3, axis=2)
-    else:
-        rgb = np.ascontiguousarray(arr[..., :3], dtype=np.uint8)
-        source = rgb
-    if target_id == "keep":
-        return rgb
-    if target_id == "1bpp" or (target_id.startswith("gray-") and target_id != "gray-8"):
-        bpp = 1 if target_id == "1bpp" else int(target_id.split("-", 1)[1])
-        y = _quantize_gray(_as_gray(source), bpp)
-        return np.repeat(y[:, :, None], 3, axis=2)
-    if target_id == "gray-8":
-        y = _as_gray(source)
-        return np.repeat(y[:, :, None], 3, axis=2)
-    if target_id.startswith("indexed-"):
-        back, ok = _indexed(rgb, int(target_id.split("-", 1)[1]))
-        if ok:
-            return np.ascontiguousarray(back, dtype=np.uint8)
-    return rgb
+    from krop.imagetarget import reconstruct
+    return reconstruct(arr, target_id)
 
 
 def _mask_xref(doc, xref):

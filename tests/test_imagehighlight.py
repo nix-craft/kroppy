@@ -54,9 +54,9 @@ def test_map_follows_rotation_and_crop_display():
 
 
 def test_highlight_dims_without_hue_and_keeps_a_crisp_red_outline(qapp):
-    """Outside the image is a neutral darkening. The stroke stays about 2 px when scaled."""
+    """The dim stays neutral. The red frame stays about 3 px even when scaled down."""
     from krop.qt import QColor, QGraphicsRectItem, QGraphicsScene, QImage, QPainter, QRectF
-    from krop.vieweritem import ImageHighlightItem
+    from krop.vieweritem import ImageHighlightItem, ImageOutlineItem
     try:
         fmt = QImage.Format.Format_ARGB32
     except AttributeError:
@@ -66,22 +66,17 @@ def test_highlight_dims_without_hue_and_keeps_a_crisp_red_outline(qapp):
     scene = QGraphicsScene()
     scene.addItem(host)
     item = ImageHighlightItem(host)
-    item.set_rects([(20, 16, 40, 28, True), (70, 16, 30, 24, False)])
-    primary = item.outline_pen(True)
-    extra = item.outline_pen(False)
-    assert primary.isCosmetic() and extra.isCosmetic()
-    assert primary.widthF() == 2.0
-    assert extra.widthF() < primary.widthF()
-    from krop.qt import Qt
-    try:
-        dash_style = Qt.PenStyle.DashLine
-    except AttributeError:
-        dash_style = Qt.DashLine
-    assert extra.style() == dash_style
-    assert primary.color().red() > 200 and primary.color().green() < 40
+    rects = [(20, 16, 40, 28, True), (70, 16, 30, 24, False)]
+    item.set_rects(rects)
+    outlines = [ImageOutlineItem(host, rect) for rect in rects]
+    assert all(outline.isVisible() for outline in outlines)
+    assert outlines[0].zValue() > item.zValue()
+    assert outlines[0].placementRect() == (20.0, 16.0, 40.0, 28.0)
+    assert outlines[1].placementRect() == (70.0, 16.0, 30.0, 24.0)
+    assert outlines[0].isPrimary() and not outlines[1].isPrimary()
 
     def render(scale):
-        image = QImage(int(120 * scale), int(90 * scale), fmt)
+        image = QImage(max(1, int(120 * scale)), max(1, int(90 * scale)), fmt)
         image.fill(QColor(255, 255, 255))
         painter = QPainter(image)
         scene.render(painter, QRectF(image.rect()), QRectF(0, 0, 120, 90))
@@ -94,29 +89,22 @@ def test_highlight_dims_without_hue_and_keeps_a_crisp_red_outline(qapp):
     assert outside.red() == outside.green() == outside.blue()
     assert outside.red() < 255
     assert inside.red() > 250 and inside.green() > 250 and inside.blue() > 250
-    # A pixel on the primary outline is red, not orange or purple.
-    reds = []
-    for x in range(20, 60):
-        color = shot.pixelColor(x, 16)
-        if color.red() > 180 and color.green() < 80 and color.blue() < 80:
-            reds.append(x)
-    assert reds, "expected a red outline along the top of the placement"
 
     def thickness(scale):
-        """How many device pixels the top stroke covers. A cosmetic pen stays near 2."""
         image = render(scale)
-        x = int(40 * scale)
-        y0 = int(16 * scale)
+        x = int(round(40 * scale))
+        x = min(max(x, 0), image.width() - 1)
+        y0 = int(round(16 * scale))
         count = 0
-        for y in range(max(0, y0 - 8), y0 + 8):
+        for y in range(max(0, y0 - 8), min(image.height(), y0 + 9)):
             color = image.pixelColor(x, y)
             if color.red() > 180 and color.green() < 80 and color.blue() < 80:
                 count += 1
         return count
 
-    # Cosmetic: the stroke is about 2 device pixels at 1x and at 2x.
-    assert 1 <= thickness(1) <= 3
-    assert 1 <= thickness(2) <= 3
+    # Device pixels, not scene pixels: shrinking the view does not erase the stroke.
+    assert 2 <= thickness(1) <= 6
+    assert 2 <= thickness(0.25) <= 6
 
 
 def test_selecting_image_row_highlights_every_placement(window, tmp_path, qapp):
@@ -169,6 +157,12 @@ def test_selecting_image_row_highlights_every_placement(window, tmp_path, qapp):
     assert len(shown) == len(expected)
     for got, want in zip(shown, expected):
         assert got == pytest.approx(want)
+    outlines = w.viewer.outlineItems()
+    assert len(outlines) == len(shown)
+    assert all(item.isVisible() for item in outlines)
+    assert all(item.zValue() > w.viewer._highlight.zValue() for item in outlines)
+    for item, rect in zip(outlines, shown):
+        assert item.placementRect() == pytest.approx(rect[:4])
 
     # Zoom does not move the highlight in page coordinates.
     before = list(shown)
@@ -192,6 +186,7 @@ def test_selecting_image_row_highlights_every_placement(window, tmp_path, qapp):
     w.analysisPanel._clicked(row, 0)
     qapp.processEvents()
     assert w.viewer.imageHighlightRects() == []
+    assert w.viewer.outlineItems() == []
 
     # And so does changing to a page that does not contain the image.
     w.analysisPanel._clicked(image, 0)

@@ -26,6 +26,20 @@ def test_quantize_uses_the_same_levels_as_the_trial_encode():
     assert 60 < int(gray[0]) < 100
 
 
+def test_jpeg_preview_is_a_real_round_trip():
+    """The preview of a JPEG target is the decoded JPEG, not the untouched pixels."""
+    arr = np.zeros((32, 32, 3), np.uint8)
+    arr[:, :16] = (255, 0, 0)
+    arr[:, 16:] = (0, 0, 255)
+    got = quantize_pixels(arr, "jpeg-45")
+    assert got.shape == arr.shape
+    assert not np.array_equal(got, arr)
+    # The same round-trip the trial encode measures.
+    from krop.imagetarget import _jpeg_roundtrip
+    back, _size = _jpeg_roundtrip(arr, 45)
+    assert np.array_equal(got, back)
+
+
 def test_indexed_preview_has_at_most_n_colors():
     arr = np.zeros((6, 6, 3), np.uint8)
     arr[:3] = (200, 10, 10)

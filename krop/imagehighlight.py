@@ -10,11 +10,15 @@ padding around the pixmap.
 
 VIEW_DPI = 96
 
-# Neutral darkening of everything outside the image (no hue), plus a
-# cosmetic red stroke that stays the same width on screen when zooming.
+# Neutral darkening of everything outside the image (no hue). The outline
+# is a separate item: 3 device pixels of red with a thin white halo, so it
+# stays visible when the view is scaled (cosmetic pens were dropping out
+# over X11).
 HIGHLIGHT_DIM = (0, 0, 0, 56)
 HIGHLIGHT_RED = (255, 0, 0)
-HIGHLIGHT_WIDTH = 2.0
+HIGHLIGHT_HALO = (255, 255, 255)
+HIGHLIGHT_WIDTH = 3.0
+HIGHLIGHT_HALO_WIDTH = 5.0
 
 
 def _rotate_rect(rect, rotation, width, height):

@@ -20,7 +20,8 @@ from krop.qt import *
 
 from krop.viewerselections import ViewerSelections
 from krop.imagehighlight import (
-    HIGHLIGHT_DIM, HIGHLIGHT_RED, HIGHLIGHT_WIDTH, VIEW_DPI, map_image_rects)
+    HIGHLIGHT_DIM, HIGHLIGHT_HALO, HIGHLIGHT_HALO_WIDTH, HIGHLIGHT_RED,
+    HIGHLIGHT_WIDTH, VIEW_DPI, map_image_rects)
 
 
 class _PreviewJob(QThread):
@@ -60,41 +61,105 @@ def _rgba_qimage(rgba):
     return image.copy()
 
 
+def _no_mouse(item):
+    try:
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+    except AttributeError:
+        item.setAcceptedMouseButtons(Qt.NoButton)
+    try:
+        selectable = QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+        focusable = QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
+    except AttributeError:
+        selectable = QGraphicsItem.ItemIsSelectable
+        focusable = QGraphicsItem.ItemIsFocusable
+    item.setFlag(selectable, False)
+    item.setFlag(focusable, False)
+
+
+def _fill_frame(painter, rect, width, color, dashed=False):
+    """Draw a width-px frame in the painter's current coordinates."""
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    t = float(width)
+    edges = (
+        QRectF(x - t / 2.0, y - t / 2.0, w + t, t),
+        QRectF(x - t / 2.0, y + h - t / 2.0, w + t, t),
+        QRectF(x - t / 2.0, y + t / 2.0, t, max(0.0, h - t)),
+        QRectF(x + w - t / 2.0, y + t / 2.0, t, max(0.0, h - t)),
+    )
+    if not dashed:
+        for edge in edges:
+            painter.fillRect(edge, color)
+        return
+    # Dashed along the long axis of each edge, in device pixels.
+    step = 8.0
+    gap = 6.0
+    for edge in edges:
+        horizontal = edge.width() >= edge.height()
+        span = edge.width() if horizontal else edge.height()
+        pos = 0.0
+        while pos < span:
+            take = min(step, span - pos)
+            if horizontal:
+                painter.fillRect(QRectF(edge.x() + pos, edge.y(), take, edge.height()), color)
+            else:
+                painter.fillRect(QRectF(edge.x(), edge.y() + pos, edge.width(), take), color)
+            pos += step + gap
+
+
+class ImageOutlineItem(QGraphicsItem):
+    """Red frame in the same coordinates as the dim cutout.
+
+    The stroke is filled in device pixels (at least 3 px, plus a white halo)
+    so a scaled graphics view cannot shrink it to nothing. That happened with
+    a cosmetic QPen over X11.
+    """
+
+    def __init__(self, parent, rect):
+        QGraphicsItem.__init__(self, parent)
+        self._rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+        self._primary = len(rect) > 4 and bool(rect[4])
+        self.setZValue(1000)
+        _no_mouse(self)
+
+    def placementRect(self):
+        return self._rect
+
+    def isPrimary(self):
+        return self._primary
+
+    def boundingRect(self):
+        parent = self.parentItem()
+        page = getattr(parent, "irect", None) if parent is not None else None
+        if page is not None and not page.isNull():
+            return QRectF(page).adjusted(-8, -8, 8, 8)
+        x, y, w, h = self._rect
+        return QRectF(x, y, w, h).adjusted(-8, -8, 8, 8)
+
+    def paint(self, painter, option, widget):
+        x, y, w, h = self._rect
+        local = QRectF(x, y, w, h)
+        painter.save()
+        device = painter.worldTransform().mapRect(local)
+        painter.setWorldTransform(QTransform())
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        except AttributeError:
+            painter.setRenderHint(QPainter.Antialiasing, False)
+        _fill_frame(painter, device, HIGHLIGHT_HALO_WIDTH, QColor(*HIGHLIGHT_HALO), dashed=not self._primary)
+        _fill_frame(painter, device, HIGHLIGHT_WIDTH, QColor(*HIGHLIGHT_RED), dashed=not self._primary)
+        painter.restore()
+
+
 class ImageHighlightItem(QGraphicsItem):
-    """Neutral dim around an image, with a crisp red outline. Not a crop selection."""
+    """Neutral dim around an image. The red frame is a separate item."""
 
     def __init__(self, parent):
         QGraphicsItem.__init__(self, parent)
         self._rects = []
-        self.setZValue(-1)
-        try:
-            self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        except AttributeError:
-            self.setAcceptedMouseButtons(Qt.NoButton)
-        try:
-            selectable = QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
-            focusable = QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
-        except AttributeError:
-            selectable = QGraphicsItem.ItemIsSelectable
-            focusable = QGraphicsItem.ItemIsFocusable
-        self.setFlag(selectable, False)
-        self.setFlag(focusable, False)
+        self.setZValue(10)
+        _no_mouse(self)
         self._page_rect = QRectF()
         self.hide()
-
-    def outline_pen(self, primary):
-        """Cosmetic so the stroke stays about 2 px at any zoom."""
-        pen = QPen(QColor(*HIGHLIGHT_RED))
-        pen.setCosmetic(True)
-        pen.setWidthF(HIGHLIGHT_WIDTH if primary else max(1.0, HIGHLIGHT_WIDTH - 0.5))
-        try:
-            solid = Qt.PenStyle.SolidLine
-            dash = Qt.PenStyle.DashLine
-        except AttributeError:
-            solid = Qt.SolidLine
-            dash = Qt.DashLine
-        pen.setStyle(solid if primary else dash)
-        return pen
 
     def set_rects(self, rects):
         self.prepareGeometryChange()
@@ -144,12 +209,6 @@ class ImageHighlightItem(QGraphicsItem):
             painter.setPen(QPen(no_pen))
             painter.setBrush(QBrush(QColor(*HIGHLIGHT_DIM)))
             painter.drawPath(path)
-        painter.setRenderHint(no_aa, False)
-        painter.setBrush(QBrush(no_brush))
-        for rect in self._rects:
-            primary = len(rect) > 4 and rect[4]
-            painter.setPen(self.outline_pen(primary))
-            painter.drawRect(QRectF(rect[0], rect[1], rect[2], rect[3]))
 
 
 class AbstractViewerItem(QGraphicsItem):
@@ -172,6 +231,7 @@ class AbstractViewerItem(QGraphicsItem):
         self._highlight_xref = None
         if getattr(self, "_highlight", None) is not None:
             self._highlight.set_rects([])
+        self._set_outlines([])
         self.selections.deleteSelections()
         self._preview_cache = {}
         self._preview_wanted = set()
@@ -238,6 +298,7 @@ class AbstractViewerItem(QGraphicsItem):
         self._highlight_xref = None
         if getattr(self, "_highlight", None) is not None:
             self._highlight.set_rects([])
+        self._set_outlines([])
 
     def refreshImageHighlight(self):
         if getattr(self, "_highlight", None) is None:
@@ -245,13 +306,28 @@ class AbstractViewerItem(QGraphicsItem):
         xref = self._highlight_xref
         if not xref:
             self._highlight.set_rects([])
+            self._set_outlines([])
             return
         rects = self.imagePlacementRects(xref)
         if not rects:
             self._highlight_xref = None
             self._highlight.set_rects([])
+            self._set_outlines([])
             return
         self._highlight.set_rects(rects)
+        self._set_outlines(rects)
+
+    def _set_outlines(self, rects):
+        for item in list(getattr(self, "_outlines", []) or []):
+            scene = item.scene()
+            if scene is not None:
+                scene.removeItem(item)
+        self._outlines = []
+        for rect in rects or []:
+            self._outlines.append(ImageOutlineItem(self, rect))
+
+    def outlineItems(self):
+        return [item for item in getattr(self, "_outlines", []) or [] if item.scene() is not None]
 
     def clearPreviews(self):
         """Hide previews. Cached images are kept so they can return at once."""

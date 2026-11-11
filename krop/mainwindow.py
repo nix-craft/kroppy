@@ -1387,5 +1387,14 @@ class MainWindow(QMainWindow):
                     job.wait(2000)
                 except Exception:
                     pass
+        panel = getattr(self, "analysisPanel", None)
+        if panel is not None:
+            panel._ladder_gen = getattr(panel, "_ladder_gen", 0) + 1
+            job = getattr(panel, "_ladder_job", None)
+            if job is not None:
+                try:
+                    job.wait(8000)
+                except Exception:
+                    pass
         self.cancelAnalysis(wait=True)
         self.writeSettings()

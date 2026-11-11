@@ -78,7 +78,7 @@ class AnalyzeJob(QThread):
             result = analyze_file(
                 self.path, cancel=self.cancel, threshold=self.threshold,
                 focus=self._focus_value, on_start=on_start, on_page=on_page,
-                on_image=on_image)
+                on_image=on_image, defer_heavy=True)
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -96,6 +96,37 @@ class AnalyzeJob(QThread):
             result = {"error": tb, "message": message, "missing": missing}
         if not self.cancel.is_set():
             self.done.emit(result)
+
+
+class _LadderJob(QThread):
+    """Measure JPEG and palette options away from the UI thread."""
+    ready = pyqtSignal(object)
+
+    def __init__(self, path, xref, share, candidates, stored, filt, threshold, width, height, gen):
+        QThread.__init__(self)
+        self.path = path
+        self.xref = xref
+        self.share = share
+        self.candidates = candidates
+        self.stored = stored
+        self.filt = filt
+        self.threshold = threshold
+        self.width = width
+        self.height = height
+        self.gen = gen
+
+    def run(self):
+        filled = self.candidates
+        try:
+            from krop.imagetarget import fill_pending_file
+            filled = fill_pending_file(
+                self.path, self.xref, self.candidates, self.stored, self.filt,
+                self.threshold, self.width, self.height)
+        except Exception:
+            filled = self.candidates
+        self.ready.emit({
+            "xref": self.xref, "share": self.share, "candidates": filled, "gen": self.gen,
+        })
 
 
 class _EncodeJob(QThread):
@@ -145,6 +176,10 @@ class AnalysisPanel(QDockWidget):
         self._encoded = {}
         self._tokens = {}
         self._encode_jobs = []
+        self._ladder_queue = []
+        self._ladder_job = None
+        self._ladder_gen = 0
+        self._ladder_seen = set()
         body = QWidget()
         layout = QVBoxLayout(body)
         self.summary = QLabel("Open a PDF to analyze it.")
@@ -202,6 +237,9 @@ class AnalysisPanel(QDockWidget):
         self._path = name
         self._data = None
         self._pages = {}
+        self._ladder_gen = getattr(self, "_ladder_gen", 0) + 1
+        self._ladder_queue = []
+        self._ladder_seen = set()
         self.summary.setText("Analyzing %s…" % name)
         self.preview_changed.emit()
         self._selecting = True
@@ -221,6 +259,94 @@ class AnalysisPanel(QDockWidget):
             self._selecting = False
         self._select_followed()
         self.preview_changed.emit()
+        self._queue_pending_ladder()
+
+    def _queue_pending_ladder(self):
+        pages = []
+        data = self._data or {}
+        if data.get("pages") and not data.get("error"):
+            pages = data.get("pages") or []
+        else:
+            pages = list(getattr(self, "_pages", {}).values())
+        for page in pages:
+            if not page:
+                continue
+            for im in page.get("images") or []:
+                self._queue_ladder(im)
+
+    def _queue_ladder(self, im):
+        if not im or not any(c.get("pending") for c in im.get("candidates") or []):
+            return
+        key = im.get("share_key") or str(im.get("xref"))
+        if key in self._ladder_seen:
+            return
+        self._ladder_seen.add(key)
+        self._ladder_queue.append({
+            "xref": im.get("xref"),
+            "share": key,
+            "candidates": [dict(c) for c in im.get("candidates") or []],
+            "stored": int(im.get("bytes") or 0),
+            "filt": im.get("filter_name") or "",
+            "width": int(im.get("width") or 0),
+            "height": int(im.get("height") or 0),
+            "gen": self._ladder_gen,
+        })
+        self._pump_ladder()
+
+    def _pump_ladder(self):
+        if self._ladder_job is not None or not self._ladder_queue or not self._path:
+            return
+        item = self._ladder_queue.pop(0)
+        job = _LadderJob(
+            self._path, item["xref"], item["share"], item["candidates"], item["stored"],
+            item["filt"], self.error_threshold(), item["width"], item["height"], item["gen"])
+        job.ready.connect(self._on_ladder)
+        job.finished.connect(job.deleteLater)
+        self._ladder_job = job
+        job.start()
+
+    def _on_ladder(self, payload):
+        self._ladder_job = None
+        try:
+            if payload.get("gen") != self._ladder_gen:
+                return
+            filled = payload.get("candidates") or []
+            xref = payload.get("xref")
+            share = payload.get("share") or ""
+            holder = self._holder()
+            matches = []
+            stored = 0
+            for page in holder.get("pages") or []:
+                if not page:
+                    continue
+                for im in page.get("images") or []:
+                    if im.get("xref") == xref or (share and im.get("share_key") == share):
+                        matches.append(im)
+                        stored = int(im.get("bytes") or stored)
+            for im in holder.get("images") or []:
+                if im.get("xref") == xref or (share and im.get("share_key") == share):
+                    matches.append(im)
+                    stored = int(im.get("bytes") or stored)
+            if not matches:
+                return
+            for im in matches:
+                im["candidates"] = [dict(c) for c in filled]
+            from krop.imagetarget import choose_smallest
+            best = choose_smallest(filled, stored)
+            user_picked = share in self._choices or str(xref) in self._choices
+            if best and not user_picked and best.get("id") != matches[0].get("target"):
+                from krop.analyze import apply_chosen_target
+                apply_chosen_target(holder, xref, best)
+            self._refresh_after_choice()
+            self.preview_changed.emit()
+        finally:
+            self._pump_ladder()
+
+    def _holder(self):
+        data = self._data or {}
+        if data.get("pages") and not data.get("error"):
+            return data
+        return {"pages": list(getattr(self, "_pages", {}).values()), "images": [], "summary": None}
 
     def preview_enabled(self):
         return bool(self.previewBox.isChecked())
@@ -382,6 +508,8 @@ class AnalysisPanel(QDockWidget):
             self._selecting = False
         self._select_followed()
         self.preview_changed.emit()
+        for im in page.get("images") or []:
+            self._queue_ladder(im)
 
     def _fill_row(self, row, page):
         images = page.get("images") or []
@@ -429,10 +557,7 @@ class AnalysisPanel(QDockWidget):
             role = Qt.ForegroundRole
         warn = QBrush(QColor(160, 70, 0))
         for cand in candidates:
-            label = cand.get("label") or cand.get("id") or ""
-            if cand.get("over"):
-                label = "%s  (over)" % label
-            combo.addItem(label, cand.get("id"))
+            combo.addItem(_candidate_label(cand), cand.get("id"))
             if cand.get("over"):
                 combo.setItemData(combo.count() - 1, warn, role)
         share = im.get("share_key") or ""
@@ -574,7 +699,7 @@ class AnalysisPanel(QDockWidget):
                 apply_chosen_target(self._data, im.get("xref"), cand)
 
     def _refresh_after_choice(self):
-        data = self._data or {}
+        data = self._holder()
         self._selecting = True
         try:
             for page in data.get("pages") or []:
@@ -602,12 +727,17 @@ class AnalysisPanel(QDockWidget):
             combo = self.tree.itemWidget(child, 2)
             if combo is None:
                 continue
+            by_id = {c.get("id"): c for c in im.get("candidates") or []}
+            combo.blockSignals(True)
+            for index in range(combo.count()):
+                cand = by_id.get(combo.itemData(index))
+                if cand is not None:
+                    combo.setItemText(index, _candidate_label(cand))
             chosen = im.get("chosen_target") or im.get("target")
             index = combo.findData(chosen)
             if index >= 0 and combo.currentIndex() != index:
-                combo.blockSignals(True)
                 combo.setCurrentIndex(index)
-                combo.blockSignals(False)
+            combo.blockSignals(False)
             return
 
     def follow_page(self, page):
@@ -720,6 +850,29 @@ class AnalysisPanel(QDockWidget):
     def _clicked(self, item, _column):
         # Kept for tests that call the handler directly.
         self._on_clicked(item, _column)
+
+
+def _candidate_label(cand):
+    """Dropdown text: structure, mean error, estimated size, and savings."""
+    label = cand.get("label") or cand.get("id") or ""
+    bits = [label]
+    if cand.get("error_mae") is not None:
+        bits.append("mae %.1f" % float(cand["error_mae"]))
+    if cand.get("est_bytes") is not None:
+        bits.append(_fmt_bytes(cand["est_bytes"]))
+    pct = cand.get("savings_pct")
+    if pct is not None:
+        pct = float(pct)
+        if pct > 0.5:
+            bits.append("%.0f%% smaller" % pct)
+        elif pct < -0.5:
+            bits.append("%.0f%% larger" % (-pct))
+    text = "  ".join(bits)
+    if cand.get("pending"):
+        text += "  …"
+    if cand.get("over"):
+        text += "  (over)"
+    return text
 
 
 def _fmt_bytes(n):
