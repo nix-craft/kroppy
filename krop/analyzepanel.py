@@ -47,6 +47,7 @@ class AnalyzeJob(QThread):
         QThread.__init__(self)
         self.path = path
         self.cancel = threading.Event()
+        self.yield_to = None
         self.threshold = threshold
         self._focus = int(focus or 0)
         self._lock = threading.Lock()
@@ -78,7 +79,7 @@ class AnalyzeJob(QThread):
             result = analyze_file(
                 self.path, cancel=self.cancel, threshold=self.threshold,
                 focus=self._focus_value, on_start=on_start, on_page=on_page,
-                on_image=on_image, defer_heavy=True)
+                on_image=on_image, defer_heavy=True, yield_to=self.yield_to)
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -96,6 +97,52 @@ class AnalyzeJob(QThread):
             result = {"error": tb, "message": message, "missing": missing}
         if not self.cancel.is_set():
             self.done.emit(result)
+
+
+def _run_queued(payload):
+    kind = payload.get("kind")
+    if not payload.get("path"):
+        return None
+    if kind == "measure":
+        from krop.imagetarget import encode_file_image
+        return encode_file_image(
+            payload["path"], payload["xref"], payload["target"],
+            payload.get("stored") or 0, payload.get("filt") or "")
+    if kind == "preview":
+        from krop.preview import preview_rgba
+        return preview_rgba(
+            payload["path"], payload["xref"], payload["target"], payload.get("rotation") or 0)
+    return None
+
+
+class _WorkThread(QThread):
+    """One worker for measurements and previews, in queue order."""
+    done = pyqtSignal(object)
+
+    def __init__(self, queue, wake, stop):
+        QThread.__init__(self)
+        self.queue = queue
+        self.wake = wake
+        self.stop = stop
+
+    def run(self):
+        while not self.stop.is_set():
+            job = self.queue.pop()
+            if job is None:
+                self.wake.wait(0.25)
+                self.wake.clear()
+                continue
+            if self.queue.has_better_than(job["priority"]):
+                self.queue.requeue(job)
+                continue
+            self.queue.set_running(job["priority"])
+            result = None
+            try:
+                result = _run_queued(job["payload"])
+            except Exception:
+                result = None
+            self.queue.set_running(None)
+            self.done.emit({"payload": job["payload"], "result": result, "priority": job["priority"]})
 
 
 class _LadderJob(QThread):
@@ -180,6 +227,14 @@ class AnalysisPanel(QDockWidget):
         self._ladder_job = None
         self._ladder_gen = 0
         self._ladder_seen = set()
+        self._urgent = None
+        from krop.jobqueue import JobQueue
+        self._jobs = JobQueue()
+        self._wake = threading.Event()
+        self._work_stop = threading.Event()
+        self._worker = _WorkThread(self._jobs, self._wake, self._work_stop)
+        self._worker.done.connect(self._on_work)
+        self._worker.start()
         body = QWidget()
         layout = QVBoxLayout(body)
         self.summary = QLabel("Open a PDF to analyze it.")
@@ -244,6 +299,9 @@ class AnalysisPanel(QDockWidget):
         self._ladder_gen = getattr(self, "_ladder_gen", 0) + 1
         self._ladder_queue = []
         self._ladder_seen = set()
+        self._urgent = None
+        if getattr(self, "_jobs", None) is not None:
+            self._jobs.clear()
         self.summary.setText("Analyzing %s…" % name)
         self.preview_changed.emit()
         self._selecting = True
@@ -279,72 +337,144 @@ class AnalysisPanel(QDockWidget):
                 self._queue_ladder(im)
 
     def _queue_ladder(self, im):
-        if not im or not any(c.get("pending") for c in im.get("candidates") or []):
+        if not im:
             return
-        key = im.get("share_key") or str(im.get("xref"))
-        if key in self._ladder_seen:
-            return
-        self._ladder_seen.add(key)
-        self._ladder_queue.append({
-            "xref": im.get("xref"),
-            "share": key,
-            "candidates": [dict(c) for c in im.get("candidates") or []],
-            "stored": int(im.get("bytes") or 0),
-            "filt": im.get("filter_name") or "",
-            "width": int(im.get("width") or 0),
-            "height": int(im.get("height") or 0),
-            "gen": self._ladder_gen,
-        })
-        self._pump_ladder()
+        for cand in im.get("candidates") or []:
+            if not cand.get("pending"):
+                continue
+            self._enqueue_measure(im, cand.get("id"), priority=10)
 
-    def _pump_ladder(self):
-        if self._ladder_job is not None or not self._ladder_queue or not self._path:
+    def _enqueue_measure(self, im, target_id, priority, token=None):
+        if not im or not target_id or target_id == "keep":
             return
-        item = self._ladder_queue.pop(0)
-        job = _LadderJob(
-            self._path, item["xref"], item["share"], item["candidates"], item["stored"],
-            item["filt"], self.error_threshold(), item["width"], item["height"], item["gen"])
-        job.ready.connect(self._on_ladder)
-        job.finished.connect(job.deleteLater)
-        self._ladder_job = job
-        job.start()
+        xref = int(im.get("xref"))
+        key = ("measure", xref, str(target_id))
+        payload = {
+            "kind": "measure", "path": self._path, "xref": xref, "target": str(target_id),
+            "share": im.get("share_key") or "", "stored": int(im.get("bytes") or 0),
+            "filt": im.get("filter_name") or "", "width": int(im.get("width") or 0),
+            "height": int(im.get("height") or 0), "gen": self._ladder_gen, "token": token,
+        }
+        if priority <= 0:
+            self._jobs.promote(key, payload, 0)
+        else:
+            self._jobs.push(key, payload, priority)
+        self._wake.set()
 
-    def _on_ladder(self, payload):
-        self._ladder_job = None
-        try:
-            if payload.get("gen") != self._ladder_gen:
-                return
-            filled = payload.get("candidates") or []
-            xref = payload.get("xref")
-            share = payload.get("share") or ""
-            holder = self._holder()
-            matches = []
-            stored = 0
-            for page in holder.get("pages") or []:
-                if not page:
-                    continue
-                for im in page.get("images") or []:
-                    if im.get("xref") == xref or (share and im.get("share_key") == share):
-                        matches.append(im)
-                        stored = int(im.get("bytes") or stored)
-            for im in holder.get("images") or []:
+    def prioritize(self, xref, target_id, token=None):
+        """Jump this image's measurement and preview ahead of other work."""
+        im = self._find_image(xref) or {"xref": xref, "share_key": "", "bytes": 0, "filter_name": ""}
+        cand = None
+        for item in im.get("candidates") or []:
+            if item.get("id") == target_id:
+                cand = item
+                break
+        if cand is None or cand.get("pending") or cand.get("est_bytes") is None:
+            self._enqueue_measure(im, target_id, 0, token)
+        parent = self.parent()
+        viewer = getattr(parent, "viewer", None)
+        if viewer is not None and self._path:
+            try:
+                rotation = viewer.pageGetRotation(viewer.currentPageIndex)
+            except Exception:
+                rotation = 0
+            self.enqueue_preview(self._path, int(xref), str(target_id), rotation, token, 0)
+
+    def enqueue_preview(self, path, xref, target, rotation, token, priority):
+        key = ("preview", int(xref), str(target), int(rotation or 0))
+        payload = {
+            "kind": "preview", "path": path, "xref": int(xref), "target": str(target),
+            "rotation": int(rotation or 0), "token": token, "gen": self._ladder_gen,
+        }
+        if priority <= 0:
+            self._jobs.promote(key, payload, 0)
+        else:
+            self._jobs.push(key, payload, priority)
+        self._wake.set()
+
+    def job_order(self):
+        return list(self._jobs.order())
+
+    def urgent(self):
+        return self._urgent
+
+    def yield_to_urgent(self):
+        """Block the page walk while a user-selected job is queued or running."""
+        import time
+        deadline = time.time() + 20
+        while time.time() < deadline and self._jobs.has_priority(0):
+            self._wake.set()
+            time.sleep(0.02)
+
+    def _on_work(self, message):
+        payload = message.get("payload") or {}
+        if payload.get("gen") != self._ladder_gen:
+            return
+        kind = payload.get("kind")
+        if kind == "measure":
+            self._apply_measure(payload, message.get("result"))
+        elif kind == "preview":
+            viewer = getattr(self.parent(), "viewer", None)
+            if viewer is not None:
+                viewer.deliverPreview({
+                    "xref": payload.get("xref"), "target": payload.get("target"),
+                    "rotation": payload.get("rotation") or 0, "token": payload.get("token"),
+                    "rgba": message.get("result"),
+                })
+
+    def _matching_images(self, xref, share):
+        holder = self._holder()
+        matches = []
+        for page in holder.get("pages") or []:
+            if not page:
+                continue
+            for im in page.get("images") or []:
                 if im.get("xref") == xref or (share and im.get("share_key") == share):
                     matches.append(im)
-                    stored = int(im.get("bytes") or stored)
-            if not matches:
-                return
-            for im in matches:
-                im["candidates"] = [dict(c) for c in filled]
-            from krop.imagetarget import choose_smallest
-            best = choose_smallest(filled, stored)
-            user_picked = share in self._choices or str(xref) in self._choices
-            if best and not user_picked and best.get("id") != matches[0].get("target"):
+        for im in holder.get("images") or []:
+            if im.get("xref") == xref or (share and im.get("share_key") == share):
+                matches.append(im)
+        return holder, matches
+
+    def _apply_measure(self, payload, result):
+        if not result:
+            return
+        xref = payload.get("xref")
+        target = str(payload.get("target"))
+        share = payload.get("share") or ""
+        holder, matches = self._matching_images(xref, share)
+        if not matches:
+            return
+        limit = float(self.error_threshold())
+        mae = result.get("error_mae")
+        mx = result.get("error_max") or 0
+        try:
+            over = mae is not None and (float(mae) > limit or float(mx) > max(16.0, limit * 4.0))
+        except (TypeError, ValueError):
+            over = False
+        fields = dict(result)
+        fields["id"] = target
+        fields["over"] = over
+        fields["pending"] = False
+        for im in matches:
+            for cand in im.get("candidates") or []:
+                if cand.get("id") == target:
+                    cand.update(fields)
+                    cand["pending"] = False
+        chosen = self._choices.get(share) or self._choices.get(str(xref))
+        if chosen == target:
+            from krop.analyze import apply_chosen_target
+            apply_chosen_target(holder, xref, fields)
+        else:
+            user_picked = bool(chosen)
+            pending_left = any(c.get("pending") for im in matches for c in (im.get("candidates") or []))
+            if not user_picked and not pending_left:
+                from krop.imagetarget import choose_smallest
                 from krop.analyze import apply_chosen_target
-                apply_chosen_target(holder, xref, best)
-            self._refresh_after_choice()
-            self.preview_changed.emit()
-        finally:
-            self._pump_ladder()
+                best = choose_smallest(matches[0].get("candidates") or [], matches[0].get("bytes") or 0)
+                if best and best.get("id") != matches[0].get("target"):
+                    apply_chosen_target(holder, xref, best)
+        self._refresh_after_choice()
 
     def _holder(self):
         data = self._data or {}
@@ -589,30 +719,31 @@ class AnalysisPanel(QDockWidget):
 
     def _choose(self, xref, share, target_id):
         key = share or str(xref)
+        token = self._tokens.get(key, 0) + 1
+        self._tokens[key] = token
         self._choices[key] = target_id
         self._choices[str(xref)] = target_id
+        if target_id == "keep":
+            self._urgent = None
+        else:
+            self._urgent = (int(xref), str(target_id), token)
+            self.prioritize(xref, target_id, token)
         self.preview_changed.emit()
         cached = self._encoded.get((key, target_id))
         cand = self._candidate(xref, target_id)
-        if cached:
-            fields = dict(cand or {})
-            fields.update(cached)
+        if target_id == "keep" or cached or (cand and cand.get("est_bytes") is not None and not cand.get("pending")):
+            fields = dict(cand or {"id": "keep", "label": "keep", "error_mae": 0, "error_max": 0})
+            if cached:
+                fields.update(cached)
             fields["id"] = target_id
-            self._apply_fields(xref, fields)
-            return
-        if cand and cand.get("est_bytes") is not None:
-            fields = dict(cand)
-            fields["id"] = target_id
+            if target_id == "keep":
+                fields.setdefault("error_mae", 0)
+                fields.setdefault("error_max", 0)
+                if fields.get("est_bytes") is None and cand:
+                    fields["est_bytes"] = cand.get("est_bytes")
             self._apply_fields(xref, fields)
             return
         self._mark_pending(xref)
-        token = self._tokens.get(key, 0) + 1
-        self._tokens[key] = token
-        stored, filt = self._image_facts(xref)
-        job = _EncodeJob(self._path, xref, target_id, stored, filt, token, key)
-        job.ready.connect(self._on_encoded)
-        self._encode_jobs.append(job)
-        job.start()
 
     def _candidate(self, xref, target_id):
         im = self._find_image(xref)
@@ -622,8 +753,7 @@ class AnalysisPanel(QDockWidget):
         return None
 
     def _find_image(self, xref):
-        data = self._data or {}
-        for page in data.get("pages") or []:
+        for page in self._holder().get("pages") or []:
             if not page:
                 continue
             for im in page.get("images") or []:

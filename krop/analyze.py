@@ -1730,7 +1730,7 @@ def _owned_image_bytes(images, page_no):
     return current, estimate
 
 
-def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None, on_image=None, defer_heavy=False):
+def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None, on_image=None, defer_heavy=False, yield_to=None):
     """Analyze path. cancel is an optional threading.Event checked between pages.
 
     focus is a 0-based page index, or a callable returning one, so a running
@@ -1760,6 +1760,8 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
         while pending:
             if cancel is not None and cancel.is_set():
                 return None
+            if yield_to is not None:
+                yield_to()
             where = focus() if callable(focus) else (0 if focus is None else int(focus))
             index = None
             for candidate in page_visit_order(count, where):

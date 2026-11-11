@@ -1263,6 +1263,7 @@ class MainWindow(QMainWindow):
         job.page_ready.connect(self.analysisPanel.add_page)
         job.image_ready.connect(self.analysisPanel.show_shared_image)
         job.done.connect(self._onAnalysis)
+        job.yield_to = self.analysisPanel.yield_to_urgent
         self._analysis_job = job
         self._analysis_jobs.append(job)
         self.analysisPanel.set_running(path)
@@ -1328,7 +1329,22 @@ class MainWindow(QMainWindow):
             rotation = viewer.pageGetRotation(viewer.currentPageIndex)
         except Exception:
             rotation = 0
-        viewer.setPreviewPlan(path, panel.preview_plan(viewer.currentPageIndex + 1), rotation)
+        rotation = int(rotation or 0)
+        plan = panel.preview_plan(viewer.currentPageIndex + 1)
+        viewer.setPreviewPlan(path, plan, rotation)
+        urgent = panel.urgent()
+        if urgent and urgent[1] != "keep":
+            cached = viewer.previewImage(urgent[0], urgent[1], rotation)
+            if cached is None:
+                viewer.showBusy(urgent[0], urgent[2])
+            else:
+                viewer.clearBusy()
+        else:
+            viewer.clearBusy()
+        for xref, target, rot in viewer.missingPreviews():
+            token = urgent[2] if urgent and urgent[0] == xref and urgent[1] == target else None
+            priority = 0 if token is not None else 10
+            panel.enqueue_preview(path, xref, target, rot, token, priority)
 
     def _analysisDockVisibility(self, visible):
         if not visible:
@@ -1390,11 +1406,21 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "analysisPanel", None)
         if panel is not None:
             panel._ladder_gen = getattr(panel, "_ladder_gen", 0) + 1
-            job = getattr(panel, "_ladder_job", None)
-            if job is not None:
+            stop = getattr(panel, "_work_stop", None)
+            wake = getattr(panel, "_wake", None)
+            if stop is not None:
+                stop.set()
+            if wake is not None:
+                wake.set()
+            worker = getattr(panel, "_worker", None)
+            if worker is not None:
                 try:
-                    job.wait(8000)
+                    worker.wait(3000)
                 except Exception:
                     pass
+        if viewer is not None:
+            spinner = getattr(viewer, "_spinner", None)
+            if spinner is not None:
+                spinner.stop()
         self.cancelAnalysis(wait=True)
         self.writeSettings()

@@ -24,6 +24,125 @@ from krop.imagehighlight import (
     HIGHLIGHT_WIDTH, VIEW_DPI, map_image_rects)
 
 
+class _Spinner(QObject):
+    """Repaint the busy glyph. QPainter only, so it works over X11 without GL."""
+
+    def __init__(self, item):
+        QObject.__init__(self)
+        self._item = item
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def _tick(self):
+        item = self._item
+        if item is None or not item.isVisible():
+            return
+        item._angle = (getattr(item, "_angle", 0) + 30) % 360
+        item.update()
+
+    def stop(self):
+        self._timer.stop()
+        self._item = None
+
+
+class BusyOverlayItem(QGraphicsItem):
+    """Darkens one image and shows a spinner while its preview is computed."""
+
+    def __init__(self, parent):
+        QGraphicsItem.__init__(self, parent)
+        self._rects = []
+        self._angle = 0
+        self.setZValue(1200)
+        self.setAcceptHoverEvents(True)
+        try:
+            self.setCursor(Qt.CursorShape.WaitCursor)
+        except AttributeError:
+            self.setCursor(Qt.WaitCursor)
+        try:
+            self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        except AttributeError:
+            self.setAcceptedMouseButtons(Qt.NoButton)
+        self.hide()
+
+    def set_rects(self, rects):
+        self.prepareGeometryChange()
+        self._rects = list(rects or [])
+        self.setVisible(bool(self._rects))
+        self.update()
+
+    def rects(self):
+        return list(self._rects)
+
+    def boundingRect(self):
+        if not self._rects:
+            return QRectF()
+        x0 = min(r[0] for r in self._rects)
+        y0 = min(r[1] for r in self._rects)
+        x1 = max(r[0] + r[2] for r in self._rects)
+        y1 = max(r[1] + r[3] for r in self._rects)
+        return QRectF(x0, y0, x1 - x0, y1 - y0).adjusted(-16, -16, 16, 16)
+
+    def shape(self):
+        path = QPainterPath()
+        for rect in self._rects:
+            path.addRect(QRectF(rect[0], rect[1], rect[2], rect[3]))
+        return path
+
+    def hoverEnterEvent(self, event):
+        cursor = Qt.CursorShape.WaitCursor if hasattr(Qt, "CursorShape") else Qt.WaitCursor
+        scene = self.scene()
+        if scene is not None:
+            for view in scene.views():
+                view.setCursor(cursor)
+        QGraphicsItem.hoverEnterEvent(self, event)
+
+    def hoverLeaveEvent(self, event):
+        scene = self.scene()
+        if scene is not None:
+            for view in scene.views():
+                view.unsetCursor()
+        QGraphicsItem.hoverLeaveEvent(self, event)
+
+    def paint(self, painter, option, widget):
+        if not self._rects:
+            return
+        try:
+            no_pen = Qt.PenStyle.NoPen
+        except AttributeError:
+            no_pen = Qt.NoPen
+        painter.setPen(QPen(no_pen))
+        painter.setBrush(QBrush(QColor(0, 0, 0, 120)))
+        primary = self._rects[0]
+        for rect in self._rects:
+            if len(rect) > 4 and rect[4]:
+                primary = rect
+            painter.drawRect(QRectF(rect[0], rect[1], rect[2], rect[3]))
+        cx = primary[0] + primary[2] / 2.0
+        cy = primary[1] + primary[3] / 2.0
+        painter.save()
+        center = painter.worldTransform().map(QPointF(cx, cy))
+        painter.setWorldTransform(QTransform())
+        painter.translate(center)
+        painter.rotate(getattr(self, "_angle", 0))
+        # Hourglass, drawn in device pixels so the stroke cannot vanish on X11.
+        glass = QPainterPath()
+        glass.moveTo(-7, -9)
+        glass.lineTo(7, -9)
+        glass.lineTo(0, 0)
+        glass.lineTo(7, 9)
+        glass.lineTo(-7, 9)
+        glass.lineTo(0, 0)
+        glass.closeSubpath()
+        painter.fillPath(glass, QBrush(QColor(255, 255, 255)))
+        for step in range(8):
+            alpha = 50 + step * 25
+            painter.fillRect(QRectF(9, -1.5, 5, 3), QColor(255, 255, 255, min(alpha, 255)))
+            painter.rotate(45)
+        painter.restore()
+
+
 class _PreviewJob(QThread):
     """Quantize one image off the UI thread. Display only."""
     ready = pyqtSignal(object)
@@ -222,6 +341,10 @@ class AbstractViewerItem(QGraphicsItem):
         self.reset()
         self.mainwindow = mainwindow
         self._highlight = ImageHighlightItem(self)
+        self._busy = BusyOverlayItem(self)
+        self._busy_token = None
+        self._busy_xref = None
+        self._spinner = _Spinner(self._busy)
 
     def reset(self):
         self._currentPageIndex = 0
@@ -232,6 +355,11 @@ class AbstractViewerItem(QGraphicsItem):
         if getattr(self, "_highlight", None) is not None:
             self._highlight.set_rects([])
         self._set_outlines([])
+        if getattr(self, "_busy", None) is not None:
+            self._busy.set_rects([])
+        self._busy_token = None
+        self._busy_xref = None
+        self._preview_tokens = {}
         self.selections.deleteSelections()
         self._preview_cache = {}
         self._preview_wanted = set()
@@ -316,6 +444,10 @@ class AbstractViewerItem(QGraphicsItem):
             return
         self._highlight.set_rects(rects)
         self._set_outlines(rects)
+        if getattr(self, "_busy_xref", None):
+            busy = self.imagePlacementRects(self._busy_xref)
+            if busy and getattr(self, "_busy", None) is not None:
+                self._busy.set_rects(busy)
 
     def _set_outlines(self, rects):
         for item in list(getattr(self, "_outlines", []) or []):
@@ -332,10 +464,15 @@ class AbstractViewerItem(QGraphicsItem):
     def clearPreviews(self):
         """Hide previews. Cached images are kept so they can return at once."""
         self._preview_wanted = set()
+        self.clearBusy()
         self.update()
 
     def setPreviewPlan(self, path, plan, rotation):
-        """Show these (xref, target) previews. Quantize any that are not cached."""
+        """Remember which previews the current page should show.
+
+        Encoding is queued by the analysis panel so a chosen target can jump
+        the line. path is unused here and kept so callers stay the same.
+        """
         rot = int(rotation or 0)
         wanted = set()
         for item in plan or []:
@@ -344,30 +481,69 @@ class AbstractViewerItem(QGraphicsItem):
             except (TypeError, ValueError, KeyError):
                 continue
         self._preview_wanted = wanted
-        self._preview_gen = getattr(self, "_preview_gen", 0)
         self.update()
-        for xref, target, item_rot in wanted:
-            key = (xref, target, item_rot)
-            if key in self._preview_cache or key in self._preview_pending:
-                continue
-            self._preview_pending.add(key)
-            job = _PreviewJob(path, xref, target, item_rot, self._preview_gen)
-            job.ready.connect(self._on_preview_ready)
-            job.finished.connect(job.deleteLater)
-            self._preview_jobs.append(job)
-            job.finished.connect(lambda job=job: self._preview_jobs.remove(job) if job in self._preview_jobs else None)
-            job.start()
 
-    def _on_preview_ready(self, payload):
-        if payload.get("gen") != getattr(self, "_preview_gen", None):
-            return
-        key = (payload.get("xref"), payload.get("target"), payload.get("rotation"))
-        self._preview_pending.discard(key)
-        rgba = payload.get("rgba")
-        if rgba is None:
-            return
-        self._preview_cache[key] = _rgba_qimage(rgba)
+    def missingPreviews(self):
+        wanted = getattr(self, "_preview_wanted", None) or set()
+        cache = getattr(self, "_preview_cache", None) or {}
+        return [key for key in wanted if key not in cache]
+
+    def showBusy(self, xref, token, rects=None):
+        """Darken xref until a preview with this token arrives."""
+        try:
+            self._busy_xref = int(xref) if xref else None
+        except (TypeError, ValueError):
+            self._busy_xref = None
+        self._busy_token = token
+        if self._busy_xref is not None:
+            if not hasattr(self, "_preview_tokens"):
+                self._preview_tokens = {}
+            self._preview_tokens[self._busy_xref] = token
+        if rects is None and self._busy_xref:
+            rects = self.imagePlacementRects(self._busy_xref)
+        if getattr(self, "_busy", None) is not None:
+            self._busy.set_rects(rects or [])
         self.update()
+
+    def clearBusy(self):
+        self._busy_token = None
+        self._busy_xref = None
+        if getattr(self, "_busy", None) is not None:
+            self._busy.set_rects([])
+        self.update()
+
+    def busyVisible(self):
+        item = getattr(self, "_busy", None)
+        return bool(item is not None and item.isVisible())
+
+    def busyItem(self):
+        return getattr(self, "_busy", None)
+
+    def busyRects(self):
+        item = getattr(self, "_busy", None)
+        if item is None:
+            return []
+        return item.rects()
+
+    def deliverPreview(self, payload):
+        """Store a preview. A token that is no longer current is ignored."""
+        if not payload or payload.get("rgba") is None:
+            return False
+        try:
+            xref = int(payload.get("xref"))
+        except (TypeError, ValueError):
+            return False
+        token = payload.get("token")
+        expected = (getattr(self, "_preview_tokens", None) or {}).get(xref)
+        if expected is not None and token != expected:
+            return False
+        key = (xref, str(payload.get("target")), int(payload.get("rotation") or 0))
+        self._preview_cache[key] = _rgba_qimage(payload.get("rgba"))
+        self._preview_pending.discard(key)
+        if self._busy_token is not None and token == self._busy_token and xref == self._busy_xref:
+            self.clearBusy()
+        self.update()
+        return True
 
     def previewReady(self):
         return [key for key in self._preview_wanted if key in self._preview_cache]
