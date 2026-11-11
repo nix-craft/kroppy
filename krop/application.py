@@ -171,19 +171,24 @@ def main():
 
     import os
     from krop.activitylog import install as _installLog, patch_classes
-    from krop.control import resolve_control_path, start_control
-    _control_path = resolve_control_path(getattr(args, "control", None), os.environ.get("KROPPY_CONTROL"))
-    if _control_path:
-        try:
-            start_control(window, _control_path)
-        except Exception as exc:
-            sys.stderr.write("kroppy: control socket failed: %s\n" % exc)
     _logPath = args.log or os.environ.get('KROP_LOG')
     _explicit_log = _logPath and str(_logPath).lower() not in ("off", "0", "no", "false")
     patch_classes("off" if args.log_keep == "never" and not _explicit_log else _logPath)
     from krop.mainwindow import MainWindow
     window=MainWindow()
     _installLog(window, _logPath, keep=args.log_keep, location=args.log_location)
+
+    # After the window and the log exist, and before the file opens, so a
+    # client can connect while startup continues. --analyze-only and
+    # --analyze-json already returned. --go is not an interactive session.
+    if not args.go:
+        from krop.control import resolve_control_path, start_control
+        _control_path = resolve_control_path(getattr(args, "control", None), os.environ.get("KROPPY_CONTROL"))
+        if _control_path:
+            try:
+                start_control(window, _control_path)
+            except Exception as exc:
+                sys.stderr.write("kroppy: control socket failed: %s\n" % exc)
 
     window.analyzeOnOpen = not args.go
     if args.file is not None:

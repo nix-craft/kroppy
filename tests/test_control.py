@@ -203,3 +203,77 @@ def test_control_socket_roundtrip(window, tmp_path, qapp, monkeypatch):
     qapp.processEvents()
     assert not window.isVisible()
     assert not os.path.exists(sock)
+
+
+def _drain(pipe, sink):
+    try:
+        sink.append(pipe.read())
+    except Exception:
+        pass
+
+
+def test_main_control_flag_answers_ping_and_state(tmp_path):
+    """python -m krop --control PATH file.pdf must listen before the window is used."""
+    import pymupdf
+    doc = pymupdf.open()
+    doc.new_page()
+    pdf = str(tmp_path / "file.pdf")
+    doc.save(pdf)
+    doc.close()
+    sock = str(tmp_path / "kroppy-amy.sock")
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = "/workspace" + os.pathsep + env.get("PYTHONPATH", "")
+    env.pop("KROPPY_CONTROL", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "krop", "--control", sock, "--log", "off", pdf],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/workspace", env=env,
+    )
+    err_box = []
+    out_box = []
+    pipes = [
+        threading.Thread(target=_drain, args=(proc.stderr, err_box), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stdout, out_box), daemon=True),
+    ]
+    for thread in pipes:
+        thread.start()
+
+    def stderr_text():
+        return b"".join(err_box).decode("utf-8", "replace")
+
+    try:
+        deadline = time.time() + 20
+        ping = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                ping = transact(sock, "ping", {}, timeout=2)
+                break
+            except OSError:
+                time.sleep(0.05)
+        assert proc.poll() is None, stderr_text()
+        assert ping and ping.get("ok") is True and ping.get("result") == {"pong": True}, err
+        state = None
+        while time.time() < deadline:
+            state = transact(sock, "state", {}, timeout=5)
+            assert state.get("ok") is True, state
+            if state["result"].get("path") == pdf:
+                break
+            time.sleep(0.05)
+        assert state["result"]["path"] == pdf, state
+        assert state["result"]["page_count"] == 1
+        assert state["result"]["page"] == 1
+        quit_resp = transact(sock, "quit", {}, timeout=5)
+        assert quit_resp.get("ok") is True
+        proc.wait(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        for thread in pipes:
+            thread.join(2)
+    err = stderr_text()
+    assert "referenced before assignment" not in err
+    assert "control socket failed" not in err
+    assert proc.returncode == 0, err
