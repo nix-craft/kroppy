@@ -82,7 +82,9 @@ def main():
     parser.add_argument('--trim-use', type=str, choices=['initial', 'all'], help='whether to inspect only the initial page or all pages (slow!) when auto trimming (default: previous value)')
     parser.add_argument('--trim-padding', help='how much padding to include when auto trimming (default: previous value)')
 
-    parser.add_argument('--log', help='run log to append to, one flushed line per event (default: <input>.kroppy.log beside the PDF, with a session header of version, platform and time; if that folder is not writable, a file under ~/.local/state/kroppy). "off" disables. $KROP_LOG is used when this option is omitted')
+    parser.add_argument('--log', help='run log to append to, one flushed line per event. A path is always kept. "off" disables logging. By default the log is <input>.kroppy.log beside the PDF and is deleted when the session ends with no errors. $KROP_LOG is used when this option is omitted')
+    parser.add_argument('--log-keep', choices=['always', 'on-error', 'never'], help='always: keep the run log; on-error: delete it when the session ends with no errors (default); never: do not write a run log (same as --log off). Ignored when --log names a file, which is always kept')
+    parser.add_argument('--log-location', choices=['beside', 'central'], help='where an automatic run log is written: beside the PDF (default) or a central folder (~/.local/state/kroppy, ~/Library/Logs/kroppy, or %%LOCALAPPDATA%%\\kroppy\\logs). Ignored when --log names a file. Central logs older than 30 days are removed on startup')
     parser.add_argument('--go', action='store_true', help='output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb-run')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
@@ -106,10 +108,11 @@ def main():
     import os
     from krop.activitylog import install as _installLog, patch_classes
     _logPath = args.log or os.environ.get('KROP_LOG')
-    patch_classes(_logPath)
+    _explicit_log = _logPath and str(_logPath).lower() not in ("off", "0", "no", "false")
+    patch_classes("off" if args.log_keep == "never" and not _explicit_log else _logPath)
     from krop.mainwindow import MainWindow
     window=MainWindow()
-    _installLog(window, _logPath)
+    _installLog(window, _logPath, keep=args.log_keep, location=args.log_location)
 
     if args.file is not None:
         fileName = args.file

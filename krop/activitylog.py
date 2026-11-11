@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Activity log for kroppy.
 
-By default each run appends to <input>.kroppy.log beside the PDF being opened.
---log FILE / KROP_LOG=FILE appends to that file instead; --log off / KROP_LOG=off
-disables logging. If the folder beside the PDF is not writable, the log goes
-to ~/.local/state/kroppy/ (or $XDG_STATE_HOME/kroppy).
+By default each run appends to <input>.kroppy.log beside the PDF. The file is
+flushed on every line. It is deleted when the session ends with no ERROR
+lines (a clean save, or closing without saving). Errors keep the log.
+--log FILE / KROP_LOG=FILE appends to that file and never deletes it.
+--log off / KROP_LOG=off / --log-keep never writes nothing.
 
 Every line is flushed so the file can be followed with `tail -f`:
   SESSION  version, platform, timestamp
@@ -21,18 +22,36 @@ from krop.qt import *
 
 _f = None
 _mode = "off"          # off | explicit | auto
+_policy = "on-error"   # on-error | always | off | discard
+_location = "beside"   # beside | central
+_cli_keep = None
+_cli_location = None
 _buf = []
 _path = None
+_errors = False
+_last_input = None
+_log_where = None
+_stopped = False
+_CENTRAL_DAYS = 30
 
 
 def user_log_dir():
+    """Per-user folder for run logs when they are not beside the PDF."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        return os.path.join(base, "kroppy", "logs")
+    if sys.platform == "darwin" and not os.environ.get("XDG_STATE_HOME"):
+        return os.path.expanduser("~/Library/Logs/kroppy")
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     return os.path.join(base, "kroppy")
 
 
 def log(kind, msg):
+    global _errors
     if _mode == "off":
         return
+    if kind == "ERROR":
+        _errors = True
     t = time.strftime("%H:%M:%S") + ".%03d" % (int(time.time() * 1000) % 1000)
     line = "%s %-6s %s\n" % (t, kind, msg)
     if _f is None:
@@ -59,55 +78,188 @@ def _write_header(path):
     log("SESSION", "argv %r" % (sys.argv,))
 
 
+def _settings_value(key, default):
+    try:
+        from krop.qt import QSettings
+        value = QSettings().value(key, default)
+    except Exception:
+        return default
+    return default if value in (None, "") else value
+
+
+def _close_log_file():
+    """Flush and close the log. The path stays set so it can be deleted next."""
+    global _f
+    if _f is None:
+        return
+    try:
+        _f.flush()
+        _f.close()
+    except OSError:
+        pass
+    _f = None
+
+
+def _delete_log_file(path):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _should_delete():
+    """Whether the current auto log should be removed when its session ends."""
+    if _mode != "auto":
+        return False
+    if _policy in ("always", "off"):
+        return False
+    if _policy == "discard":
+        return True
+    return not _errors
+
+
+def _end_log(delete):
+    """Write the closing line, close the handle, then optionally delete."""
+    global _path
+    path = _path
+    if _f is not None:
+        log("STOP", "kroppy exiting")
+    _close_log_file()
+    if delete:
+        _delete_log_file(path)
+        _path = None
+
+
 def _switch_log(path):
     """Append a new session to path. Returns the path opened."""
-    global _f, _path
+    global _f, _path, _errors
     path = os.path.abspath(path)
     if _f is not None and _path == path:
         _write_header(path)
         return path
     if _f is not None:
-        try:
-            _f.flush()
-            _f.close()
-        except OSError:
-            pass
-        _f = None
+        _end_log(_should_delete())
+        _errors = False
     _f = _try_open(path)
     _path = path
     _write_header(path)
     if _buf:
         _f.write("".join(_buf))
         _f.flush()
-        _buf.clear()
+        del _buf[:]
     return path
+
+
+def prune_central_logs(days=None):
+    """Delete central *.kroppy.log files older than `days` (default 30)."""
+    if days is None:
+        days = _CENTRAL_DAYS
+    folder = user_log_dir()
+    if not os.path.isdir(folder):
+        return
+    cutoff = time.time() - days * 86400
+    current = os.path.abspath(_path) if _path else None
+    for name in os.listdir(folder):
+        if not name.endswith(".kroppy.log"):
+            continue
+        path = os.path.join(folder, name)
+        if current and os.path.abspath(path) == current:
+            continue
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _auto_log_path(input_path):
+    name = os.path.splitext(os.path.basename(input_path))[0] + ".kroppy.log"
+    if _location == "central":
+        return os.path.join(user_log_dir(), name)
+    return os.path.splitext(os.path.abspath(input_path))[0] + ".kroppy.log"
 
 
 def attach_input(input_path):
     """Open the run log for this PDF.
 
-    Returns the fallback path when the log could not be written beside the
-    PDF, otherwise None. No-op when logging is off or --log named a file.
+    Returns a path when the log is not beside the PDF (chosen central folder,
+    or a fallback because the PDF's folder was not writable), otherwise None.
+    No-op when logging is off or --log named a file.
     """
-    global _buf
+    global _last_input, _log_where
+    _last_input = input_path
     if _mode != "auto" or not input_path:
         return None
+    if _location == "central":
+        prune_central_logs()
+    target = _auto_log_path(input_path)
     beside = os.path.splitext(os.path.abspath(input_path))[0] + ".kroppy.log"
     try:
-        _switch_log(beside)
-        return None
+        _switch_log(target)
     except OSError as err:
-        name = os.path.basename(beside)
-        fallback = os.path.join(user_log_dir(), name)
+        fallback = os.path.join(user_log_dir(), os.path.basename(beside))
         try:
             _switch_log(fallback)
         except OSError:
-            _mode_note = "could not open a log (%s)" % err
-            log("WARN", _mode_note)
+            log("WARN", "could not open a log (%s)" % err)
+            _log_where = None
             return None
         log("WARN", "could not write %s (%s); logging to %s" % (beside, err, fallback))
         sys.stderr.write("kroppy: could not write %s (%s); logging to %s\n" % (beside, err, fallback))
+        _log_where = "fallback"
         return fallback
+    if os.path.abspath(target) == os.path.abspath(beside):
+        _log_where = None
+        return None
+    _log_where = "central"
+    return target
+
+
+def log_where():
+    """'fallback', 'central', or None when the log is beside the PDF."""
+    return _log_where
+
+
+def note_clean_save():
+    """A save finished. Drop the log when this session has no errors."""
+    global _errors
+    if not _should_delete():
+        return
+    reopen = _last_input
+    _end_log(delete=True)
+    _errors = False
+    if reopen and _mode == "auto":
+        attach_input(reopen)
+
+
+def apply_preferences():
+    """Re-read Log/Keep and Log/Location unless this process locked them."""
+    global _policy, _location, _mode
+    if _cli_keep is None and _mode != "explicit":
+        _policy = _saved_policy()
+        if _policy == "off":
+            _mode = "off"
+            _end_log(delete=False)
+        elif _mode == "off":
+            _mode = "auto"
+    if _cli_location is None:
+        _location = _saved_location()
+
+
+def _saved_policy():
+    value = _settings_value("Log/Keep", "on-error")
+    if value not in ("on-error", "always", "off"):
+        return "on-error"
+    return value
+
+
+def _saved_location():
+    value = _settings_value("Log/Location", "beside")
+    if value not in ("beside", "central"):
+        return "beside"
+    return value
 
 
 def _fmt(v):
@@ -194,16 +346,38 @@ def _disabled(path):
     return bool(path) and str(path).lower() in ("off", "0", "no", "false")
 
 
-def install(win, path):
-    """path None -> log beside the input PDF once it is opened.
-    path 'off' -> disable. Any other path is appended to for the whole run.
+def install(win, path, keep=None, location=None):
+    """path None -> log beside the input PDF (or the central folder) once opened.
+    path 'off' -> disable. Any other path is appended to and never deleted.
+    keep/location override the saved preferences for this process.
     """
-    global _mode, _f, _path, _buf
-    if _disabled(path):
+    global _mode, _f, _path, _buf, _policy, _location, _cli_keep, _cli_location
+    global _errors, _stopped, _last_input, _log_where
+    if _f is not None:
+        _end_log(_should_delete())
+    _errors = False
+    _stopped = False
+    _last_input = None
+    _log_where = None
+    _cli_keep = keep
+    _cli_location = location
+    _location = location or _saved_location()
+    if keep == "never":
+        _policy = "off"
+    elif keep == "always":
+        _policy = "always"
+    elif keep == "on-error":
+        _policy = "on-error"
+    else:
+        _policy = _saved_policy()
+    if _location == "central":
+        prune_central_logs()
+    if _disabled(path) or (_policy == "off" and not (path and not _disabled(path))):
         _mode = "off"
         return
     if path:
         _mode = "explicit"
+        _policy = "always"
         _switch_log(os.path.expanduser(path))
     else:
         _mode = "auto"
@@ -244,12 +418,8 @@ def install(win, path):
 
 
 def _stop():
-    global _f
-    log("STOP", "kroppy exiting")
-    if _f is not None:
-        try:
-            _f.flush()
-            _f.close()
-        except OSError:
-            pass
-        _f = None
+    global _stopped
+    if _stopped:
+        return
+    _stopped = True
+    _end_log(_should_delete())

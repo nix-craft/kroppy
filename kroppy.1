@@ -73,7 +73,13 @@ whether to inspect only the initial page or all pages (slow!) when auto trimming
 how much padding to include when auto trimming (default: previous value)
 .TP
 .B \-\-log LOG
-run log to append to (default: <input>.kroppy.log beside the PDF; if that folder is not writable, a file under ~/.local/state/kroppy). "off" disables. $KROP_LOG is used when this option is omitted
+run log to append to, one flushed line per event. A path is always kept. "off" disables logging. By default the log is <input>.kroppy.log beside the PDF and is deleted when the session ends with no errors. $KROP_LOG is used when this option is omitted
+.TP
+.B \-\-log\-keep {always,on\-error,never}
+always: keep the run log; on\-error: delete it when the session ends with no errors (default); never: do not write a run log (same as \-\-log off). Ignored when \-\-log names a file, which is always kept
+.TP
+.B \-\-log\-location {beside,central}
+where an automatic run log is written: beside the PDF (default) or a central folder. Ignored when \-\-log names a file. Central logs older than 30 days are removed on startup
 .TP
 .B \-\-go
 output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb\-run
