@@ -76,10 +76,18 @@ class AnalyzeJob(QThread):
                 if not self.cancel.is_set():
                     self.image_ready.emit(im)
 
-            result = analyze_file(
-                self.path, cancel=self.cancel, threshold=self.threshold,
-                focus=self._focus_value, on_start=on_start, on_page=on_page,
-                on_image=on_image, defer_heavy=True, yield_to=self.yield_to)
+            import pymupdf
+            doc = pymupdf.open(self.path)
+            try:
+                try:
+                    count = doc.page_count
+                except Exception:
+                    count = len(doc)
+            finally:
+                doc.close()
+            result = {"count": int(count)}
+            if not self.cancel.is_set():
+                self.counted.emit(int(count))
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -95,7 +103,7 @@ class AnalyzeJob(QThread):
                     message = "Missing package: %s. Install it with: pip install %s" % (pip, pip)
                     missing = [pip]
             result = {"error": tb, "message": message, "missing": missing}
-        if not self.cancel.is_set():
+        if not self.cancel.is_set() and isinstance(result, dict) and result.get("error"):
             self.done.emit(result)
 
 
@@ -116,33 +124,52 @@ def _run_queued(payload):
 
 
 class _WorkThread(QThread):
-    """One worker for measurements and previews, in queue order."""
+    """One worker. Each pick re-reads which page and which target matter now."""
     done = pyqtSignal(object)
 
-    def __init__(self, queue, wake, stop):
+    def __init__(self, scheduler, wake, stop):
         QThread.__init__(self)
-        self.queue = queue
+        self.scheduler = scheduler
         self.wake = wake
         self.stop = stop
 
     def run(self):
         while not self.stop.is_set():
-            job = self.queue.pop()
+            job = self.scheduler.pop()
             if job is None:
                 self.wake.wait(0.25)
                 self.wake.clear()
                 continue
-            if self.queue.has_better_than(job["priority"]):
-                self.queue.requeue(job)
+            if self.scheduler.should_pause(job):
+                self.scheduler.add(job.get("_key"), job)
                 continue
-            self.queue.set_running(job["priority"])
+            self.scheduler.set_running(job.get("_tier"), job.get("page"))
             result = None
+            paused = False
+            error = None
             try:
-                result = _run_queued(job["payload"])
-            except Exception:
+                if job.get("kind") == "page":
+                    from krop.analyze import analyze_page
+                    def pause(job=job):
+                        return self.scheduler.should_pause(job)
+                    result = analyze_page(
+                        job.get("path"), job.get("page"),
+                        threshold=job.get("threshold"), defer_heavy=True,
+                        cheap=bool(job.get("cheap")), pause=pause)
+                    if result is None and error is None:
+                        paused = True
+                        self.scheduler.add(job.get("_key"), job)
+                else:
+                    result = _run_queued(job)
+            except Exception as exc:
+                error = exc
                 result = None
-            self.queue.set_running(None)
-            self.done.emit({"payload": job["payload"], "result": result, "priority": job["priority"]})
+            self.scheduler.clear_running()
+            if paused and error is None:
+                self.wake.set()
+                continue
+            self.done.emit({"payload": job, "result": result, "error": error})
+            self.wake.set()
 
 
 class _LadderJob(QThread):
@@ -228,13 +255,17 @@ class AnalysisPanel(QDockWidget):
         self._ladder_gen = 0
         self._ladder_seen = set()
         self._urgent = None
-        from krop.jobqueue import JobQueue
-        self._jobs = JobQueue()
+        from krop.scheduler import Scheduler
+        self._scheduler = Scheduler()
         self._wake = threading.Event()
         self._work_stop = threading.Event()
-        self._worker = _WorkThread(self._jobs, self._wake, self._work_stop)
+        self._worker = _WorkThread(self._scheduler, self._wake, self._work_stop)
         self._worker.done.connect(self._on_work)
         self._worker.start()
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(400)
+        self._idle_timer.timeout.connect(self._submit_available)
+        self._idle_timer.start()
         body = QWidget()
         layout = QVBoxLayout(body)
         self.summary = QLabel("Open a PDF to analyze it.")
@@ -290,7 +321,19 @@ class AnalysisPanel(QDockWidget):
         self.legend.setObjectName("analysisLegend")
         self.legend.setWordWrap(True)
         layout.addWidget(self.legend)
+        self.backgroundBox = QCheckBox("Analyze other pages in background")
+        self.backgroundBox.setObjectName("analyzeBackground")
+        self.backgroundBox.setChecked(True)
+        self.backgroundBox.setToolTip("Other pages are scanned only while you are idle, nearest page first. The page on screen always comes first.")
+        self.backgroundBox.toggled.connect(self._toggle_background)
+        layout.addWidget(self.backgroundBox)
         self.setWidget(body)
+
+    def _toggle_background(self, enabled):
+        self._scheduler.set_background(bool(enabled))
+        self._wake.set()
+        self._submit_available()
+        self._refresh_progress()
 
     def set_running(self, name):
         self._path = name
@@ -300,8 +343,10 @@ class AnalysisPanel(QDockWidget):
         self._ladder_queue = []
         self._ladder_seen = set()
         self._urgent = None
-        if getattr(self, "_jobs", None) is not None:
-            self._jobs.clear()
+        self._finalized = False
+        self._failed = False
+        if getattr(self, "_scheduler", None) is not None:
+            self._scheduler.configure(0, 0)
         self.summary.setText("Analyzing %s…" % name)
         self.preview_changed.emit()
         self._selecting = True
@@ -337,82 +382,185 @@ class AnalysisPanel(QDockWidget):
                 self._queue_ladder(im)
 
     def _queue_ladder(self, im):
+        """Queue the displayed page's extra candidates. Other pages stay cheap."""
         if not im:
+            return
+        page_index = int(im.get("page") or 1) - 1
+        if page_index != self._scheduler.focus:
             return
         for cand in im.get("candidates") or []:
             if not cand.get("pending"):
                 continue
-            self._enqueue_measure(im, cand.get("id"), priority=10)
-
-    def _enqueue_measure(self, im, target_id, priority, token=None):
-        if not im or not target_id or target_id == "keep":
-            return
-        xref = int(im.get("xref"))
-        key = ("measure", xref, str(target_id))
-        payload = {
-            "kind": "measure", "path": self._path, "xref": xref, "target": str(target_id),
-            "share": im.get("share_key") or "", "stored": int(im.get("bytes") or 0),
-            "filt": im.get("filter_name") or "", "width": int(im.get("width") or 0),
-            "height": int(im.get("height") or 0), "gen": self._ladder_gen, "token": token,
-        }
-        if priority <= 0:
-            self._jobs.promote(key, payload, 0)
-        else:
-            self._jobs.push(key, payload, priority)
+            self._scheduler.add(("measure", int(im.get("xref")), str(cand.get("id"))), {
+                "kind": "measure", "path": self._path, "xref": int(im.get("xref")),
+                "target": str(cand.get("id")), "page": page_index, "lane": "extra",
+                "share": im.get("share_key") or "", "stored": int(im.get("bytes") or 0),
+                "filt": im.get("filter_name") or "", "gen": self._ladder_gen,
+            })
         self._wake.set()
 
     def prioritize(self, xref, target_id, token=None):
-        """Jump this image's measurement and preview ahead of other work."""
-        im = self._find_image(xref) or {"xref": xref, "share_key": "", "bytes": 0, "filter_name": ""}
+        """The chosen target is P0 until it is measured and previewed."""
+        if target_id == "keep":
+            self._scheduler.set_urgent(None, None)
+            self._wake.set()
+            return
+        self._urgent = (int(xref), str(target_id), token)
+        self._scheduler.set_urgent(xref, target_id)
+        im = self._find_image(xref) or {
+            "xref": xref, "page": self._follow_page or 1, "bytes": 0,
+            "filter_name": "", "share_key": "",
+        }
+        page_index = int(im.get("page") or (self._follow_page or 1)) - 1
         cand = None
         for item in im.get("candidates") or []:
             if item.get("id") == target_id:
                 cand = item
                 break
         if cand is None or cand.get("pending") or cand.get("est_bytes") is None:
-            self._enqueue_measure(im, target_id, 0, token)
-        parent = self.parent()
-        viewer = getattr(parent, "viewer", None)
-        if viewer is not None and self._path:
-            try:
-                rotation = viewer.pageGetRotation(viewer.currentPageIndex)
-            except Exception:
-                rotation = 0
-            self.enqueue_preview(self._path, int(xref), str(target_id), rotation, token, 0)
+            self._scheduler.add(("measure", int(xref), str(target_id)), {
+                "kind": "measure", "path": self._path, "xref": int(xref),
+                "target": str(target_id), "page": page_index, "lane": "choice",
+                "share": im.get("share_key") or "", "stored": int(im.get("bytes") or 0),
+                "filt": im.get("filter_name") or "", "gen": self._ladder_gen, "token": token,
+            })
+        self._wake.set()
+        self._refresh_progress()
 
     def enqueue_preview(self, path, xref, target, rotation, token, priority):
-        key = ("preview", int(xref), str(target), int(rotation or 0))
-        payload = {
-            "kind": "preview", "path": path, "xref": int(xref), "target": str(target),
-            "rotation": int(rotation or 0), "token": token, "gen": self._ladder_gen,
-        }
-        if priority <= 0:
-            self._jobs.promote(key, payload, 0)
+        im = self._find_image(xref)
+        if im is not None:
+            page_index = int(im.get("page") or 1) - 1
         else:
-            self._jobs.push(key, payload, priority)
+            page_index = (self._follow_page or 1) - 1
+        self._scheduler.add(("preview", int(xref), str(target), int(rotation or 0)), {
+            "kind": "preview", "path": path, "xref": int(xref), "target": str(target),
+            "rotation": int(rotation or 0), "token": token, "page": page_index,
+            "lane": "choice" if priority <= 0 else "page", "gen": self._ladder_gen,
+        })
         self._wake.set()
 
     def job_order(self):
-        return list(self._jobs.order())
+        return list(self._scheduler.order())
 
     def urgent(self):
         return self._urgent
 
     def yield_to_urgent(self):
-        """Block the page walk while a user-selected job is queued or running."""
+        """Kept for callers. Page jobs now yield on their own between images."""
         import time
         deadline = time.time() + 20
-        while time.time() < deadline and self._jobs.has_priority(0):
+        while time.time() < deadline and self._scheduler.has_priority(0):
             self._wake.set()
             time.sleep(0.02)
 
+    def _submit_available(self):
+        if not self._path or getattr(self, "_scheduler", None) is None:
+            return
+        if self._scheduler.page_count <= 0:
+            return
+        claimed = self._scheduler.claim_next_page(self._path, self.error_threshold(), self._ladder_gen)
+        if claimed:
+            self._wake.set()
+        self._refresh_progress()
+
+    def _refresh_progress(self):
+        if getattr(self, "_scheduler", None) is None or self._scheduler.page_count <= 0:
+            return
+        page = self._follow_page or (self._scheduler.focus + 1)
+        rec = (self._pages or {}).get(page)
+        images = (rec or {}).get("images") or []
+        ready = sum(1 for im in images if im.get("target"))
+        if not self._scheduler.background:
+            other = "off"
+        elif self._scheduler.running_tier == 3 and self._scheduler.running_page is not None:
+            other = "scanning p%d" % (int(self._scheduler.running_page) + 1)
+        elif self._scheduler.unscanned_others():
+            other = "idle"
+        else:
+            other = "done"
+        line = "page %d: %d/%d images ready; other pages: %s" % (page, ready, len(images), other)
+        if getattr(self, "_finalized", False) or getattr(self, "_failed", False):
+            return
+        self.summary.setText(line)
+        self._maybe_final()
+
+    def _maybe_final(self):
+        if getattr(self, "_finalized", False) or getattr(self, "_failed", False):
+            return
+        if not self._scheduler.all_visited():
+            return
+        pages = []
+        images = []
+        for index in range(self._scheduler.page_count):
+            rec = (self._pages or {}).get(index + 1)
+            if rec is None:
+                return
+            pages.append(rec)
+            images.extend(rec.get("images") or [])
+        try:
+            from krop.analyze import _document, analyze_lines
+            from krop.activitylog import log
+            summary = _document(pages, images)
+        except Exception:
+            return
+        self._data = {"summary": summary, "pages": pages, "images": images}
+        self._finalized = True
+        self._show_summary(summary)
+        for line in analyze_lines(self._data):
+            log("ANALYZE", line)
+
+    def _show_worker_error(self, exc):
+        import traceback
+        self._failed = True
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        message = None
+        try:
+            from krop.analyze import missing_message
+            message = missing_message(exc)
+        except Exception:
+            message = None
+        if not message:
+            message = "Analysis failed: %s" % exc
+        self.summary.setText(message)
+        try:
+            from krop.activitylog import log
+            log("ANALYZE", "failed: %s" % message)
+            for line in tb.splitlines():
+                log("ANALYZE", line)
+        except Exception:
+            pass
+
     def _on_work(self, message):
         payload = message.get("payload") or {}
-        if payload.get("gen") != self._ladder_gen:
+        if payload.get("gen") not in (None, self._ladder_gen):
             return
         kind = payload.get("kind")
+        if message.get("error") is not None:
+            self._show_worker_error(message.get("error"))
+            if kind == "page":
+                self._scheduler.mark_scanned(payload.get("page"), "error")
+            return
+        if kind == "page":
+            rec = message.get("result")
+            index = payload.get("page")
+            if rec:
+                mode = "cheap" if payload.get("cheap") else "full"
+                self._scheduler.mark_scanned(index, mode)
+                self.add_page(rec)
+                if mode == "full":
+                    for im in rec.get("images") or []:
+                        self._queue_ladder(im)
+            else:
+                self._scheduler.note_not_queued(index)
+            self._refresh_progress()
+            self._submit_available()
+            self.preview_changed.emit()
+            return
         if kind == "measure":
             self._apply_measure(payload, message.get("result"))
+            self._refresh_progress()
+            self._submit_available()
         elif kind == "preview":
             viewer = getattr(self.parent(), "viewer", None)
             if viewer is not None:
@@ -581,6 +729,10 @@ class AnalysisPanel(QDockWidget):
         finally:
             self._selecting = False
         self._select_followed()
+        if self._path and getattr(self, "_scheduler", None) is not None:
+            focus = (self._follow_page or 1) - 1
+            self._scheduler.configure(int(count), focus)
+            self._submit_available()
 
     def show_shared_image(self, im):
         """Attach an already-analyzed shared image to every page that uses it."""
@@ -636,14 +788,13 @@ class AnalysisPanel(QDockWidget):
                 self.tree.addTopLevelItem(row)
             self._fill_row(row, page)
             self._arrived = getattr(self, "_arrived", 0) + 1
-            total = getattr(self, "_total", self._arrived)
-            self.summary.setText("Analyzing… %d/%d" % (self._arrived, total))
         finally:
             self._selecting = False
         self._select_followed()
         self.preview_changed.emit()
         for im in page.get("images") or []:
             self._queue_ladder(im)
+        self._refresh_progress()
 
     def _fill_row(self, row, page):
         images = page.get("images") or []
@@ -791,10 +942,11 @@ class AnalysisPanel(QDockWidget):
         self._apply_fields(payload.get("xref"), result)
 
     def _apply_fields(self, xref, fields):
-        if not self._data:
+        holder = self._holder()
+        if not holder.get("pages"):
             return
         from krop.analyze import apply_chosen_target
-        apply_chosen_target(self._data, xref, fields)
+        apply_chosen_target(holder, xref, fields)
         self._refresh_after_choice()
 
     def _reapply_choices(self):
@@ -897,9 +1049,13 @@ class AnalysisPanel(QDockWidget):
         if page < 1:
             return
         self._follow_page = page
+        if getattr(self, "_scheduler", None) is not None:
+            self._scheduler.set_focus(page - 1)
+            self._submit_available()
         self._select_followed()
         self.focus_changed.emit(page)
         self.preview_changed.emit()
+        self._refresh_progress()
 
     def _row_for_page(self, page):
         for i in range(self.tree.topLevelItemCount()):

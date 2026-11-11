@@ -827,7 +827,7 @@ def _catalog_images(doc):
     return catalog
 
 
-def _image_records(doc, page, page_no, placements, threshold=None, decoded=None, catalog=None, analyzed=None, on_image=None, defer_heavy=False):
+def _image_records(doc, page, page_no, placements, threshold=None, decoded=None, catalog=None, analyzed=None, on_image=None, defer_heavy=False, cheap=False, pause=None):
     import numpy as np
     import pymupdf
     by_name = {}
@@ -853,6 +853,8 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None,
         grouped.append(slot)
     page_area = max(float(page.rect.width * page.rect.height), 1.0)
     for slot in grouped:
+        if pause is not None and pause():
+            return None
         im = slot["im"]
         xref = int(im[0])
         smask = int(im[1] or 0)
@@ -934,6 +936,27 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None,
             records.append(rec)
             continue
         _link_image(rec, info)
+        if cheap:
+            upper = cs.upper()
+            if "RGB" in upper or "CMYK" in upper:
+                rec.update(kind="color", photo=True, suggested_bpp=None)
+            elif bpc <= 1:
+                rec.update(kind="bilevel", levels=2, suggested_bpp=1)
+            else:
+                rec.update(kind="gray", suggested_bpp=bpc or 8)
+            rec["target"] = "keep"
+            rec["chosen_target"] = "keep"
+            rec["recommended_target"] = "keep"
+            rec["candidates"] = [{
+                "id": "keep", "label": "keep", "over": False, "pending": False,
+                "error_mae": 0, "error_max": 0, "est_bytes": raw_len, "savings_pct": 0,
+                "codec": rec.get("filter_name") or "keep",
+            }]
+            _describe_image(rec)
+            if on_image is not None:
+                on_image(dict(rec))
+            records.append(rec)
+            continue
         if _reuse_target(rec, analyzed):
             _describe_image(rec)
             records.append(rec)
@@ -1730,6 +1753,70 @@ def _owned_image_bytes(images, page_no):
     return current, estimate
 
 
+def _one_page(doc, pdf, index, cache, decoded, analyzed, catalog, threshold, defer_heavy, cheap, on_image, pause, seen_xrefs, image_table):
+    """One page. None means a pause check asked us to stop before finishing it."""
+    if pause is not None and pause():
+        return None
+    page = doc[index]
+    page_no = index + 1
+    contrib = _empty_contrib()
+    try:
+        pk_page = pdf.pages[index]
+        res = pk_page.get("/Resources", None)
+        if res is None:
+            res = pk_page.resources
+        _page_group(pk_page.obj, contrib)
+        _walk_content(pdf, pk_page.obj, res, contrib, set(), 0, cache)
+    except Exception as exc:
+        _add_blocker(contrib, "stream", "content stream could not be parsed (%s) p{p}" % exc, "check")
+    images = _image_records(
+        doc, page, page_no, contrib["placements"], threshold, decoded,
+        catalog, analyzed, on_image, defer_heavy, cheap, pause)
+    if images is None:
+        return None
+    for im in images:
+        if im["xref"] in seen_xrefs:
+            continue
+        seen_xrefs.add(im["xref"])
+        image_table.append(im)
+    texts = _text_items(page, contrib["tr3"] > 0)
+    _mark_red_text(texts)
+    _annotations(page, contrib)
+    rec = _page_decision(page_no, images, texts, contrib)
+    if rec.get("needs_render") and not cheap:
+        annots = any(b.get("kind") == "annot" and b.get("severity") == "check" for b in rec["blockers"])
+        rec = _apply_render(rec, _render_measure(page, annots=annots))
+    rec["image_count"] = len(images)
+    rec["image_bytes"], rec["image_est"] = _owned_image_bytes(images, page_no)
+    if rec["image_bytes"]:
+        rec["savings_pct"] = round((rec["image_bytes"] - rec["image_est"]) * 100.0 / rec["image_bytes"], 1)
+    else:
+        rec["savings_pct"] = 0.0
+    rec["scan"] = "cheap" if cheap else "full"
+    return rec
+
+
+def analyze_page(path, index, threshold=None, defer_heavy=True, cheap=False, cancel=None, pause=None):
+    """Analyze a single 0-based page. None if cancelled or paused before the end."""
+    if cancel is not None and cancel.is_set():
+        return None
+    require_analysis_deps()
+    import pikepdf
+    import pymupdf
+    doc = pymupdf.open(path)
+    pdf = pikepdf.open(path)
+    try:
+        if pause is not None and pause():
+            return None
+        catalog = _catalog_images(doc)
+        return _one_page(
+            doc, pdf, int(index), {"instr": {}, "forms": {}}, {}, {}, catalog,
+            threshold, defer_heavy, cheap, None, pause, set(), [])
+    finally:
+        doc.close()
+        pdf.close()
+
+
 def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None, on_image=None, defer_heavy=False, yield_to=None):
     """Analyze path. cancel is an optional threading.Event checked between pages.
 
@@ -1769,39 +1856,11 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
                     index = candidate
                     break
             pending.remove(index)
-            page = doc[index]
-            page_no = index + 1
-            contrib = _empty_contrib()
-            try:
-                pk_page = pdf.pages[index]
-                res = pk_page.get("/Resources", None)
-                if res is None:
-                    res = pk_page.resources
-                _page_group(pk_page.obj, contrib)
-                _walk_content(pdf, pk_page.obj, res, contrib, set(), 0, cache)
-            except Exception as exc:
-                _add_blocker(contrib, "stream", "content stream could not be parsed (%s) p{p}" % exc, "check")
-            images = _image_records(
-                doc, page, page_no, contrib["placements"], threshold, decoded,
-                catalog, analyzed, on_image, defer_heavy)
-            for im in images:
-                if im["xref"] in seen_xrefs:
-                    continue
-                seen_xrefs.add(im["xref"])
-                image_table.append(im)
-            texts = _text_items(page, contrib["tr3"] > 0)
-            _mark_red_text(texts)
-            _annotations(page, contrib)
-            rec = _page_decision(page_no, images, texts, contrib)
-            if rec.get("needs_render"):
-                annots = any(b.get("kind") == "annot" and b.get("severity") == "check" for b in rec["blockers"])
-                rec = _apply_render(rec, _render_measure(page, annots=annots))
-            rec["image_count"] = len(images)
-            rec["image_bytes"], rec["image_est"] = _owned_image_bytes(images, page_no)
-            if rec["image_bytes"]:
-                rec["savings_pct"] = round((rec["image_bytes"] - rec["image_est"]) * 100.0 / rec["image_bytes"], 1)
-            else:
-                rec["savings_pct"] = 0.0
+            rec = _one_page(
+                doc, pdf, index, cache, decoded, analyzed, catalog, threshold,
+                defer_heavy, False, on_image, None, seen_xrefs, image_table)
+            if rec is None:
+                continue
             pages[index] = rec
             if on_page:
                 on_page(rec)

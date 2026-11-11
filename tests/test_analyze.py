@@ -314,7 +314,7 @@ def test_dock_names_missing_package(window, tmp_path, qapp, monkeypatch):
     def boom(path, cancel=None, **kwargs):
         raise MissingDependency(["pikepdf"])
 
-    monkeypatch.setattr("krop.analyze.analyze_file", boom)
+    monkeypatch.setattr("krop.analyze.analyze_page", boom)
     w = window
     w.show()
     qapp.processEvents()
@@ -928,25 +928,24 @@ def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypat
     src = str(tmp_path / "pages.pdf")
     _save(doc, src)
 
-    from krop.analyze import analyze_file as real
+    from krop.analyze import analyze_page as real_page
     gate = threading.Event()
     started = threading.Event()
 
-    def slow(path, cancel=None, **kwargs):
+    def slow(path, index, **kwargs):
         started.set()
         if not gate.wait(5):
             return None
-        if cancel is not None and cancel.is_set():
-            return None
-        return real(path, cancel=cancel, **kwargs)
+        return real_page(path, index, **kwargs)
 
-    monkeypatch.setattr("krop.analyze.analyze_file", slow)
+    monkeypatch.setattr("krop.analyze.analyze_page", slow)
     w = window
     w.show()
     w.resize(1000, 800)
     qapp.processEvents()
     w.actionAnalysis.setChecked(True)
-    w.analysisPanel.tree.setFixedHeight(52)
+    w.analysisPanel._scheduler.idle_delay = 0
+    w.analysisPanel.tree.setFixedHeight(160)
     qapp.processEvents()
 
     nav = []
@@ -979,7 +978,11 @@ def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypat
         qapp.processEvents()
 
     w.openFile(src, False)
-    assert started.wait(5)
+    deadline = time.time() + 5
+    while time.time() < deadline and not started.is_set():
+        qapp.processEvents()
+        time.sleep(0.02)
+    assert started.is_set()
     # Page changed while the table is still empty. Highlight once the row exists.
     w.viewer.currentPageIndex = 2
     qapp.processEvents()
@@ -1030,6 +1033,10 @@ def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypat
 
     page2 = w.analysisPanel.tree.topLevelItem(1)
     assert page2.data(0, user) == 2
+    deadline = time.time() + 10
+    while time.time() < deadline and page2.childCount() == 0:
+        qapp.processEvents()
+        time.sleep(0.05)
     assert page2.childCount() > 0
     nav.clear()
     click(page2.child(0))

@@ -30,42 +30,55 @@ def test_selected_target_moves_ahead_of_measurements_and_pages():
     assert held.pop()["key"] == ("measure", 3, "jpeg-85")
 
 
-def test_panel_prioritize_queues_the_choice_first(window):
-    panel = window.analysisPanel
-    panel._work_stop.set()
-    panel._wake.set()
-    panel._worker.wait(2000)
-    panel._jobs.clear()
-    panel._path = "/tmp/does-not-need-to-exist.pdf"
-    panel._jobs.push(("measure", 9, "jpeg-95"), {"kind": "measure", "path": None}, 10)
-    panel._jobs.push(("page", 2), {"kind": "page"}, 20)
-    panel.prioritize(9, "jpeg-45", token=4)
-    order = panel.job_order()
-    assert ("measure", 9, "jpeg-45") in order[:2]
-    assert ("preview", 9, "jpeg-45", 0) in order[:2]
-    assert order.index(("measure", 9, "jpeg-45")) < order.index(("measure", 9, "jpeg-95"))
-    assert order[-1] == ("page", 2)
+def test_p0_preempts_queued_other_pages():
+    from krop.scheduler import Scheduler
+    sched = Scheduler(idle_delay=0)
+    sched.configure(6, 0)
+    sched.idle_at = 0
+    sched.add(("page", 4), {"kind": "page", "page": 4, "cheap": True})
+    sched.add(("measure", 9, "jpeg-45"), {
+        "kind": "measure", "page": 4, "xref": 9, "target": "jpeg-45", "lane": "extra",
+    })
+    sched.set_urgent(9, "jpeg-45")
+    job = sched.pop(now=sched.idle_at)
+    assert job["_key"] == ("measure", 9, "jpeg-45")
+    assert job["_tier"] == 0
+    # The other page was already running when the choice arrived.
+    running = {"kind": "page", "page": 4, "cheap": True, "_key": ("page", 4)}
+    sched.add(("measure", 9, "jpeg-45"), {
+        "kind": "measure", "page": 0, "xref": 9, "target": "jpeg-45",
+    })
+    assert sched.should_pause(running, now=sched.idle_at)
 
 
-def test_page_walk_waits_while_the_selected_job_is_queued(window):
-    panel = window.analysisPanel
-    panel._work_stop.set()
-    panel._wake.set()
-    panel._worker.wait(2000)
-    panel._jobs.clear()
-    panel._jobs.push(("measure", 4, "jpeg-45"), {"kind": "measure"}, 0)
-
-    def release():
-        time.sleep(0.15)
-        panel._jobs.pop()
-        panel._jobs.set_running(None)
-
-    import threading
-    threading.Thread(target=release).start()
-    started = time.time()
-    panel.yield_to_urgent()
-    assert time.time() - started >= 0.1
-    assert panel.job_order() == []
+def test_navigation_reprioritizes_and_does_not_prefill():
+    from krop.scheduler import Scheduler
+    sched = Scheduler(idle_delay=1.5)
+    sched.configure(20, 0)
+    now = sched.idle_at
+    sched.add(("page", 0), {"kind": "page", "page": 0})
+    sched.add(("page", 7), {"kind": "page", "page": 7, "cheap": True})
+    sched.set_focus(7)
+    now = sched.idle_at
+    job = sched.pop(now=now)
+    assert job["page"] == 7
+    # The other page is no longer eligible immediately after the navigation.
+    assert sched.order(now) == []
+    # Opening a document submits the page on screen and nothing else.
+    fresh = Scheduler(idle_delay=1.5)
+    fresh.configure(20, 5)
+    opened = fresh.idle_at
+    assert fresh.next_page_to_submit(opened) == (5, "full")
+    assert fresh.claim_next_page("/tmp/doc.pdf", 4.0, 1, opened) == ("page", 5)
+    assert fresh.claim_next_page("/tmp/doc.pdf", 4.0, 1, opened) is None
+    fresh.pop(opened)
+    fresh.mark_scanned(5, "full")
+    assert fresh.next_page_to_submit(opened) is None
+    later = fresh.idle_at + 2
+    nxt = fresh.next_page_to_submit(later)
+    assert nxt == (6, "cheap")
+    assert fresh.claim_next_page("/tmp/doc.pdf", 4.0, 1, later)[0] == "page"
+    assert fresh.claim_next_page("/tmp/doc.pdf", 4.0, 1, later) is None
 
 
 def test_busy_overlay_tracks_the_newest_preview_token(window, qapp):
