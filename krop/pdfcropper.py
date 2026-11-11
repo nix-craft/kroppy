@@ -222,16 +222,25 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
                 self._src_page_to_out[pagenumber] = self.output.page_count - 1
         if not croplist and alwaysinclude:
             addPage()
+            self._log_boxes("included", self.output[-1], pagenumber)
         else:
             for crop in croplist:
                 addPage()
                 new_page = self.output[-1]
-                box = self.pageGetCropBox(new_page)
-                # MuPDF uses coordinates where (0,0) is the top-right point, unlike
-                # PDF where (0,0) is the bottom-left.
-                new_box = computeCropBoxCoords(box, crop, pdf_coords=False)
-                self.pageSetCropBox(new_page, new_box)
+                self._log_boxes("before", new_page, pagenumber)
+                # Fractions are of the visible page. page.cropbox is not clipped
+                # to the MediaBox, and set_cropbox rejects anything outside it.
+                box = visible_mu_box(new_page)
+                new_box = clamp_mu_box(new_page, computeCropBoxCoords(box, crop, pdf_coords=False))
+                try:
+                    self.pageSetCropBox(new_page, new_box)
+                except ValueError as err:
+                    if "not in MediaBox" not in str(err):
+                        raise
+                    _page_log("set_cropbox refused %s; writing the clamped box" % err)
+                    self._write_clamped_box(new_page, new_box)
                 self.pageShrinkMediaBox(new_page)
+                self._log_boxes("after", new_page, pagenumber)
                 # if rotate != 0:
                 #     self.pageRotateClockwise(new_page, rotate)
     def pageGetCropBox(self, page):
@@ -265,6 +274,19 @@ class PyMuPdfCropper(SemiAbstractPdfCropper):
         if kind == "array":
             for key in ("MediaBox", "CropBox", "TrimBox", "ArtBox", "BleedBox"):
                 doc.xref_set_key(xref, key, cb)
+    def _write_clamped_box(self, page, mu_box):
+        """Write a CropBox PyMuPDF's set_cropbox would not accept."""
+        mb = _mediabox_floats(page)
+        x0, y0, x1, y1 = _pdf_from_mu(mb, mu_box)
+        page.parent.xref_set_key(page.xref, "CropBox", "[%g %g %g %g]" % (x0, y0, x1, y1))
+    def _log_boxes(self, phase, page, src_index):
+        doc = page.parent
+        xref = page.xref
+        _page_log("src %d %s MediaBox %s CropBox %s rot %s" % (
+            src_index + 1, phase,
+            doc.xref_get_key(xref, "MediaBox")[1],
+            doc.xref_get_key(xref, "CropBox")[1],
+            page.rotation))
     def copyDocumentRoot(self, pdffile):
         # Called before pages are added; stash catalog extras for write time.
         try:
@@ -357,6 +379,89 @@ def computeCropBoxCoords(box, crop, pdf_coords=True):
     x0, x1 = x0+crop[0]*(x1-x0), x1-crop[2]*(x1-x0)
     y0, y1 = y0+crop[3]*(y1-y0), y1-crop[1]*(y1-y0)
     return x0, y0, x1, y1
+
+
+def _page_log(msg):
+    try:
+        from krop.activitylog import log
+        log("PAGE", msg)
+    except Exception:
+        pass
+
+
+def _mediabox_floats(page):
+    mb = page.mediabox
+    return (float(mb.x0), float(mb.y0), float(mb.x1), float(mb.y1))
+
+
+def _mu_from_pdf(mb, rect):
+    """PDF user space -> the y-down space Page.set_cropbox expects."""
+    x0, y0, x1, y1 = rect
+    return (x0, mb[3] - y1, x1, mb[3] - y0)
+
+
+def _pdf_from_mu(mb, rect):
+    return _mu_from_pdf(mb, rect)
+
+
+def visible_mu_box(page):
+    """The on-screen page, in set_cropbox coordinates.
+
+    page.cropbox is the file's CropBox with y flipped about MediaBox.y1, and
+    it is not clipped to the MediaBox. PyMuPDF draws only the intersection,
+    so a CropBox that sticks out past the MediaBox is larger than the page the
+    user sees. Crop fractions are fractions of that visible page.
+    """
+    cb = tuple(float(v) for v in (page.cropbox.x0, page.cropbox.y0, page.cropbox.x1, page.cropbox.y1))
+    mb = _mediabox_floats(page)
+    mu_mb = _mu_from_pdf(mb, mb)
+    def inside(inner, outer):
+        return (inner[0] >= outer[0] - 1e-6 and inner[1] >= outer[1] - 1e-6
+                and inner[2] <= outer[2] + 1e-6 and inner[3] <= outer[3] + 1e-6
+                and inner[2] > inner[0] + 1e-6 and inner[3] > inner[1] + 1e-6)
+    if inside(cb, mu_mb):
+        return cb
+    vis = (max(cb[0], mu_mb[0]), max(cb[1], mu_mb[1]),
+           min(cb[2], mu_mb[2]), min(cb[3], mu_mb[3]))
+    if vis[2] - vis[0] < 1e-4 or vis[3] - vis[1] < 1e-4:
+        _page_log("CropBox does not meet MediaBox; cropping the MediaBox")
+        return mu_mb
+    _page_log("CropBox extends outside MediaBox; cropping their intersection")
+    return vis
+
+
+def clamp_mu_box(page, rect):
+    """Pull a set_cropbox rectangle back inside the MediaBox.
+
+    set_cropbox raises ValueError('CropBox not in MediaBox') unless the
+    rectangle is strictly inside after it flips y. A selection that crosses
+    the page edge, or a CropBox that already sticks out, produces that error.
+    """
+    mb = _mediabox_floats(page)
+    x0, y0, x1, y1 = (float(v) for v in rect)
+    if x1 - x0 < 1e-4 or y1 - y0 < 1e-4:
+        _page_log("selection has no area; keeping the visible page")
+        rect = visible_mu_box(page)
+        x0, y0, x1, y1 = rect
+    px0, py0, px1, py1 = _pdf_from_mu(mb, (x0, y0, x1, y1))
+    if px1 < px0:
+        px0, px1 = px1, px0
+    if py1 < py0:
+        py0, py1 = py1, py0
+    clamped = (min(max(px0, mb[0]), mb[2]), min(max(py0, mb[1]), mb[3]),
+               min(max(px1, mb[0]), mb[2]), min(max(py1, mb[1]), mb[3]))
+    eps = 0.01
+    cx0, cy0, cx1, cy1 = clamped
+    if cx1 - cx0 < eps:
+        cx1 = min(mb[2], cx0 + eps)
+        cx0 = max(mb[0], cx1 - eps)
+    if cy1 - cy0 < eps:
+        cy1 = min(mb[3], cy0 + eps)
+        cy0 = max(mb[1], cy1 - eps)
+    out = _mu_from_pdf(mb, (cx0, cy0, cx1, cy1))
+    if tuple(round(v, 4) for v in out) != tuple(round(v, 4) for v in (x0, y0, x1, y1)):
+        _page_log("clamped crop into MediaBox")
+    return out
 
 def optimizePdfGhostscript(oldfilename, newfilename):
     import subprocess

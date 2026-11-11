@@ -652,8 +652,17 @@ class HardCropper:
     def page(self, i, page):
         try:
             mb = rect(page.mediabox)
-            cb = rect(page.cropbox)
+            try:
+                cb = rect(page.cropbox)
+            except Exception:
+                cb = mb
             vis = isect(cb, mb)
+            self.log("page %d: MediaBox %s CropBox %s" % (
+                i + 1, tuple(round(v, 2) for v in mb), tuple(round(v, 2) for v in cb)))
+            if vis[2] - vis[0] <= 1e-6 or vis[3] - vis[1] <= 1e-6:
+                self.log("page %d: CropBox does not meet MediaBox; left unchanged" % (i + 1), force=True)
+                self.stats["skipped"] += 1
+                return
             self.log(f"page {i+1}: visible {tuple(round(v, 2) for v in vis)}")
             res = page.obj.get("/Resources") or Dictionary()
             if "/Resources" not in page.obj:

@@ -53,7 +53,7 @@ def main():
     parser.add_argument('--trim-use', type=str, choices=['initial', 'all'], help='whether to inspect only the initial page or all pages (slow!) when auto trimming (default: previous value)')
     parser.add_argument('--trim-padding', help='how much padding to include when auto trimming (default: previous value)')
 
-    parser.add_argument('--log', help='append a live activity log to this file (default: $KROP_LOG, else a temporary log in ~/.local/state/krop-trimall that is deleted on clean exit; "off" disables)')
+    parser.add_argument('--log', help='run log to append to, one flushed line per event (default: <input>.krop.log beside the PDF, with a session header of version, platform and time; if that folder is not writable, a file under ~/.local/state/krop-trimall). "off" disables. $KROP_LOG is used when this option is omitted')
     parser.add_argument('--go', action='store_true', help='output PDF without opening the krop GUI (using the choices supplied on the command line); if used in a script without X server access, you can run krop using xvfb-run')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')

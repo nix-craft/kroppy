@@ -1,30 +1,113 @@
 # -*- coding: utf-8 -*-
-"""Activity log for krop (local patch, Nov 2026).
+"""Activity log for krop.
 
-On by default: ~/.local/state/krop-trimall/activity.log, recreated at start and
-deleted on clean exit (kept after a crash).  --log FILE / KROP_LOG=FILE appends
-to FILE and keeps it; --log off / KROP_LOG=off disables.  Writes one timestamped, line-flushed entry per event so the file
-can be followed live with `tail -f`:
+By default each run appends to <input>.krop.log beside the PDF being opened.
+--log FILE / KROP_LOG=FILE appends to that file instead; --log off / KROP_LOG=off
+disables logging. If the folder beside the PDF is not writable, the log goes
+to ~/.local/state/krop-trimall/ (or $XDG_STATE_HOME/krop-trimall).
+
+Every line is flushed so the file can be followed with `tail -f`:
+  SESSION  version, platform, timestamp
   ACTION   toolbar/menu actions        UI      widget value changes
   CALL/RET every slot + trim function, with arguments, results and timing
   SEL      selection boxes after each mouse release / key press in the view
-  ERROR    uncaught exceptions with traceback
+  PAGE     page boxes before and after a crop
+  WARN     text shown to the user
+  ERROR    exceptions with traceback
 """
 import functools, os, sys, time, traceback
 
 from krop.qt import *
 
 _f = None
-DEFAULT = "~/.local/state/krop-trimall/activity.log"
-_temp = None
+_mode = "off"          # off | explicit | auto
+_buf = []
+_path = None
+
+
+def user_log_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "krop-trimall")
 
 
 def log(kind, msg):
-    if _f is None:
+    if _mode == "off":
         return
     t = time.strftime("%H:%M:%S") + ".%03d" % (int(time.time() * 1000) % 1000)
-    _f.write("%s %-6s %s\n" % (t, kind, msg))
+    line = "%s %-6s %s\n" % (t, kind, msg)
+    if _f is None:
+        _buf.append(line)
+        return
+    _f.write(line)
     _f.flush()
+
+
+def _try_open(path):
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    return open(path, "a", buffering=1)
+
+
+def _write_header(path):
+    import platform
+    from krop.version import __version__
+    log("SESSION", "krop %s" % __version__)
+    log("SESSION", "time %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    log("SESSION", "platform %s" % platform.platform())
+    log("SESSION", "python %s" % platform.python_version())
+    log("SESSION", "log %s" % path)
+    log("SESSION", "argv %r" % (sys.argv,))
+
+
+def _switch_log(path):
+    """Append a new session to path. Returns the path opened."""
+    global _f, _path
+    path = os.path.abspath(path)
+    if _f is not None and _path == path:
+        _write_header(path)
+        return path
+    if _f is not None:
+        try:
+            _f.flush()
+            _f.close()
+        except OSError:
+            pass
+        _f = None
+    _f = _try_open(path)
+    _path = path
+    _write_header(path)
+    if _buf:
+        _f.write("".join(_buf))
+        _f.flush()
+        _buf.clear()
+    return path
+
+
+def attach_input(input_path):
+    """Open the run log for this PDF.
+
+    Returns the fallback path when the log could not be written beside the
+    PDF, otherwise None. No-op when logging is off or --log named a file.
+    """
+    global _buf
+    if _mode != "auto" or not input_path:
+        return None
+    beside = os.path.splitext(os.path.abspath(input_path))[0] + ".krop.log"
+    try:
+        _switch_log(beside)
+        return None
+    except OSError as err:
+        name = os.path.basename(beside)
+        fallback = os.path.join(user_log_dir(), name)
+        try:
+            _switch_log(fallback)
+        except OSError:
+            _mode_note = "could not open a log (%s)" % err
+            log("WARN", _mode_note)
+            return None
+        log("WARN", "could not write %s (%s); logging to %s" % (beside, err, fallback))
+        sys.stderr.write("krop: could not write %s (%s); logging to %s\n" % (beside, err, fallback))
+        return fallback
 
 
 def _fmt(v):
@@ -107,17 +190,24 @@ def patch_classes(path):
             setattr(mw, n, traced(getattr(mw, n), n))
 
 
+def _disabled(path):
+    return bool(path) and str(path).lower() in ("off", "0", "no", "false")
+
+
 def install(win, path):
-    """path None -> default log, truncated at start and deleted on clean exit."""
-    global _f, _temp
-    if path and path.lower() in ("off", "0", "no", "false"):
+    """path None -> log beside the input PDF once it is opened.
+    path 'off' -> disable. Any other path is appended to for the whole run.
+    """
+    global _mode, _f, _path, _buf
+    if _disabled(path):
+        _mode = "off"
         return
-    if not path:
-        path = _temp = os.path.expanduser(DEFAULT)
-    path = os.path.expanduser(path)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    _f = open(path, "w" if _temp else "a", buffering=1)
-    log("START", "krop pid %d, argv %r" % (os.getpid(), sys.argv))
+    if path:
+        _mode = "explicit"
+        _switch_log(os.path.expanduser(path))
+    else:
+        _mode = "auto"
+        _buf = []
 
     old = sys.excepthook
     def hook(et, ev, tb):
@@ -139,21 +229,27 @@ def install(win, path):
         w.editingFinished.connect(lambda w=w: log("UI", "%s = %r" % (w.objectName(), w.text())))
     for w in win.findChildren(QComboBox):
         w.currentIndexChanged.connect(lambda i, w=w: log("UI", "%s = %r" % (w.objectName(), w.currentText())))
+    tabs = getattr(win.ui, "tabWidget", None)
+    if tabs is not None:
+        tabs.currentChanged.connect(lambda i, w=tabs: log(
+            "UI", "tab = %r" % w.tabText(i)))
 
     filt = _Filter(win)
     win.ui.documentView.viewport().installEventFilter(filt)
     win.ui.documentView.installEventFilter(filt)
     win._activityFilter = filt
-    QApplication.instance().aboutToQuit.connect(_stop)
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(_stop)
 
 
 def _stop():
-    """Clean exit: delete the default log (crashes never get here, so it stays)."""
     global _f
     log("STOP", "krop exiting")
-    if _temp and _f:
-        _f.close(); _f = None
+    if _f is not None:
         try:
-            os.remove(_temp)
+            _f.flush()
+            _f.close()
         except OSError:
             pass
+        _f = None
