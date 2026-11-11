@@ -65,6 +65,9 @@ class AbstractViewerItem(QGraphicsItem):
         if idx < 0:
             idx = 0
         self._currentPageIndex = idx
+        panel = getattr(self.mainwindow, "analysisPanel", None)
+        if panel is not None:
+            panel.follow_page(idx + 1)
 
         img = self.getImage(idx)
         if img is None:

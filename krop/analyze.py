@@ -17,9 +17,11 @@ WHITE_MIN = 0.90
 SAMPLE_PIXELS = 200000
 
 
-# Modest render used only when a construct could hide color. Longest edge is capped.
-RENDER_DPI = 120
-RENDER_MAX_EDGE = 1400
+# Modest render used only when a construct could hide color. 72 dpi is enough
+# to tell neutral pages from colored ones and is much cheaper than 120 on a
+# page whose transparency group forces a full raster. Longest edge is capped.
+RENDER_DPI = 72
+RENDER_MAX_EDGE = 900
 
 _PIP_NAMES = {
     "PIL": "Pillow",
@@ -1022,8 +1024,8 @@ def _check_name(blocker):
     return kind or "unresolved construct"
 
 
-def _render_measure(page):
-    """Rasterize at about 120 dpi and report whether the pixels are neutral."""
+def _render_measure(page, annots=False):
+    """Rasterize at about 72 dpi and report whether the pixels are neutral."""
     try:
         import numpy as np
         import pymupdf
@@ -1031,7 +1033,7 @@ def _render_measure(page):
         dpi = float(RENDER_DPI)
         if long_pt / 72.0 * dpi > RENDER_MAX_EDGE:
             dpi = RENDER_MAX_EDGE * 72.0 / long_pt
-        pix = page.get_pixmap(dpi=int(round(dpi)), alpha=False, colorspace=pymupdf.csRGB, annots=True)
+        pix = page.get_pixmap(dpi=int(round(dpi)), alpha=False, colorspace=pymupdf.csRGB, annots=bool(annots))
         n = pix.n
         arr = np.frombuffer(pix.samples, np.uint8)
         arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n)
@@ -1217,7 +1219,8 @@ def analyze_file(path, cancel=None):
             _annotations(page, contrib)
             rec = _page_decision(page_no, images, texts, contrib)
             if rec.get("needs_render"):
-                rec = _apply_render(rec, _render_measure(page))
+                annots = any(b.get("kind") == "annot" and b.get("severity") == "check" for b in rec["blockers"])
+                rec = _apply_render(rec, _render_measure(page, annots=annots))
             pages.append(rec)
     finally:
         doc.close()

@@ -1250,7 +1250,6 @@ class MainWindow(QMainWindow):
         from krop.analyzepanel import AnalyzeJob
         job = AnalyzeJob(path)
         job.done.connect(self._onAnalysis)
-        job.finished.connect(job.deleteLater)
         self._analysis_job = job
         self._analysis_jobs.append(job)
         self.analysisPanel.set_running(path)
@@ -1260,14 +1259,17 @@ class MainWindow(QMainWindow):
         job = self._analysis_job
         if job is None:
             return
-        job.cancel.set()
-        try:
-            job.done.disconnect(self._onAnalysis)
-        except Exception:
-            pass
         self._analysis_job = None
-        if wait and job.isRunning():
-            job.wait(60000)
+        try:
+            job.cancel.set()
+            try:
+                job.done.disconnect(self._onAnalysis)
+            except Exception:
+                pass
+            if wait and job.isRunning():
+                job.wait(60000)
+        except RuntimeError:
+            pass
 
     def _onAnalysis(self, data):
         self.analysisPanel.set_result(data)

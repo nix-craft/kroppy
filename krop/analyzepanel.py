@@ -9,6 +9,15 @@ try:
 except AttributeError:
     _USER = Qt.UserRole
 
+try:
+    _SINGLE = QAbstractItemView.SelectionMode.SingleSelection
+    _ROWS = QAbstractItemView.SelectionBehavior.SelectRows
+    _FOCUS = Qt.FocusPolicy.StrongFocus
+except AttributeError:
+    _SINGLE = QAbstractItemView.SingleSelection
+    _ROWS = QAbstractItemView.SelectRows
+    _FOCUS = Qt.StrongFocus
+
 
 class AnalyzeJob(QThread):
     done = pyqtSignal(object)
@@ -47,6 +56,9 @@ class AnalysisPanel(QDockWidget):
     def __init__(self, parent=None):
         QDockWidget.__init__(self, "Analysis", parent)
         self.setObjectName("analysisDock")
+        self._follow_page = None
+        self._selecting = False
+        self._pending_nav = None
         body = QWidget()
         layout = QVBoxLayout(body)
         self.summary = QLabel("Open a PDF to analyze it.")
@@ -57,15 +69,36 @@ class AnalysisPanel(QDockWidget):
         self.tree.setObjectName("analysisTree")
         self.tree.setHeaderLabels(["Page", "Label", "Target", "Images", "Blockers"])
         self.tree.setColumnWidth(0, 50)
-        self.tree.itemClicked.connect(self._clicked)
+        self.tree.setSelectionMode(_SINGLE)
+        self.tree.setSelectionBehavior(_ROWS)
+        self.tree.setFocusPolicy(_FOCUS)
+        # currentItemChanged covers keyboard up/down and a click that changes
+        # the selection. itemClicked and itemPressed also fire for a click on
+        # the row that is already selected, which currentItemChanged does not.
+        self.tree.currentItemChanged.connect(self._on_current_changed)
+        self.tree.itemClicked.connect(self._on_clicked)
+        self.tree.itemPressed.connect(self._on_clicked)
+        self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.tree)
         self.setWidget(body)
 
     def set_running(self, name):
         self.summary.setText("Analyzing %s…" % name)
-        self.tree.clear()
+        self._selecting = True
+        try:
+            self.tree.clear()
+        finally:
+            self._selecting = False
 
     def set_result(self, data):
+        self._selecting = True
+        try:
+            self._fill(data)
+        finally:
+            self._selecting = False
+        self._select_followed()
+
+    def _fill(self, data):
         self.tree.clear()
         if not data:
             self.summary.setText("Analysis cancelled.")
@@ -100,7 +133,80 @@ class AnalysisPanel(QDockWidget):
             self.tree.addTopLevelItem(row)
         self.tree.expandAll()
 
-    def _clicked(self, item, _column):
+    def follow_page(self, page):
+        """Select the row for this 1-based page. Does not change the viewer."""
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            return
+        if page < 1:
+            return
+        self._follow_page = page
+        self._select_followed()
+
+    def _row_for_page(self, page):
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, _USER) == page:
+                return item
+        return None
+
+    def _page_of(self, item):
+        if item is None:
+            return None
         page = item.data(0, _USER)
-        if page:
-            self.page_requested.emit(int(page))
+        if not page:
+            return None
+        try:
+            return int(page)
+        except (TypeError, ValueError):
+            return None
+
+    def _select_followed(self):
+        page = self._follow_page
+        if not page:
+            return
+        current = self.tree.currentItem()
+        # A child of this page stays selected so keyboard movement is not yanked back.
+        if self._page_of(current) == page:
+            self._selecting = True
+            try:
+                self.tree.scrollToItem(current)
+            finally:
+                self._selecting = False
+            return
+        item = self._row_for_page(page)
+        if item is None:
+            return
+        self._selecting = True
+        try:
+            self.tree.setCurrentItem(item)
+            self.tree.scrollToItem(item)
+        finally:
+            self._selecting = False
+
+    def _request(self, item):
+        if self._selecting:
+            return
+        page = self._page_of(item)
+        if not page or self._pending_nav == page:
+            return
+        self._pending_nav = page
+        self.page_requested.emit(page)
+        QTimer.singleShot(0, self._clear_pending)
+
+    def _clear_pending(self):
+        self._pending_nav = None
+
+    def _on_current_changed(self, current, _previous):
+        self._request(current)
+
+    def _on_clicked(self, item, _column):
+        self._request(item)
+
+    def _on_selection_changed(self):
+        self._request(self.tree.currentItem())
+
+    def _clicked(self, item, _column):
+        # Kept for tests that call the handler directly.
+        self._on_clicked(item, _column)

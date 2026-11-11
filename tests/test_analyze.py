@@ -363,7 +363,7 @@ def test_heavy_shared_form_is_fast(tmp_path):
 
 def test_needs_check_when_render_fails(tmp_path, monkeypatch):
     import pikepdf
-    monkeypatch.setattr("krop.analyze._render_measure", lambda page: None)
+    monkeypatch.setattr("krop.analyze._render_measure", lambda page, annots=False: None)
     path = str(tmp_path / "shade.pdf")
     pdf = pikepdf.Pdf.new()
     page = pdf.add_blank_page()
@@ -462,3 +462,146 @@ def test_panel_fills_and_jumps(window, tmp_path, qapp):
     assert w.viewer.currentPageIndex == 1
     text = open(w.logPath).read()
     assert "ANALYZE" in text
+
+
+def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypatch):
+    """The highlighted row tracks the viewer, and a single click or key moves the viewer."""
+    import threading
+    from krop.config import PYQT6
+    if PYQT6:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        left = Qt.MouseButton.LeftButton
+        key_down = Qt.Key.Key_Down
+        user = Qt.ItemDataRole.UserRole
+    else:
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtTest import QTest
+        left = Qt.LeftButton
+        key_down = Qt.Key_Down
+        user = Qt.UserRole
+
+    doc = pymupdf.open()
+    for i in range(8):
+        page = doc.new_page()
+        page.insert_text((72, 80), "Page %d" % (i + 1), fontsize=16, color=(0, 0, 0))
+    doc[1].insert_text((72, 140), "Refrain", fontsize=16, color=(0.85, 0.05, 0.05))
+    src = str(tmp_path / "pages.pdf")
+    _save(doc, src)
+
+    from krop.analyze import analyze_file as real
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow(path, cancel=None):
+        started.set()
+        if not gate.wait(5):
+            return None
+        if cancel is not None and cancel.is_set():
+            return None
+        return real(path, cancel)
+
+    monkeypatch.setattr("krop.analyze.analyze_file", slow)
+    w = window
+    w.show()
+    w.resize(1000, 800)
+    qapp.processEvents()
+    w.actionAnalysis.setChecked(True)
+    w.analysisPanel.tree.setFixedHeight(52)
+    qapp.processEvents()
+
+    nav = []
+    orig = w.slotShowAnalysisPage
+
+    def wrapped(page):
+        nav.append(int(page))
+        orig(page)
+
+    w.analysisPanel.page_requested.disconnect(orig)
+    w.analysisPanel.page_requested.connect(wrapped)
+
+    def current_page():
+        item = w.analysisPanel.tree.currentItem()
+        if item is None:
+            return None
+        return item.data(0, user)
+
+    def row_visible(item):
+        rect = w.analysisPanel.tree.visualItemRect(item)
+        return rect.height() > 0 and w.analysisPanel.tree.viewport().rect().intersects(rect)
+
+    def click(item):
+        tree = w.analysisPanel.tree
+        tree.scrollToItem(item)
+        qapp.processEvents()
+        rect = tree.visualItemRect(item).intersected(tree.viewport().rect())
+        assert rect.width() > 1 and rect.height() > 1, rect
+        QTest.mouseClick(tree.viewport(), left, pos=rect.center())
+        qapp.processEvents()
+
+    w.openFile(src, False)
+    assert started.wait(5)
+    # Page changed while the table is still empty. Highlight once the row exists.
+    w.viewer.currentPageIndex = 2
+    qapp.processEvents()
+    assert nav == []
+    gate.set()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        qapp.processEvents()
+        if "Document:" in w.analysisPanel.summary.text() and current_page() == 3:
+            break
+        time.sleep(0.05)
+    assert current_page() == 3, current_page()
+    assert w.viewer.currentPageIndex == 2
+    assert row_visible(w.analysisPanel.tree.currentItem())
+    assert nav == []
+
+    nav.clear()
+    w.ui.actionNextPage.trigger()
+    qapp.processEvents()
+    assert w.viewer.currentPageIndex == 3
+    assert current_page() == 4
+    assert nav == []
+
+    w.slotCurrentPageEdited("8")
+    qapp.processEvents()
+    assert w.viewer.currentPageIndex == 7
+    assert current_page() == 8
+    assert row_visible(w.analysisPanel.tree.currentItem())
+
+    page6 = None
+    for i in range(w.analysisPanel.tree.topLevelItemCount()):
+        item = w.analysisPanel.tree.topLevelItem(i)
+        if item.data(0, user) == 6:
+            page6 = item
+            break
+    assert page6 is not None
+    nav.clear()
+    click(page6)
+    assert nav == [6], nav
+    assert w.viewer.currentPageIndex == 5
+    assert current_page() == 6
+
+    # Clicking the already-selected row still asks the viewer to show that page.
+    nav.clear()
+    click(page6)
+    assert nav == [6], nav
+    assert w.viewer.currentPageIndex == 5
+
+    page2 = w.analysisPanel.tree.topLevelItem(1)
+    assert page2.data(0, user) == 2
+    assert page2.childCount() > 0
+    nav.clear()
+    click(page2.child(0))
+    assert nav == [2], nav
+    assert w.viewer.currentPageIndex == 1
+
+    w.analysisPanel.tree.setFocus()
+    qapp.processEvents()
+    nav.clear()
+    QTest.keyClick(w.analysisPanel.tree, key_down)
+    qapp.processEvents()
+    assert current_page() is not None
+    assert w.viewer.currentPageIndex == int(current_page()) - 1
+    assert len(nav) <= 1
