@@ -1,0 +1,8 @@
+PyQt6
+pymupdf
+pikepdf
+numpy
+Pillow
+# Optional system tools, not pip packages: jpegtran (libjpeg-turbo) for JPEG
+# images, and jbig2 plus jbig2dec for JBIG2. Without them those images are
+# left unchanged.

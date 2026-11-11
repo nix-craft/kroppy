@@ -41,6 +41,7 @@ def main():
     parser.add_argument('--whichpages', help='which pages (e.g. "1-5" or "1,3-") to include in cropped PDF (default: all)')
     parser.add_argument('--rotate', type=int, choices=[0,90,180,270], help='how much to rotate the cropped pdf clockwise (default: 0)')
     parser.add_argument('--optimize', choices=['gs', 'no'], help='whether to optimize the final PDF using ghostscript (default: previous choice)')
+    parser.add_argument('--hard-crop', action='store_true', help='hard-crop embedded images to the visible page box when saving, keeping their original encoding (default: previous choice, initially off)')
 
     parser.add_argument('--grid', help='if set to 2x3, for instance, creates a 2x3 grid of selections on initial page; if only one number is specified, the number of columns/rows is determined according to whether the page is landscape or portrait')
 
@@ -93,6 +94,8 @@ def main():
         window.ui.comboRotation.setCurrentIndex({0:0,90:2,180:3,270:1}[args.rotate])
     if args.optimize is not None:
         window.ui.checkGhostscript.setChecked(args.optimize == "gs")
+    if args.hard_crop:
+        window.ui.checkHardCrop.setChecked(True)
     if args.selections is not None:
         if args.selections == "all":
             window.ui.radioSelAll.setChecked(True)
