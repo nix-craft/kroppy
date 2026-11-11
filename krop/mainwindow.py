@@ -154,7 +154,12 @@ class MainWindow(QMainWindow):
         self.analysisPanel.focus_changed.connect(self._refocusAnalysis)
         self.analysisPanel.threshold_changed.connect(self._reanalyze)
         self.analysisPanel.highlight_requested.connect(self._showImageHighlight)
+        self.analysisPanel.preview_changed.connect(self._updatePreview)
         self.analysisPanel.visibilityChanged.connect(self._analysisDockVisibility)
+        self._preview_hold = False
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         try:
             dock_right = Qt.DockWidgetArea.RightDockWidgetArea
         except AttributeError:
@@ -1283,15 +1288,54 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
+    def eventFilter(self, obj, event):
+        # Hold Alt to compare the original pixels with the target preview.
+        try:
+            press = QEvent.Type.KeyPress
+            release = QEvent.Type.KeyRelease
+            alt = Qt.Key.Key_Alt
+        except AttributeError:
+            press = QEvent.KeyPress
+            release = QEvent.KeyRelease
+            alt = Qt.Key_Alt
+        etype = event.type()
+        if etype in (press, release) and event.key() == alt and not event.isAutoRepeat():
+            hold = etype == press
+            if hold != self._preview_hold:
+                self._preview_hold = hold
+                self._updatePreview()
+        return False
+
     def _showImageHighlight(self, xref):
         if not xref or not self.analysisPanel.isVisible():
             self.viewer.clearImageHighlight()
             return
         self.viewer.showImageHighlight(int(xref))
 
+    def _updatePreview(self, *_args):
+        viewer = getattr(self, "viewer", None)
+        panel = getattr(self, "analysisPanel", None)
+        if viewer is None or panel is None:
+            return
+        if self._preview_hold or not panel.isVisible() or not panel.preview_enabled():
+            viewer.clearPreviews()
+            return
+        path = getattr(self, "originalFileName", None) or getattr(self, "fileName", None)
+        if not path or viewer.isEmpty():
+            viewer.clearPreviews()
+            return
+        try:
+            rotation = viewer.pageGetRotation(viewer.currentPageIndex)
+        except Exception:
+            rotation = 0
+        viewer.setPreviewPlan(path, panel.preview_plan(viewer.currentPageIndex + 1), rotation)
+
     def _analysisDockVisibility(self, visible):
         if not visible:
             self.viewer.clearImageHighlight()
+            self.viewer.clearPreviews()
+        else:
+            self._updatePreview()
 
     def _refocusAnalysis(self, page):
         job = self._analysis_job
@@ -1329,5 +1373,19 @@ class MainWindow(QMainWindow):
         self.slotFitInView(self.ui.actionFitInView.isChecked())
 
     def closeEvent(self, event):
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+        viewer = getattr(self, "viewer", None)
+        if viewer is not None:
+            viewer._preview_gen = getattr(viewer, "_preview_gen", 0) + 1
+            for job in list(getattr(viewer, "_preview_jobs", []) or []):
+                try:
+                    job.wait(2000)
+                except Exception:
+                    pass
         self.cancelAnalysis(wait=True)
         self.writeSettings()

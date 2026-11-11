@@ -131,6 +131,7 @@ class AnalysisPanel(QDockWidget):
     focus_changed = pyqtSignal(int)
     threshold_changed = pyqtSignal(float)
     highlight_requested = pyqtSignal(int)
+    preview_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         QDockWidget.__init__(self, "Analysis", parent)
@@ -172,6 +173,12 @@ class AnalysisPanel(QDockWidget):
         self.errorBox.valueChanged.connect(lambda _v: self._threshold_timer.start(400))
         threshold_row.addWidget(self.errorBox)
         threshold_row.addWidget(QLabel("MAE"))
+        self.previewBox = QCheckBox("Preview target")
+        self.previewBox.setObjectName("previewTarget")
+        self.previewBox.setChecked(True)
+        self.previewBox.setToolTip("Draw each image as its chosen target on the page. Hold Alt to compare with the original.")
+        self.previewBox.toggled.connect(lambda _v: self.preview_changed.emit())
+        threshold_row.addWidget(self.previewBox)
         threshold_row.addStretch(1)
         layout.addLayout(threshold_row)
         self.tree = QTreeWidget()
@@ -193,7 +200,10 @@ class AnalysisPanel(QDockWidget):
 
     def set_running(self, name):
         self._path = name
+        self._data = None
+        self._pages = {}
         self.summary.setText("Analyzing %s…" % name)
+        self.preview_changed.emit()
         self._selecting = True
         try:
             self.tree.clear()
@@ -210,6 +220,42 @@ class AnalysisPanel(QDockWidget):
         finally:
             self._selecting = False
         self._select_followed()
+        self.preview_changed.emit()
+
+    def preview_enabled(self):
+        return bool(self.previewBox.isChecked())
+
+    def preview_plan(self, page_no):
+        """Images on this 1-based page whose chosen target is not keep."""
+        if not self.preview_enabled():
+            return []
+        try:
+            page_no = int(page_no)
+        except (TypeError, ValueError):
+            return []
+        plan = []
+        seen = set()
+        pages = []
+        data = self._data or {}
+        if data.get("pages") and not data.get("error"):
+            pages = data.get("pages") or []
+        else:
+            pages = list(getattr(self, "_pages", {}).values())
+        for page in pages:
+            if not page or page.get("page") != page_no:
+                continue
+            for im in page.get("images") or []:
+                xref = im.get("xref")
+                if xref in seen:
+                    continue
+                share = im.get("share_key") or ""
+                chosen = self._choices.get(share) or self._choices.get(str(xref))
+                chosen = chosen or im.get("chosen_target") or im.get("target")
+                if not chosen or chosen == "keep":
+                    continue
+                seen.add(xref)
+                plan.append({"xref": xref, "target": str(chosen)})
+        return plan
 
     def _fill(self, data):
         self.tree.clear()
@@ -264,6 +310,7 @@ class AnalysisPanel(QDockWidget):
         self._selecting = True
         self._arrived = 0
         self._total = int(count)
+        self._pages = {}
         try:
             self.tree.clear()
             self.summary.setText("Analyzing… 0/%d" % count)
@@ -317,6 +364,9 @@ class AnalysisPanel(QDockWidget):
     def add_page(self, page):
         if not page:
             return
+        if not hasattr(self, "_pages"):
+            self._pages = {}
+        self._pages[page["page"]] = page
         self._selecting = True
         try:
             row = self._row_for_page(page["page"])
@@ -331,6 +381,7 @@ class AnalysisPanel(QDockWidget):
         finally:
             self._selecting = False
         self._select_followed()
+        self.preview_changed.emit()
 
     def _fill_row(self, row, page):
         images = page.get("images") or []
@@ -416,6 +467,7 @@ class AnalysisPanel(QDockWidget):
         key = share or str(xref)
         self._choices[key] = target_id
         self._choices[str(xref)] = target_id
+        self.preview_changed.emit()
         cached = self._encoded.get((key, target_id))
         cand = self._candidate(xref, target_id)
         if cached:
@@ -569,6 +621,7 @@ class AnalysisPanel(QDockWidget):
         self._follow_page = page
         self._select_followed()
         self.focus_changed.emit(page)
+        self.preview_changed.emit()
 
     def _row_for_page(self, page):
         for i in range(self.tree.topLevelItemCount()):

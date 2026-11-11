@@ -10,6 +10,12 @@ padding around the pixmap.
 
 VIEW_DPI = 96
 
+# Neutral darkening of everything outside the image (no hue), plus a
+# cosmetic red stroke that stays the same width on screen when zooming.
+HIGHLIGHT_DIM = (0, 0, 0, 56)
+HIGHLIGHT_RED = (255, 0, 0)
+HIGHLIGHT_WIDTH = 2.0
+
 
 def _rotate_rect(rect, rotation, width, height):
     """Move an unrotated page rectangle into the displayed page.

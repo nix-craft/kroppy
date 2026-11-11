@@ -19,11 +19,49 @@ from krop.config import PYQT6
 from krop.qt import *
 
 from krop.viewerselections import ViewerSelections
-from krop.imagehighlight import VIEW_DPI, map_image_rects
+from krop.imagehighlight import (
+    HIGHLIGHT_DIM, HIGHLIGHT_RED, HIGHLIGHT_WIDTH, VIEW_DPI, map_image_rects)
+
+
+class _PreviewJob(QThread):
+    """Quantize one image off the UI thread. Display only."""
+    ready = pyqtSignal(object)
+
+    def __init__(self, path, xref, target, rotation, gen):
+        QThread.__init__(self)
+        self.path = path
+        self.xref = xref
+        self.target = target
+        self.rotation = rotation
+        self.gen = gen
+
+    def run(self):
+        rgba = None
+        try:
+            from krop.preview import preview_rgba
+            rgba = preview_rgba(self.path, self.xref, self.target, self.rotation)
+        except Exception:
+            rgba = None
+        self.ready.emit({
+            "xref": int(self.xref), "target": self.target,
+            "rotation": int(self.rotation or 0), "gen": self.gen, "rgba": rgba,
+        })
+
+
+def _rgba_qimage(rgba):
+    import numpy as np
+    rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+    height, width, channels = rgba.shape
+    try:
+        fmt = QImage.Format.Format_RGBA8888 if channels == 4 else QImage.Format.Format_RGB888
+    except AttributeError:
+        fmt = QImage.Format_RGBA8888 if channels == 4 else QImage.Format_RGB888
+    image = QImage(rgba.data, width, height, width * channels, fmt)
+    return image.copy()
 
 
 class ImageHighlightItem(QGraphicsItem):
-    """Shaded outline of an image placement. Not a crop selection."""
+    """Neutral dim around an image, with a crisp red outline. Not a crop selection."""
 
     def __init__(self, parent):
         QGraphicsItem.__init__(self, parent)
@@ -41,11 +79,31 @@ class ImageHighlightItem(QGraphicsItem):
             focusable = QGraphicsItem.ItemIsFocusable
         self.setFlag(selectable, False)
         self.setFlag(focusable, False)
+        self._page_rect = QRectF()
         self.hide()
+
+    def outline_pen(self, primary):
+        """Cosmetic so the stroke stays about 2 px at any zoom."""
+        pen = QPen(QColor(*HIGHLIGHT_RED))
+        pen.setCosmetic(True)
+        pen.setWidthF(HIGHLIGHT_WIDTH if primary else max(1.0, HIGHLIGHT_WIDTH - 0.5))
+        try:
+            solid = Qt.PenStyle.SolidLine
+            dash = Qt.PenStyle.DashLine
+        except AttributeError:
+            solid = Qt.SolidLine
+            dash = Qt.DashLine
+        pen.setStyle(solid if primary else dash)
+        return pen
 
     def set_rects(self, rects):
         self.prepareGeometryChange()
         self._rects = list(rects or [])
+        parent = self.parentItem()
+        if parent is not None and hasattr(parent, "irect"):
+            self._page_rect = QRectF(parent.irect)
+        else:
+            self._page_rect = QRectF()
         self.setVisible(bool(self._rects))
         self.update()
 
@@ -55,6 +113,8 @@ class ImageHighlightItem(QGraphicsItem):
     def boundingRect(self):
         if not self._rects:
             return QRectF()
+        if not self._page_rect.isNull():
+            return QRectF(self._page_rect).adjusted(-2, -2, 2, 2)
         x0 = min(r[0] for r in self._rects)
         y0 = min(r[1] for r in self._rects)
         x1 = max(r[0] + r[2] for r in self._rects)
@@ -62,20 +122,34 @@ class ImageHighlightItem(QGraphicsItem):
         return QRectF(x0, y0, x1 - x0, y1 - y0).adjusted(-3, -3, 3, 3)
 
     def paint(self, painter, option, widget):
+        if not self._rects:
+            return
+        try:
+            no_pen = Qt.PenStyle.NoPen
+            no_brush = Qt.BrushStyle.NoBrush
+            odd = Qt.FillRule.OddEvenFill
+            no_aa = QPainter.RenderHint.Antialiasing
+        except AttributeError:
+            no_pen = Qt.NoPen
+            no_brush = Qt.NoBrush
+            odd = Qt.OddEvenFill
+            no_aa = QPainter.Antialiasing
+        page = self._page_rect
+        if not page.isNull():
+            path = QPainterPath()
+            path.setFillRule(odd)
+            path.addRect(page)
+            for rect in self._rects:
+                path.addRect(QRectF(rect[0], rect[1], rect[2], rect[3]))
+            painter.setPen(QPen(no_pen))
+            painter.setBrush(QBrush(QColor(*HIGHLIGHT_DIM)))
+            painter.drawPath(path)
+        painter.setRenderHint(no_aa, False)
+        painter.setBrush(QBrush(no_brush))
         for rect in self._rects:
             primary = len(rect) > 4 and rect[4]
-            box = QRectF(rect[0], rect[1], rect[2], rect[3])
-            if primary:
-                fill = QColor(214, 112, 18, 110)
-                line = QColor(120, 40, 0)
-                width = 3
-            else:
-                fill = QColor(214, 112, 18, 60)
-                line = QColor(70, 40, 140)
-                width = 2
-            painter.setPen(QPen(line, width))
-            painter.setBrush(QBrush(fill))
-            painter.drawRect(box)
+            painter.setPen(self.outline_pen(primary))
+            painter.drawRect(QRectF(rect[0], rect[1], rect[2], rect[3]))
 
 
 class AbstractViewerItem(QGraphicsItem):
@@ -99,6 +173,11 @@ class AbstractViewerItem(QGraphicsItem):
         if getattr(self, "_highlight", None) is not None:
             self._highlight.set_rects([])
         self.selections.deleteSelections()
+        self._preview_cache = {}
+        self._preview_wanted = set()
+        self._preview_pending = set()
+        self._preview_jobs = []
+        self._preview_gen = getattr(self, "_preview_gen", 0) + 1
 
     def boundingRect(self):
         return self.brect
@@ -112,6 +191,7 @@ class AbstractViewerItem(QGraphicsItem):
             return
         painter.drawRect(self.irect.adjusted(-1,-1,1,1))
         painter.drawImage(self.irect, img)
+        self._paint_previews(painter)
 
     def mapRectToImage(self, r):
         return r.translated(-self.irect.left(), -self.irect.top())
@@ -172,6 +252,72 @@ class AbstractViewerItem(QGraphicsItem):
             self._highlight.set_rects([])
             return
         self._highlight.set_rects(rects)
+
+    def clearPreviews(self):
+        """Hide previews. Cached images are kept so they can return at once."""
+        self._preview_wanted = set()
+        self.update()
+
+    def setPreviewPlan(self, path, plan, rotation):
+        """Show these (xref, target) previews. Quantize any that are not cached."""
+        rot = int(rotation or 0)
+        wanted = set()
+        for item in plan or []:
+            try:
+                wanted.add((int(item["xref"]), str(item["target"]), rot))
+            except (TypeError, ValueError, KeyError):
+                continue
+        self._preview_wanted = wanted
+        self._preview_gen = getattr(self, "_preview_gen", 0)
+        self.update()
+        for xref, target, item_rot in wanted:
+            key = (xref, target, item_rot)
+            if key in self._preview_cache or key in self._preview_pending:
+                continue
+            self._preview_pending.add(key)
+            job = _PreviewJob(path, xref, target, item_rot, self._preview_gen)
+            job.ready.connect(self._on_preview_ready)
+            job.finished.connect(job.deleteLater)
+            self._preview_jobs.append(job)
+            job.finished.connect(lambda job=job: self._preview_jobs.remove(job) if job in self._preview_jobs else None)
+            job.start()
+
+    def _on_preview_ready(self, payload):
+        if payload.get("gen") != getattr(self, "_preview_gen", None):
+            return
+        key = (payload.get("xref"), payload.get("target"), payload.get("rotation"))
+        self._preview_pending.discard(key)
+        rgba = payload.get("rgba")
+        if rgba is None:
+            return
+        self._preview_cache[key] = _rgba_qimage(rgba)
+        self.update()
+
+    def previewReady(self):
+        return [key for key in self._preview_wanted if key in self._preview_cache]
+
+    def previewImage(self, xref, target, rotation):
+        return self._preview_cache.get((int(xref), str(target), int(rotation or 0)))
+
+    def _paint_previews(self, painter):
+        wanted = getattr(self, "_preview_wanted", None)
+        cache = getattr(self, "_preview_cache", None)
+        if not wanted or not cache:
+            return
+        painter.save()
+        try:
+            hint = QPainter.RenderHint.SmoothPixmapTransform
+        except AttributeError:
+            hint = QPainter.SmoothPixmapTransform
+        painter.setRenderHint(hint, True)
+        for key in list(wanted):
+            image = cache.get(key)
+            if image is None:
+                continue
+            xref = key[0]
+            for rect in self.imagePlacementRects(xref):
+                painter.drawImage(QRectF(rect[0], rect[1], rect[2], rect[3]), image)
+        painter.restore()
 
     def imageHighlightRects(self):
         if getattr(self, "_highlight", None) is None:

@@ -53,6 +53,72 @@ def test_map_follows_rotation_and_crop_display():
         doc.close()
 
 
+def test_highlight_dims_without_hue_and_keeps_a_crisp_red_outline(qapp):
+    """Outside the image is a neutral darkening. The stroke stays about 2 px when scaled."""
+    from krop.qt import QColor, QGraphicsRectItem, QGraphicsScene, QImage, QPainter, QRectF
+    from krop.vieweritem import ImageHighlightItem
+    try:
+        fmt = QImage.Format.Format_ARGB32
+    except AttributeError:
+        fmt = QImage.Format_ARGB32
+    host = QGraphicsRectItem(0, 0, 120, 90)
+    host.irect = QRectF(0, 0, 120, 90)
+    scene = QGraphicsScene()
+    scene.addItem(host)
+    item = ImageHighlightItem(host)
+    item.set_rects([(20, 16, 40, 28, True), (70, 16, 30, 24, False)])
+    primary = item.outline_pen(True)
+    extra = item.outline_pen(False)
+    assert primary.isCosmetic() and extra.isCosmetic()
+    assert primary.widthF() == 2.0
+    assert extra.widthF() < primary.widthF()
+    from krop.qt import Qt
+    try:
+        dash_style = Qt.PenStyle.DashLine
+    except AttributeError:
+        dash_style = Qt.DashLine
+    assert extra.style() == dash_style
+    assert primary.color().red() > 200 and primary.color().green() < 40
+
+    def render(scale):
+        image = QImage(int(120 * scale), int(90 * scale), fmt)
+        image.fill(QColor(255, 255, 255))
+        painter = QPainter(image)
+        scene.render(painter, QRectF(image.rect()), QRectF(0, 0, 120, 90))
+        painter.end()
+        return image
+
+    shot = render(1)
+    outside = shot.pixelColor(4, 4)
+    inside = shot.pixelColor(30, 28)
+    assert outside.red() == outside.green() == outside.blue()
+    assert outside.red() < 255
+    assert inside.red() > 250 and inside.green() > 250 and inside.blue() > 250
+    # A pixel on the primary outline is red, not orange or purple.
+    reds = []
+    for x in range(20, 60):
+        color = shot.pixelColor(x, 16)
+        if color.red() > 180 and color.green() < 80 and color.blue() < 80:
+            reds.append(x)
+    assert reds, "expected a red outline along the top of the placement"
+
+    def thickness(scale):
+        """How many device pixels the top stroke covers. A cosmetic pen stays near 2."""
+        image = render(scale)
+        x = int(40 * scale)
+        y0 = int(16 * scale)
+        count = 0
+        for y in range(max(0, y0 - 8), y0 + 8):
+            color = image.pixelColor(x, y)
+            if color.red() > 180 and color.green() < 80 and color.blue() < 80:
+                count += 1
+        return count
+
+    # Cosmetic: the stroke is about 2 device pixels at 1x and at 2x.
+    assert 1 <= thickness(1) <= 3
+    assert 1 <= thickness(2) <= 3
+
+
 def test_selecting_image_row_highlights_every_placement(window, tmp_path, qapp):
     import time
     doc = pymupdf.open()
