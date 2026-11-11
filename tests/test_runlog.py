@@ -35,7 +35,7 @@ def test_go_writes_log_beside_input(tmp_path):
     env = _env(tmp_path)
     r = _run(["--go", "--optimize", "no", "--grid", "1", "-o", str(out), str(src)], env)
     assert r.returncode == 0, r.stderr
-    log = src.with_suffix(".krop.log")
+    log = src.with_suffix(".kroppy.log")
     assert log.is_file()
     text = log.read_text()
     assert "SESSION" in text
@@ -46,10 +46,10 @@ def test_go_writes_log_beside_input(tmp_path):
     assert "SAVE" in text
     assert "PAGE" in text and "MediaBox" in text
     # one session header (several SESSION lines), then a second run appends another
-    assert text.count("SESSION krop") == 1
+    assert text.count("SESSION kroppy") == 1
     r2 = _run(["--go", "--optimize", "no", "--grid", "1", "-o", str(out), str(src)], env)
     assert r2.returncode == 0, r2.stderr
-    assert log.read_text().count("SESSION krop") == 2
+    assert log.read_text().count("SESSION kroppy") == 2
 
 
 def test_log_off_writes_nothing(tmp_path):
@@ -59,7 +59,7 @@ def test_log_off_writes_nothing(tmp_path):
     r = _run(["--go", "--optimize", "no", "--log", "off", "--grid", "1",
               "-o", str(tmp_path / "out.pdf"), str(src)], env)
     assert r.returncode == 0, r.stderr
-    assert not src.with_suffix(".krop.log").exists()
+    assert not src.with_suffix(".kroppy.log").exists()
 
 
 def test_explicit_log_and_help(tmp_path):
@@ -69,13 +69,13 @@ def test_explicit_log_and_help(tmp_path):
     env = _env(tmp_path)
     help_r = _run(["--help"], env)
     assert help_r.returncode == 0
-    assert ".krop.log" in help_r.stdout
+    assert ".kroppy.log" in help_r.stdout
     assert "off" in help_r.stdout
     r = _run(["--go", "--optimize", "no", "--log", str(chosen), "--grid", "1",
               "-o", str(tmp_path / "out.pdf"), str(src)], env)
     assert r.returncode == 0, r.stderr
     assert chosen.is_file()
-    assert not src.with_suffix(".krop.log").exists()
+    assert not src.with_suffix(".kroppy.log").exists()
     assert __version__ in chosen.read_text()
 
 
@@ -86,7 +86,7 @@ def test_fallback_is_named_in_the_status_bar(qapp, tmp_path, monkeypatch):
     real = activitylog._try_open
 
     def wrapped(path):
-        if str(path).endswith(".krop.log") and "userlog" not in str(path):
+        if str(path).endswith(".kroppy.log") and "userlog" not in str(path):
             raise PermissionError(path)
         return real(path)
 
@@ -103,7 +103,7 @@ def test_fallback_is_named_in_the_status_bar(qapp, tmp_path, monkeypatch):
         w.openFile(str(src), False)
         msg = w.statusBar().currentMessage()
         assert "userlog" in msg
-        fallback = tmp_path / "userlog" / "doc.krop.log"
+        fallback = tmp_path / "userlog" / "doc.kroppy.log"
         assert fallback.is_file()
         text = fallback.read_text()
         assert __version__ in text

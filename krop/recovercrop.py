@@ -15,7 +15,7 @@ BOXES = ("MediaBox", "CropBox", "TrimBox", "ArtBox", "BleedBox")
 
 
 def _tempPath(path):
-    d = os.path.join(os.path.expanduser('~/.cache'), 'krop-trimall')
+    d = os.path.join(os.path.expanduser('~/.cache'), 'kroppy')
     os.makedirs(d, exist_ok=True)
     fd, out = tempfile.mkstemp(prefix=os.path.splitext(os.path.basename(path))[0] + '-full-',
             suffix='.pdf', dir=d)

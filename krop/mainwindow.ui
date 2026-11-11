@@ -44,14 +44,14 @@
             <item row="0" column="0">
              <widget class="QLineEdit" name="editFile">
               <property name="toolTip">
-               <string>&lt;p&gt;This is where the cropped PDF will be saved after you choose &lt;i&gt;Krop!&lt;/i&gt; in the menu.&lt;/p&gt;</string>
+               <string>&lt;p&gt;This is where the cropped PDF will be saved after you choose &lt;i&gt;Kroppy!&lt;/i&gt; in the menu.&lt;/p&gt;</string>
               </property>
              </widget>
             </item>
             <item row="0" column="1">
              <widget class="QToolButton" name="buttonFileSelect">
               <property name="toolTip">
-               <string>&lt;p&gt;This is where the cropped PDF will be saved after you choose &lt;i&gt;Krop!&lt;/i&gt; in the menu.&lt;/p&gt;</string>
+               <string>&lt;p&gt;This is where the cropped PDF will be saved after you choose &lt;i&gt;Kroppy!&lt;/i&gt; in the menu.&lt;/p&gt;</string>
               </property>
               <property name="text">
                <string/>
@@ -444,7 +444,7 @@
            <property name="text">
             <string>&lt;h3&gt;Getting started&lt;/h3&gt;
 &lt;p&gt;Using your mouse, create one or more selections on the pdf document. These are the regions that will be included into the cropped file.&lt;/p&gt;
-&lt;p&gt;When you are done, click &lt;i&gt;Krop!&lt;/i&gt; in the menu to create a cropped version of your document.&lt;/p&gt;
+&lt;p&gt;When you are done, click &lt;i&gt;Kroppy!&lt;/i&gt; in the menu to create a cropped version of your document.&lt;/p&gt;
 &lt;h3&gt;Hints&lt;/h3&gt;
 &lt;p&gt;Right-click the page to create a selection for the full page (or a grid of selections).&lt;/p&gt;
 &lt;p&gt;Right-click a selection to delete it. Or simply press the Delete key.&lt;/p&gt;
@@ -862,7 +862,7 @@
     <bool>false</bool>
    </property>
    <property name="text">
-    <string>Krop!</string>
+    <string>Kroppy!</string>
    </property>
   </action>
   <action name="actionDeleteSelection">

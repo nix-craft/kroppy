@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=krop
+Name=kroppy
 GenericName=Crop PDF files
 Comment=A tool to crop PDF files
-TryExec=krop
-Exec=krop %F
+TryExec=kroppy
+Exec=kroppy %F
 Icon=com.arminstraub.krop
 MimeType=application/pdf;
 Categories=Utility;

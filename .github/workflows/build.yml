@@ -73,7 +73,7 @@ jobs:
 
       - name: PyInstaller
         run: |
-          ARGS=(--noconfirm --clean --name krop --windowed --paths .
+          ARGS=(--noconfirm --clean --name kroppy --windowed --paths .
                 --hidden-import krop.application --hidden-import krop.mainwindow
                 --hidden-import krop.hardcrop --hidden-import pikepdf --hidden-import numpy
                 --hidden-import PIL --hidden-import PIL.Image
@@ -88,11 +88,11 @@ jobs:
       - name: Package (Linux AppImage)
         if: runner.os == 'Linux'
         run: |
-          APPDIR=krop.AppDir
+          APPDIR=kroppy.AppDir
           mkdir -p $APPDIR/usr/bin $APPDIR/usr/share/applications $APPDIR/usr/share/icons/hicolor/scalable/apps
-          cp -a dist/krop/. $APPDIR/usr/bin/
+          cp -a dist/kroppy/. $APPDIR/usr/bin/
           cp com.arminstraub.krop.desktop $APPDIR/
-          sed -i 's/^TryExec=.*/TryExec=krop/' $APPDIR/com.arminstraub.krop.desktop
+          sed -i 's/^TryExec=.*/TryExec=kroppy/' $APPDIR/com.arminstraub.krop.desktop
           cp com.arminstraub.krop.desktop $APPDIR/usr/share/applications/
           cp com.arminstraub.krop.svg $APPDIR/
           cp com.arminstraub.krop.svg $APPDIR/usr/share/icons/hicolor/scalable/apps/
@@ -103,32 +103,38 @@ jobs:
           cat > $APPDIR/AppRun <<'EOS'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/krop" "$@"
+          exec "$HERE/usr/bin/kroppy" "$@"
           EOS
           sed -i 's/^          //' $APPDIR/AppRun
           chmod +x $APPDIR/AppRun
           curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run $APPDIR "krop-trimall-${{ steps.ver.outputs.v }}-x86_64.AppImage"
-          mkdir -p out && mv krop-trimall-*.AppImage out/
-          echo "BIN=$PWD/out/krop-trimall-${{ steps.ver.outputs.v }}-x86_64.AppImage" >> $GITHUB_ENV
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run $APPDIR "kroppy-${{ steps.ver.outputs.v }}-x86_64.AppImage"
+          mkdir -p out && mv kroppy-*.AppImage out/
+          echo "BIN=$PWD/out/kroppy-${{ steps.ver.outputs.v }}-x86_64.AppImage" >> $GITHUB_ENV
           echo "APPIMAGE_EXTRACT_AND_RUN=1" >> $GITHUB_ENV
 
       - name: Package (macOS zip + dmg)
         if: runner.os == 'macOS'
         run: |
           mkdir -p out
-          B="krop-trimall-${{ steps.ver.outputs.v }}-${{ matrix.name }}"
-          ditto -c -k --keepParent dist/krop.app "out/$B.app.zip"
-          hdiutil create -volname krop -srcfolder dist/krop.app -ov -format UDZO "out/$B.dmg"
-          echo "BIN=$PWD/dist/krop.app/Contents/MacOS/krop" >> $GITHUB_ENV
+          B="kroppy-${{ steps.ver.outputs.v }}-${{ matrix.name }}"
+          # --name kroppy names the .app; keep the bundle id (com.arminstraub.krop).
+          PLIST=dist/kroppy.app/Contents/Info.plist
+          for key in CFBundleName CFBundleDisplayName; do
+            /usr/libexec/PlistBuddy -c "Set :$key kroppy" "$PLIST" \
+              || /usr/libexec/PlistBuddy -c "Add :$key string kroppy" "$PLIST"
+          done
+          ditto -c -k --keepParent dist/kroppy.app "out/$B.app.zip"
+          hdiutil create -volname kroppy -srcfolder dist/kroppy.app -ov -format UDZO "out/$B.dmg"
+          echo "BIN=$PWD/dist/kroppy.app/Contents/MacOS/kroppy" >> $GITHUB_ENV
 
       - name: Package (Windows exe)
         if: runner.os == 'Windows'
         run: |
           mkdir -p out
-          cp dist/krop.exe "out/krop-trimall-${{ steps.ver.outputs.v }}-windows-x64.exe"
-          echo "BIN=$PWD/out/krop-trimall-${{ steps.ver.outputs.v }}-windows-x64.exe" >> $GITHUB_ENV
+          cp dist/kroppy.exe "out/kroppy-${{ steps.ver.outputs.v }}-windows-x64.exe"
+          echo "BIN=$PWD/out/kroppy-${{ steps.ver.outputs.v }}-windows-x64.exe" >> $GITHUB_ENV
 
       - name: Smoke test (headless open, trim, save)
         timeout-minutes: 10
@@ -143,7 +149,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: krop-trimall-${{ matrix.name }}
+          name: kroppy-${{ matrix.name }}
           path: out/*
           if-no-files-found: error
 

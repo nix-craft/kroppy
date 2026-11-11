@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Activity log for krop.
+"""Activity log for kroppy.
 
-By default each run appends to <input>.krop.log beside the PDF being opened.
+By default each run appends to <input>.kroppy.log beside the PDF being opened.
 --log FILE / KROP_LOG=FILE appends to that file instead; --log off / KROP_LOG=off
 disables logging. If the folder beside the PDF is not writable, the log goes
-to ~/.local/state/krop-trimall/ (or $XDG_STATE_HOME/krop-trimall).
+to ~/.local/state/kroppy/ (or $XDG_STATE_HOME/kroppy).
 
 Every line is flushed so the file can be followed with `tail -f`:
   SESSION  version, platform, timestamp
@@ -27,7 +27,7 @@ _path = None
 
 def user_log_dir():
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return os.path.join(base, "krop-trimall")
+    return os.path.join(base, "kroppy")
 
 
 def log(kind, msg):
@@ -51,7 +51,7 @@ def _try_open(path):
 def _write_header(path):
     import platform
     from krop.version import __version__
-    log("SESSION", "krop %s" % __version__)
+    log("SESSION", "kroppy %s" % __version__)
     log("SESSION", "time %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
     log("SESSION", "platform %s" % platform.platform())
     log("SESSION", "python %s" % platform.python_version())
@@ -92,7 +92,7 @@ def attach_input(input_path):
     global _buf
     if _mode != "auto" or not input_path:
         return None
-    beside = os.path.splitext(os.path.abspath(input_path))[0] + ".krop.log"
+    beside = os.path.splitext(os.path.abspath(input_path))[0] + ".kroppy.log"
     try:
         _switch_log(beside)
         return None
@@ -106,7 +106,7 @@ def attach_input(input_path):
             log("WARN", _mode_note)
             return None
         log("WARN", "could not write %s (%s); logging to %s" % (beside, err, fallback))
-        sys.stderr.write("krop: could not write %s (%s); logging to %s\n" % (beside, err, fallback))
+        sys.stderr.write("kroppy: could not write %s (%s); logging to %s\n" % (beside, err, fallback))
         return fallback
 
 
@@ -245,7 +245,7 @@ def install(win, path):
 
 def _stop():
     global _f
-    log("STOP", "krop exiting")
+    log("STOP", "kroppy exiting")
     if _f is not None:
         try:
             _f.flush()
