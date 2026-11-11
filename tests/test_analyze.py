@@ -512,6 +512,112 @@ def test_image_detail_gray_target_and_uses(tmp_path):
     assert "savings" in blob
 
 
+def test_shared_image_is_encoded_once(tmp_path, monkeypatch):
+    import numpy as np
+    from krop import imagetarget
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((32, 32), np.uint8)
+    arr[:, :16] = 0
+    arr[:, 16:] = 255
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, 32, 32, arr.tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(72, 72, 200, 200), pixmap=pix)
+    page2 = doc.new_page()
+    page2.insert_image(pymupdf.Rect(72, 72, 180, 180), xref=xref)
+    path = str(tmp_path / "shared.pdf")
+    _save(doc, path)
+    calls = []
+    real = imagetarget.recommend
+
+    def wrapped(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(imagetarget, "recommend", wrapped)
+    seen = []
+    data = analyze_file(path, on_image=seen.append)
+    assert calls == [1]
+    assert len(seen) == 1
+    assert seen[0]["pages"] == [1, 2]
+    pages = data["pages"]
+    assert pages[0]["images"][0]["link_pages"] == 2
+    assert pages[0]["images"][0]["link_placements"] >= 2
+    assert 2 in pages[0]["images"][0]["pages"]
+    assert pages[1]["images"][0]["xref"] == pages[0]["images"][0]["xref"]
+    assert pages[1]["images"][0]["shared"] is True
+    assert "counted on p1" in pages[1]["images"][0]["detail"]
+    assert pages[1]["image_bytes"] == 0
+    assert data["summary"]["image_bytes"] == pages[0]["images"][0]["bytes"]
+    blob = "\n".join(__import__("krop.analyze", fromlist=["analyze_lines"]).analyze_lines(data))
+    assert "links 2 pages" in blob and "[1,2]" in blob
+
+
+def test_identical_streams_share_one_target(tmp_path, monkeypatch):
+    import pikepdf
+    import zlib
+    from krop import imagetarget
+    path = str(tmp_path / "same-bytes.pdf")
+    pdf = pikepdf.Pdf.new()
+    raw = bytes([0, 255] * 32)
+    encoded = zlib.compress(raw)
+
+    def add(page, stream):
+        page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=stream))
+        page.Contents = pikepdf.Stream(pdf, b"q 8 0 0 8 0 0 cm /Im0 Do Q\n")
+
+    page = pdf.add_blank_page(page_size=(8, 8))
+    st = pikepdf.Stream(pdf, encoded)
+    st.Type = pikepdf.Name.XObject
+    st.Subtype = pikepdf.Name.Image
+    st.Width = st.Height = 8
+    st.ColorSpace = pikepdf.Name.DeviceGray
+    st.BitsPerComponent = 8
+    st.Filter = pikepdf.Name.FlateDecode
+    add(page, st)
+    page2 = pdf.add_blank_page(page_size=(8, 8))
+    st2 = pikepdf.Stream(pdf, encoded)
+    st2.Type = pikepdf.Name.XObject
+    st2.Subtype = pikepdf.Name.Image
+    st2.Width = st2.Height = 8
+    st2.ColorSpace = pikepdf.Name.DeviceGray
+    st2.BitsPerComponent = 8
+    st2.Filter = pikepdf.Name.FlateDecode
+    add(page2, st2)
+    pdf.save(path)
+    calls = []
+    real = imagetarget.recommend
+
+    def wrapped(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(imagetarget, "recommend", wrapped)
+    data = analyze_file(path)
+    assert calls == [1]
+    assert data["summary"]["duplicates"] == 1
+    assert any(im.get("dup_of") for im in data["images"])
+    assert data["summary"]["image_bytes"] == data["pages"][0]["images"][0]["bytes"]
+    assert data["pages"][1]["image_bytes"] == 0
+    assert data["pages"][1]["images"][0]["link_pages"] == 2
+
+
+def test_shared_image_row_appears_before_later_page(window, qapp):
+    w = window
+    w.analysisPanel.begin(3)
+    w.analysisPanel.show_shared_image({
+        "xref": 9, "page": 1, "pages": [1, 3],
+        "detail": "xref 9 links 2 page(s) [p1, p3]",
+        "target": "keep", "target_text": "keep",
+        "link_tip": "Used on p1, p3 (2 placement(s))",
+    })
+    qapp.processEvents()
+    row = w.analysisPanel.tree.topLevelItem(2)
+    assert row.text(1) == "pending"
+    assert row.childCount() == 1
+    assert "xref 9" in row.child(0).text(1)
+    assert "p1, p3" in row.child(0).toolTip(1)
+
+
 def test_indexed_target_for_two_colors(tmp_path):
     import numpy as np
     doc = pymupdf.open()

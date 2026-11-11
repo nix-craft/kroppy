@@ -765,7 +765,68 @@ def _colorspace_text(doc, xref, fallback):
     return name
 
 
-def _image_records(doc, page, page_no, placements, threshold=None, decoded=None):
+_TARGET_KEYS = (
+    "kind", "levels", "photo", "suggested_bpp", "target", "error_mae", "error_max",
+    "error_metric", "est_bytes", "rep_bytes", "codec", "savings_pct", "copier_ccitt",
+)
+
+
+def _catalog_images(doc):
+    """Page membership and content hash for every image, without decoding pixels."""
+    catalog = {}
+    by_sha = {}
+    try:
+        count = doc.page_count
+    except Exception:
+        count = len(doc)
+    for index in range(count):
+        page_no = index + 1
+        try:
+            images = doc[index].get_images(full=True)
+        except Exception:
+            images = []
+        seen_here = set()
+        for im in images:
+            xref = int(im[0])
+            if xref in seen_here:
+                info = catalog.get(xref)
+                if info is not None:
+                    info["listed"][page_no] = info["listed"].get(page_no, 0) + 1
+                continue
+            seen_here.add(xref)
+            info = catalog.get(xref)
+            if info is None:
+                try:
+                    raw = doc.xref_stream_raw(xref) or b""
+                except Exception:
+                    raw = b""
+                sha = hashlib.sha256(raw).hexdigest() if raw else ""
+                info = {
+                    "xref": xref, "sha256": sha, "bytes": len(raw),
+                    "width": int(im[2] or 0), "height": int(im[3] or 0),
+                    "bpc": int(im[4] or 0), "colorspace": str(im[5] or ""),
+                    "filter": str(im[8] or ""), "smask": int(im[1] or 0),
+                    "own_pages": [], "listed": {},
+                }
+                catalog[xref] = info
+                if sha:
+                    by_sha.setdefault(sha, []).append(xref)
+            if page_no not in info["own_pages"]:
+                info["own_pages"].append(page_no)
+            info["listed"][page_no] = info["listed"].get(page_no, 0) + 1
+    for info in catalog.values():
+        group = by_sha.get(info["sha256"], [info["xref"]]) if info["sha256"] else [info["xref"]]
+        pages = sorted(set(p for xref in group for p in catalog[xref]["own_pages"]))
+        placements = sum(sum(catalog[xref]["listed"].values()) for xref in group)
+        info["group"] = list(group)
+        info["link_pages_list"] = pages
+        info["link_placements"] = placements
+        info["counted_on"] = pages[0] if pages else 0
+        info["canonical"] = min(group) if group else info["xref"]
+    return catalog
+
+
+def _image_records(doc, page, page_no, placements, threshold=None, decoded=None, catalog=None, analyzed=None, on_image=None):
     import numpy as np
     import pymupdf
     by_name = {}
@@ -799,10 +860,17 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None)
         cs = str(im[5] or "")
         name = slot["names"][0]
         filt = str(im[8] or "")
-        try:
-            raw = doc.xref_stream_raw(xref) or b""
-        except Exception:
-            raw = b""
+        info = (catalog or {}).get(xref)
+        if info is not None:
+            raw_len = info["bytes"]
+            sha = info["sha256"]
+        else:
+            try:
+                raw = doc.xref_stream_raw(xref) or b""
+            except Exception:
+                raw = b""
+            raw_len = len(raw)
+            sha = hashlib.sha256(raw).hexdigest() if raw else ""
         try:
             filt_key = doc.xref_get_key(xref, "Filter")[1] or filt
         except Exception:
@@ -838,22 +906,33 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None)
         rec = {
             "xref": xref, "name": name, "width": w, "height": h, "bpc": bpc,
             "colorspace": cs, "colorspace_text": _colorspace_text(doc, xref, cs),
-            "filter": filt_s, "filter_name": filt_short, "bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest() if raw else "",
+            "filter": filt_s, "filter_name": filt_short, "bytes": raw_len,
+            "sha256": sha, "page": page_no,
             "ppi": ppi, "ppi_text": rec_ppi or ("dpi ?" if not ppi else "%g dpi" % ppi),
             "area_frac": round(area_frac, 4), "smask": bool(smask),
             "mask": _xref_flag(doc, xref, "Mask"),
             "image_mask": _xref_flag(doc, xref, "ImageMask"),
             "uses": uses, "pages": [page_no], "dup_of": None, "kind": "gray",
             "levels": None, "photo": False, "suggested_bpp": None,
-            "est_bytes": len(raw), "rep_bytes": len(raw),
+            "est_bytes": raw_len, "rep_bytes": raw_len,
             "copier_ccitt": filt_short == "CCITT",
         }
         if filt_short in ("CCITT", "JBIG2") or (bpc <= 1 and "RGB" not in cs.upper() and "CMYK" not in cs.upper()):
             rec.update(kind="bilevel", levels=2, photo=False, suggested_bpp=1,
-                       est_bytes=len(raw) or max(1, (w * h) // 8),
-                       rep_bytes=len(raw) or max(1, (w * h) // 8))
-            _apply_target(rec, None, threshold)
+                       est_bytes=raw_len or max(1, (w * h) // 8),
+                       rep_bytes=raw_len or max(1, (w * h) // 8))
+            _link_image(rec, info)
+            fresh = not _reuse_target(rec, analyzed)
+            if fresh:
+                _apply_target(rec, None, threshold)
+                fresh = _remember_target(rec, analyzed)
+            _describe_image(rec)
+            if fresh and on_image is not None:
+                on_image(dict(rec))
+            records.append(rec)
+            continue
+        _link_image(rec, info)
+        if _reuse_target(rec, analyzed):
             _describe_image(rec)
             records.append(rec)
             continue
@@ -882,11 +961,15 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None)
             if rec["kind"] == "gray":
                 rec["photo"] = (rec["levels"] or 0) > 16
             _apply_target(rec, arr, threshold)
+            fresh = _remember_target(rec, analyzed)
         except Exception as exc:
-            rec.update(kind="undecodable", est_bytes=len(raw), rep_bytes=len(raw))
+            rec.update(kind="undecodable", est_bytes=raw_len, rep_bytes=raw_len)
             rec["error"] = str(exc)[:120]
             _apply_target(rec, None, threshold)
+            fresh = _remember_target(rec, analyzed)
         _describe_image(rec)
+        if fresh and on_image is not None:
+            on_image(dict(rec))
         records.append(rec)
     return records
 
@@ -912,6 +995,62 @@ def _decoded_samples(doc, xref, cache):
     if cache is not None:
         cache[xref] = arr
     return arr
+
+
+def _link_image(rec, info):
+    """Attach document-wide link counts. Bytes are owned by the lowest page."""
+    if not info:
+        pages = [rec.get("page")] if rec.get("page") else []
+        rec["pages"] = pages
+        rec["link_pages"] = len(pages) or 1
+        rec["link_placements"] = int(rec.get("uses") or 1)
+        rec["counted_on"] = rec.get("page")
+        rec["shared"] = False
+        return
+    pages = list(info.get("link_pages_list") or [])
+    rec["pages"] = pages
+    rec["link_pages"] = len(pages) or 1
+    rec["link_placements"] = int(info.get("link_placements") or rec.get("uses") or 1)
+    rec["counted_on"] = info.get("counted_on") or rec.get("page")
+    rec["shared"] = rec["link_pages"] > 1 or len(info.get("group") or []) > 1
+    canonical = info.get("canonical")
+    if canonical and canonical != rec.get("xref"):
+        rec["dup_of"] = canonical
+    if rec.get("sha256") and not rec.get("sha256"):
+        rec["sha256"] = info.get("sha256") or ""
+    if info.get("sha256") and not rec.get("sha256"):
+        rec["sha256"] = info["sha256"]
+
+
+def _share_key(rec):
+    if rec.get("sha256"):
+        return "sha:" + rec["sha256"]
+    return "xref:%s" % rec.get("xref")
+
+
+def _reuse_target(rec, analyzed):
+    """Copy a recommendation already computed for this xref or identical bytes."""
+    if analyzed is None:
+        return False
+    got = analyzed.get(_share_key(rec))
+    if not got:
+        return False
+    bpp = rec.get("suggested_bpp")
+    rec.update(got)
+    if got.get("suggested_bpp") is None and bpp:
+        rec["suggested_bpp"] = bpp
+    return True
+
+
+def _remember_target(rec, analyzed):
+    """Store the recommendation once per xref or identical byte stream. Returns True if new."""
+    if analyzed is None:
+        return True
+    key = _share_key(rec)
+    if key in analyzed:
+        return False
+    analyzed[key] = dict((name, rec.get(name)) for name in _TARGET_KEYS)
+    return True
 
 
 def _apply_target(rec, samples, threshold):
@@ -946,12 +1085,25 @@ def _describe_image(rec):
         masks.append("ImageMask")
     mask_s = "+".join(masks) if masks else "no mask"
     uses = int(rec.get("uses") or 1)
-    use_s = ("  %d uses" % uses) if uses > 1 else ""
-    rec["detail"] = "xref %d  %dx%d  %s  %s  %s bpc  %s  %s  %s%s" % (
+    use_s = ("  %d on this page" % uses) if uses > 1 else ""
+    link_pages = int(rec.get("link_pages") or len(rec.get("pages") or []) or 1)
+    link_placements = int(rec.get("link_placements") or uses)
+    pages = rec.get("pages") or []
+    page_s = ", ".join("p%d" % p for p in pages)
+    link_s = "  links %d page(s), %d placement(s)" % (link_pages, link_placements)
+    if page_s:
+        link_s += " [%s]" % page_s
+    if rec.get("dup_of"):
+        link_s += "  same bytes as xref %d" % rec["dup_of"]
+    owner = rec.get("counted_on")
+    if rec.get("shared") and owner and owner != rec.get("page"):
+        link_s += "  shared, counted on p%d" % owner
+    rec["detail"] = "xref %d  %dx%d  %s  %s  %s bpc  %s  %s  %s%s%s" % (
         rec.get("xref"), rec.get("width") or 0, rec.get("height") or 0, ppi_s,
         rec.get("colorspace_text") or rec.get("colorspace") or "?",
         rec.get("bpc"), rec.get("filter_name") or "?", mask_s,
-        _fmt_bytes(rec.get("bytes")), use_s)
+        _fmt_bytes(rec.get("bytes")), use_s, link_s)
+    rec["link_tip"] = "Used on %s (%d placement(s))" % (page_s or "this page", link_placements)
     mae = rec.get("error_mae")
     err = ""
     if mae is not None:
@@ -1328,13 +1480,15 @@ def _document(pages, image_table):
                 blockers.append({"page": p["page"], "kind": "note", "text": note, "severity": "note"})
     dups = sum(1 for im in image_table if im.get("dup_of"))
     est = 0
+    image_bytes = 0
     counted = set()
     for im in image_table:
-        key = im.get("dup_of") or im["xref"]
+        key = _share_key(im)
         if key in counted:
             continue
         counted.add(key)
-        est += int(im.get("est_bytes") or 0)
+        image_bytes += int(im.get("bytes") or 0)
+        est += int(im.get("rep_bytes") if im.get("rep_bytes") is not None else im.get("est_bytes") or 0)
     return {
         "pages": len(pages),
         "label": label,
@@ -1342,11 +1496,11 @@ def _document(pages, image_table):
         "suggested_bpp": bpp,
         "blockers": blockers,
         "blocker_count": len(blockers),
-        "images": len(image_table),
+        "images": len(counted) or len(image_table),
         "duplicates": dups,
         "est_bytes": est,
-        "image_bytes": sum(int(im.get("bytes") or 0) for im in image_table if not im.get("dup_of")),
-        "savings_pct": _savings(sum(int(im.get("bytes") or 0) for im in image_table if not im.get("dup_of")), est),
+        "image_bytes": image_bytes,
+        "savings_pct": _savings(image_bytes, est),
     }
 
 
@@ -1378,7 +1532,23 @@ def page_visit_order(count, focus):
     return order
 
 
-def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None):
+def _owned_image_bytes(images, page_no):
+    """Bytes and estimate for images whose document total is attributed to this page."""
+    current = estimate = 0
+    seen = set()
+    for im in images:
+        if (im.get("counted_on") or page_no) != page_no:
+            continue
+        key = _share_key(im)
+        if key in seen:
+            continue
+        seen.add(key)
+        current += int(im.get("bytes") or 0)
+        estimate += int(im.get("rep_bytes") if im.get("rep_bytes") is not None else im.get("est_bytes") or 0)
+    return current, estimate
+
+
+def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None, on_image=None):
     """Analyze path. cancel is an optional threading.Event checked between pages.
 
     focus is a 0-based page index, or a callable returning one, so a running
@@ -1392,8 +1562,9 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
     pdf = pikepdf.open(path)
     cache = {"instr": {}, "forms": {}}
     decoded = {}
+    analyzed = {}
     image_table = []
-    seen_hash = {}
+    seen_xrefs = set()
     try:
         count = doc.page_count
     except Exception:
@@ -1401,6 +1572,7 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
     pages = [None] * count
     if on_start:
         on_start(count)
+    catalog = _catalog_images(doc)
     pending = set(range(count))
     try:
         while pending:
@@ -1425,26 +1597,14 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
                 _walk_content(pdf, pk_page.obj, res, contrib, set(), 0, cache)
             except Exception as exc:
                 _add_blocker(contrib, "stream", "content stream could not be parsed (%s) p{p}" % exc, "check")
-            images = _image_records(doc, page, page_no, contrib["placements"], threshold, decoded)
-            owned = []
+            images = _image_records(
+                doc, page, page_no, contrib["placements"], threshold, decoded,
+                catalog, analyzed, on_image)
             for im in images:
-                previous = seen_hash.get(im["xref"])
-                if previous is not None:
-                    if page_no not in previous["pages"]:
-                        previous["pages"].append(page_no)
-                    owned.append(previous)
+                if im["xref"] in seen_xrefs:
                     continue
-                prev_hash = seen_hash.get("sha:" + im["sha256"]) if im["sha256"] else None
-                if prev_hash and prev_hash != im["xref"]:
-                    im["dup_of"] = prev_hash
-                    im["est_bytes"] = 0
-                    im["savings_pct"] = 0.0
-                elif im["sha256"]:
-                    seen_hash["sha:" + im["sha256"]] = im["xref"]
-                seen_hash[im["xref"]] = im
+                seen_xrefs.add(im["xref"])
                 image_table.append(im)
-                owned.append(im)
-            images = owned
             texts = _text_items(page, contrib["tr3"] > 0)
             _mark_red_text(texts)
             _annotations(page, contrib)
@@ -1453,8 +1613,7 @@ def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on
                 annots = any(b.get("kind") == "annot" and b.get("severity") == "check" for b in rec["blockers"])
                 rec = _apply_render(rec, _render_measure(page, annots=annots))
             rec["image_count"] = len(images)
-            rec["image_bytes"] = sum(int(im.get("bytes") or 0) for im in images)
-            rec["image_est"] = sum(int((im.get("rep_bytes") if im.get("rep_bytes") is not None else im.get("est_bytes")) or 0) for im in images)
+            rec["image_bytes"], rec["image_est"] = _owned_image_bytes(images, page_no)
             if rec["image_bytes"]:
                 rec["savings_pct"] = round((rec["image_bytes"] - rec["image_est"]) * 100.0 / rec["image_bytes"], 1)
             else:
@@ -1487,7 +1646,12 @@ def analyze_lines(data):
             p.get("image_count") or 0, p.get("image_bytes") or 0, p.get("image_est") or 0,
             _pct(p.get("savings_pct"))))
         for im in p.get("images") or []:
-            lines.append("image %s target %s" % (im.get("detail") or ("xref %d" % im.get("xref")), im.get("target_text") or im.get("target")))
+            pages = ",".join(str(n) for n in (im.get("pages") or []))
+            lines.append("image %s links %d pages [%s] placements %d target %s" % (
+                im.get("detail") or ("xref %d" % im.get("xref")),
+                int(im.get("link_pages") or 1), pages,
+                int(im.get("link_placements") or im.get("uses") or 1),
+                im.get("target_text") or im.get("target")))
         for b in p["blockers"]:
             lines.append("blocker %s" % b["text"])
         for note in p.get("notes") or []:

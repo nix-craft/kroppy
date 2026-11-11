@@ -8,6 +8,10 @@ try:
     _USER = Qt.ItemDataRole.UserRole
 except AttributeError:
     _USER = Qt.UserRole
+try:
+    _XREF = int(_USER) + 1
+except Exception:
+    _XREF = 257
 
 try:
     _SINGLE = QAbstractItemView.SelectionMode.SingleSelection
@@ -22,6 +26,7 @@ except AttributeError:
 class AnalyzeJob(QThread):
     counted = pyqtSignal(int)
     page_ready = pyqtSignal(object)
+    image_ready = pyqtSignal(object)
     done = pyqtSignal(object)
 
     def __init__(self, path, focus=0, threshold=None):
@@ -52,9 +57,14 @@ class AnalyzeJob(QThread):
                 if not self.cancel.is_set():
                     self.page_ready.emit(rec)
 
+            def on_image(im):
+                if not self.cancel.is_set():
+                    self.image_ready.emit(im)
+
             result = analyze_file(
                 self.path, cancel=self.cancel, threshold=self.threshold,
-                focus=self._focus_value, on_start=on_start, on_page=on_page)
+                focus=self._focus_value, on_start=on_start, on_page=on_page,
+                on_image=on_image)
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -208,6 +218,45 @@ class AnalysisPanel(QDockWidget):
             self._selecting = False
         self._select_followed()
 
+    def show_shared_image(self, im):
+        """Attach an already-analyzed shared image to every page that uses it."""
+        if not im:
+            return
+        pages = im.get("pages") or []
+        if not pages and im.get("page"):
+            pages = [im.get("page")]
+        self._selecting = True
+        try:
+            for number in pages:
+                row = self._row_for_page(number)
+                if row is None:
+                    continue
+                self._upsert_image(row, im, number)
+        finally:
+            self._selecting = False
+
+    def _upsert_image(self, row, im, page_no):
+        xref = im.get("xref")
+        for i in range(row.childCount()):
+            child = row.child(i)
+            if child.data(0, _XREF) == xref:
+                self._paint_image(child, im)
+                return
+        child = QTreeWidgetItem(["", "", "", "", "", ""])
+        child.setData(0, _USER, page_no)
+        child.setData(0, _XREF, xref)
+        self._paint_image(child, im)
+        row.insertChild(0, child)
+
+    def _paint_image(self, child, im):
+        child.setText(1, im.get("detail") or "")
+        child.setText(2, im.get("target") or "")
+        child.setText(3, im.get("target_text") or "")
+        tip = im.get("link_tip") or ""
+        if tip:
+            child.setToolTip(1, tip)
+            child.setToolTip(2, tip)
+
     def add_page(self, page):
         if not page:
             return
@@ -240,10 +289,10 @@ class AnalysisPanel(QDockWidget):
         while row.childCount():
             row.removeChild(row.child(0))
         for im in images:
-            child = QTreeWidgetItem([
-                "", im.get("detail") or "", im.get("target") or "",
-                im.get("target_text") or "", "", ""])
+            child = QTreeWidgetItem(["", "", "", "", "", ""])
             child.setData(0, _USER, page["page"])
+            child.setData(0, _XREF, im.get("xref"))
+            self._paint_image(child, im)
             row.addChild(child)
         for blocker in page.get("blockers") or []:
             child = QTreeWidgetItem(["", blocker["text"], "", "", "", ""])

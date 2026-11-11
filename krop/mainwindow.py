@@ -1254,6 +1254,7 @@ class MainWindow(QMainWindow):
         job = AnalyzeJob(path, start, self.analysisPanel.error_threshold())
         job.counted.connect(self.analysisPanel.begin)
         job.page_ready.connect(self.analysisPanel.add_page)
+        job.image_ready.connect(self.analysisPanel.show_shared_image)
         job.done.connect(self._onAnalysis)
         self._analysis_job = job
         self._analysis_jobs.append(job)
@@ -1269,6 +1270,7 @@ class MainWindow(QMainWindow):
             job.cancel.set()
             for sig, slot in ((job.done, self._onAnalysis),
                               (job.page_ready, self.analysisPanel.add_page),
+                              (job.image_ready, self.analysisPanel.show_shared_image),
                               (job.counted, self.analysisPanel.begin)):
                 try:
                     sig.disconnect(slot)
