@@ -1,3 +1,5 @@
+# Same runtime dependencies as setup.py install_requires.
+# `pip install -e .` installs these. This file is kept for a direct pip install.
 PyQt6
 pymupdf
 pikepdf

@@ -121,8 +121,13 @@ def test_transparency_is_flagged(tmp_path):
     path = str(tmp_path / "trans.pdf")
     _save(doc, path)
     data = analyze_file(path)
-    assert any(b["kind"] == "transparency" for b in data["pages"][0]["blockers"])
-    assert data["pages"][0]["label"] == "COLOR"
+    page = data["pages"][0]
+    assert any(b["kind"] == "transparency" for b in page["blockers"])
+    assert page["label"] in ("BW", "GRAY")
+    blob = " ".join([b["text"] for b in page["blockers"]] + page["notes"])
+    assert "by render" in blob or "render is neutral" in blob
+    assert "transparency" in blob
+    assert page["target"] != "color"
 
 
 def test_spot_color_is_flagged(tmp_path):
@@ -203,6 +208,174 @@ def test_form_xobject_color_is_seen(tmp_path):
     data = analyze_file(path)
     assert data["pages"][0]["label"] == "COLOR"
     assert any("color drawing" in b["text"] for b in data["pages"][0]["blockers"])
+
+
+def test_black_transparency_group_is_bw_by_render(tmp_path):
+    import pikepdf
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Hello", fontsize=18, color=(0, 0, 0))
+    path = str(tmp_path / "group.pdf")
+    _save(doc, path)
+    pdf = pikepdf.open(path, allow_overwriting_input=True)
+    pdf.pages[0].obj["/Group"] = pikepdf.Dictionary(
+        Type=pikepdf.Name.Group, S=pikepdf.Name.Transparency, CS=pikepdf.Name.DeviceGray)
+    pdf.save(path)
+    data = analyze_file(path)
+    page = data["pages"][0]
+    assert page["label"] == "BW"
+    assert page["target"] == "bw-1"
+    blob = " ".join(page["notes"])
+    assert "BW by render (transparency group present)" in blob
+    assert any("warning" in b["text"] for b in page["blockers"])
+
+
+def test_gray_alternate_spot_is_not_color(tmp_path):
+    import pikepdf
+    path = str(tmp_path / "grayspot.pdf")
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page()
+    fn = pikepdf.Dictionary(FunctionType=2, Domain=[0, 1], C0=[0], C1=[1], N=1)
+    sep = pikepdf.Array([pikepdf.Name.Separation, pikepdf.Name("/StaffGray"),
+                         pikepdf.Name.DeviceGray, fn])
+    page.Resources = pikepdf.Dictionary(ColorSpace=pikepdf.Dictionary(Sp0=sep))
+    page.Contents = pikepdf.Stream(pdf, b"/Sp0 cs 0.5 scn 100 100 80 40 re f\n")
+    pdf.save(path)
+    data = analyze_file(path)
+    page = data["pages"][0]
+    assert page["label"] != "COLOR"
+    assert page["target"] != "color"
+    blob = " ".join(b["text"] for b in page["blockers"]) + " " + " ".join(page["notes"])
+    assert "StaffGray" in blob
+    assert "maps to gray" in blob
+
+
+def test_icc_gray_is_not_color(tmp_path):
+    import pikepdf
+    path = str(tmp_path / "icc.pdf")
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page()
+    icc = pikepdf.Stream(pdf, b"\0")
+    icc.N = 1
+    cs = pikepdf.Array([pikepdf.Name.ICCBased, icc])
+    page.Resources = pikepdf.Dictionary(ColorSpace=pikepdf.Dictionary(Cs1=cs))
+    page.Contents = pikepdf.Stream(pdf, b"/Cs1 cs 0.4 scn 80 80 120 60 re f\n")
+    pdf.save(path)
+    data = analyze_file(path)
+    page = data["pages"][0]
+    assert page["label"] == "GRAY"
+    assert page["target"].startswith("gray-")
+    blob = " ".join(b["text"] for b in page["blockers"]) + " " + " ".join(page["notes"])
+    assert "ICC gray" in blob
+    assert page["label"] != "COLOR"
+
+
+def test_gray_drawing_is_explained(tmp_path):
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.draw_rect(pymupdf.Rect(72, 72, 200, 140), color=None, fill=(0.45, 0.45, 0.45))
+    path = str(tmp_path / "gdraw.pdf")
+    _save(doc, path)
+    data = analyze_file(path)
+    page = data["pages"][0]
+    assert page["label"] == "GRAY"
+    assert page["images"] == []
+    blob = " ".join(page["notes"])
+    assert "gray drawing" in blob
+    assert "bpp" in blob
+
+
+def test_missing_dependency_message(monkeypatch):
+    import builtins
+    from krop.analyze import MissingDependency, require_analysis_deps
+    real = builtins.__import__
+
+    def fake(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name in ("numpy", "pikepdf"):
+            raise ModuleNotFoundError("No module named '%s'" % name, name=name)
+        return real(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+    with pytest.raises(MissingDependency) as exc:
+        require_analysis_deps()
+    assert "numpy" in exc.value.packages
+    assert "pikepdf" in exc.value.packages
+    assert "pip install" in str(exc.value)
+    assert "numpy" in str(exc.value)
+
+
+def test_dock_names_missing_package(window, tmp_path, qapp, monkeypatch):
+    from krop.analyze import MissingDependency
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 80), "Hi", fontsize=12, color=(0, 0, 0))
+    src = str(tmp_path / "one.pdf")
+    _save(doc, src)
+
+    def boom(path, cancel=None):
+        raise MissingDependency(["pikepdf"])
+
+    monkeypatch.setattr("krop.analyze.analyze_file", boom)
+    w = window
+    w.show()
+    qapp.processEvents()
+    w.actionAnalysis.setChecked(True)
+    w.openFile(src, False)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        qapp.processEvents()
+        if "pikepdf" in w.analysisPanel.summary.text():
+            break
+        time.sleep(0.05)
+    summary = w.analysisPanel.summary.text()
+    assert "Missing package: pikepdf" in summary
+    assert "pip install pikepdf" in summary
+    assert summary != "Analysis failed."
+    text = open(w.logPath).read()
+    assert "ANALYZE" in text
+    assert "Traceback" in text
+    assert "MissingDependency" in text or "pikepdf" in text
+
+
+def test_heavy_shared_form_is_fast(tmp_path):
+    import pikepdf
+    pdf = pikepdf.Pdf.new()
+    parts = ["0 G\n"]
+    for i in range(2500):
+        y = 10 + (i % 700)
+        parts.append("%d %d m %d %d l S\n" % (20, y, 400, y))
+    form = pikepdf.Stream(pdf, "".join(parts).encode())
+    form.Type = pikepdf.Name.XObject
+    form.Subtype = pikepdf.Name.Form
+    form.BBox = pikepdf.Array([0, 0, 500, 800])
+    for n in range(20):
+        page = pdf.add_blank_page()
+        page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fm0=form))
+        extra = "".join("%d %d m %d %d l S\n" % (i % 400, i % 500, 10, 10) for i in range(200))
+        page.Contents = pikepdf.Stream(pdf, ("0 G\n" + extra + "q /Fm0 Do Q\n").encode())
+    path = str(tmp_path / "heavy.pdf")
+    pdf.save(path)
+    t0 = time.perf_counter()
+    data = analyze_file(path)
+    elapsed = time.perf_counter() - t0
+    assert data["summary"]["label"] == "BW"
+    assert elapsed < 5.0, elapsed
+
+
+def test_needs_check_when_render_fails(tmp_path, monkeypatch):
+    import pikepdf
+    monkeypatch.setattr("krop.analyze._render_measure", lambda page: None)
+    path = str(tmp_path / "shade.pdf")
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page()
+    fn = pikepdf.Dictionary(FunctionType=2, Domain=[0, 1], C0=[0, 0, 0], C1=[1, 0, 0], N=1)
+    sh = pikepdf.Dictionary(ShadingType=2, ColorSpace=pikepdf.Name.DeviceRGB,
+                            Coords=[0, 0, 100, 0], Function=fn)
+    page.Resources = pikepdf.Dictionary(Shading=pikepdf.Dictionary(Sh1=sh))
+    page.Contents = pikepdf.Stream(pdf, b"/Sh1 sh\n")
+    pdf.save(path)
+    data = analyze_file(path)
+    assert data["pages"][0]["label"] == "NEEDS-CHECK"
+    assert data["pages"][0]["target"] == "color"
 
 
 def test_duplicate_images(tmp_path):

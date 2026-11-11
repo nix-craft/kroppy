@@ -1272,7 +1272,13 @@ class MainWindow(QMainWindow):
     def _onAnalysis(self, data):
         self.analysisPanel.set_result(data)
         if not data or data.get("error"):
-            log("ANALYZE", "failed" if not data else "failed: %s" % data["error"].splitlines()[-1])
+            if not data:
+                log("ANALYZE", "failed")
+                return
+            msg = data.get("message") or data["error"].strip().splitlines()[-1]
+            log("ANALYZE", "failed: %s" % msg)
+            for line in data["error"].splitlines():
+                log("ANALYZE", line)
             return
         from krop.analyze import analyze_lines
         for line in analyze_lines(data):

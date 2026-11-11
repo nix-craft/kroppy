@@ -31,8 +31,13 @@ from krop.version import __version__
 
 def _run_analyze_cli(args):
     import json
-    from krop.analyze import analyze_file, format_report
-    data = analyze_file(args.file)
+    import sys
+    from krop.analyze import MissingDependency, analyze_file, format_report
+    try:
+        data = analyze_file(args.file)
+    except MissingDependency as exc:
+        sys.stderr.write(str(exc) + "\n")
+        sys.exit(1)
     if args.analyze_only:
         print(format_report(data))
     if args.analyze_json:

@@ -19,12 +19,24 @@ class AnalyzeJob(QThread):
         self.cancel = threading.Event()
 
     def run(self):
-        from krop.analyze import analyze_file
         try:
+            from krop.analyze import analyze_file, missing_message
             result = analyze_file(self.path, cancel=self.cancel)
-        except Exception:
+        except Exception as exc:
             import traceback
-            result = {"error": traceback.format_exc()}
+            tb = traceback.format_exc()
+            message = None
+            missing = getattr(exc, "packages", None)
+            try:
+                from krop.analyze import missing_message
+                message = missing_message(exc)
+            except Exception:
+                if isinstance(exc, ModuleNotFoundError):
+                    name = getattr(exc, "name", None) or "unknown"
+                    pip = "Pillow" if name == "PIL" else name
+                    message = "Missing package: %s. Install it with: pip install %s" % (pip, pip)
+                    missing = [pip]
+            result = {"error": tb, "message": message, "missing": missing}
         if not self.cancel.is_set():
             self.done.emit(result)
 
@@ -59,9 +71,13 @@ class AnalysisPanel(QDockWidget):
             self.summary.setText("Analysis cancelled.")
             return
         if data.get("error"):
-            self.summary.setText("Analysis failed.")
-            item = QTreeWidgetItem(["", "error", "", data["error"].splitlines()[-1], ""])
-            self.tree.addTopLevelItem(item)
+            message = data.get("message")
+            if not message:
+                last = data["error"].strip().splitlines()[-1]
+                message = "Analysis failed: %s" % last
+            self.summary.setText(message)
+            for line in data["error"].splitlines()[-12:]:
+                self.tree.addTopLevelItem(QTreeWidgetItem(["", "", "", line, ""]))
             return
         s = data["summary"]
         bpp = "" if s.get("suggested_bpp") is None else ", %s bpp" % s["suggested_bpp"]
@@ -75,6 +91,10 @@ class AnalysisPanel(QDockWidget):
             row.setData(0, _USER, page["page"])
             for blocker in page["blockers"]:
                 child = QTreeWidgetItem(["", blocker["text"], "", "", ""])
+                child.setData(0, _USER, page["page"])
+                row.addChild(child)
+            for note in page.get("notes") or []:
+                child = QTreeWidgetItem(["", note, "", "", ""])
                 child.setData(0, _USER, page["page"])
                 row.addChild(child)
             self.tree.addTopLevelItem(row)
