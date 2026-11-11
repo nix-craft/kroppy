@@ -360,6 +360,12 @@ class MainWindow(QMainWindow):
 
     def openFile(self, fileName, recoverCrops=None):
         if fileName:
+            from krop.activitylog import attach_input
+            fallback = attach_input(fileName)
+            if fallback:
+                self.statusBar().showMessage(self.tr(
+                    "Could not write a log beside the PDF. Logging to %s") % fallback)
+            log("OPEN", fileName)
             if recoverCrops is None:
                 recoverCrops = self.recoverCrops
             recovered = None
@@ -446,6 +452,7 @@ class MainWindow(QMainWindow):
     def showWarning(self, title, text):
         # if krop is called with parameter --go, then the main window is never
         # shown; in that case, we output the warning to the shell
+        log("WARN", "%s: %s" % (title, text.replace("\n", " | ")))
         if self.isVisible():
             QMessageBox.warning(self, title, text)
         else:
@@ -470,6 +477,9 @@ class MainWindow(QMainWindow):
         # file names
         inputFileName = self.fileName
         outputFileName = self.ui.editFile.text()
+        log("SAVE", "output %s hard-crop=%s ghostscript=%s" % (
+            outputFileName, self.ui.checkHardCrop.isChecked(),
+            self.ui.checkGhostscript.isChecked()))
 
         # which pages
         s = self.ui.editWhichPages.text()
@@ -513,6 +523,8 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         except PdfEncryptedError as err:
             QApplication.restoreOverrideCursor()
+            import traceback
+            log("ERROR", traceback.format_exc().rstrip())
             self.showWarning(self.tr("PDF is encrypted"),
                     self.tr("This PDF needs to be decrypted before cropping. "
                         "You could try to do that using qpdf:"
@@ -520,6 +532,8 @@ class MainWindow(QMainWindow):
             raise err
         except IOError as err:
             QApplication.restoreOverrideCursor()
+            import traceback
+            log("ERROR", traceback.format_exc().rstrip())
             self.showWarning(self.tr("Could not write cropped PDF"),
                     self.tr("An error occured while writing the cropped PDF. "
                         "Please make sure that you have permission to write to "
@@ -527,10 +541,21 @@ class MainWindow(QMainWindow):
                         "\n\nThe official error is:\n\n{0}").format(err))
         except Exception as err:
             QApplication.restoreOverrideCursor()
-            self.showWarning(self.tr("Something got in our way"),
-                    self.tr("The following unexpected error has occured:"
-                    "\n\n{0}").format(err))
-            raise err
+            import traceback
+            log("ERROR", traceback.format_exc().rstrip())
+            msg = str(err)
+            # PyMuPDF reports a missing output path as FzErrorSystem, not IOError.
+            if "cannot open file" in msg.lower() or "permission denied" in msg.lower():
+                self.showWarning(self.tr("Could not write cropped PDF"),
+                        self.tr("An error occured while writing the cropped PDF. "
+                            "Please make sure that you have permission to write to "
+                            "the selected file."
+                            "\n\nThe official error is:\n\n{0}").format(err))
+            else:
+                self.showWarning(self.tr("Something got in our way"),
+                        self.tr("The following unexpected error has occured:"
+                        "\n\n{0}").format(err))
+                raise err
 
     def hardCropFile(self, outputFileName):
         """Physically crop embedded images to the visible box. Never fails the save."""

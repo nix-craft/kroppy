@@ -68,5 +68,8 @@ whether to inspect only the initial page or all pages (slow!) when auto trimming
 .B \-\-trim\-padding TRIM_PADDING
 how much padding to include when auto trimming (default: previous value)
 .TP
+.B \-\-log LOG
+run log to append to (default: <input>.krop.log beside the PDF; if that folder is not writable, a file under ~/.local/state/krop-trimall). "off" disables. $KROP_LOG is used when this option is omitted
+.TP
 .B \-\-go
 output PDF without opening the krop GUI (using the choices supplied on the command line); if used in a script without X server access, you can run krop using xvfb\-run
