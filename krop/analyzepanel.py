@@ -20,17 +20,41 @@ except AttributeError:
 
 
 class AnalyzeJob(QThread):
+    counted = pyqtSignal(int)
+    page_ready = pyqtSignal(object)
     done = pyqtSignal(object)
 
-    def __init__(self, path):
+    def __init__(self, path, focus=0, threshold=None):
         QThread.__init__(self)
         self.path = path
         self.cancel = threading.Event()
+        self.threshold = threshold
+        self._focus = int(focus or 0)
+        self._lock = threading.Lock()
+
+    def set_focus(self, index):
+        with self._lock:
+            self._focus = max(0, int(index))
+
+    def _focus_value(self):
+        with self._lock:
+            return self._focus
 
     def run(self):
         try:
             from krop.analyze import analyze_file, missing_message
-            result = analyze_file(self.path, cancel=self.cancel)
+
+            def on_start(count):
+                if not self.cancel.is_set():
+                    self.counted.emit(int(count))
+
+            def on_page(rec):
+                if not self.cancel.is_set():
+                    self.page_ready.emit(rec)
+
+            result = analyze_file(
+                self.path, cancel=self.cancel, threshold=self.threshold,
+                focus=self._focus_value, on_start=on_start, on_page=on_page)
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -52,6 +76,8 @@ class AnalyzeJob(QThread):
 
 class AnalysisPanel(QDockWidget):
     page_requested = pyqtSignal(int)
+    focus_changed = pyqtSignal(int)
+    threshold_changed = pyqtSignal(float)
 
     def __init__(self, parent=None):
         QDockWidget.__init__(self, "Analysis", parent)
@@ -65,9 +91,33 @@ class AnalysisPanel(QDockWidget):
         self.summary.setWordWrap(True)
         self.summary.setObjectName("analysisSummary")
         layout.addWidget(self.summary)
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(QLabel("Mean error ≤"))
+        self.errorBox = QDoubleSpinBox()
+        self.errorBox.setObjectName("analysisError")
+        self.errorBox.setRange(0.0, 64.0)
+        self.errorBox.setDecimals(1)
+        self.errorBox.setSingleStep(1.0)
+        self.errorBox.setToolTip("Mean absolute error allowed when choosing a smaller image encoding, on a 0-255 scale. The maximum error must also stay within max(16, 4× this value).")
+        stored = QSettings().value("Analysis/ErrorThreshold", "")
+        try:
+            initial = float(stored) if stored not in ("", None) else 4.0
+        except (TypeError, ValueError):
+            initial = 4.0
+        self.errorBox.blockSignals(True)
+        self.errorBox.setValue(initial)
+        self.errorBox.blockSignals(False)
+        self._threshold_timer = QTimer(self)
+        self._threshold_timer.setSingleShot(True)
+        self._threshold_timer.timeout.connect(self._emit_threshold)
+        self.errorBox.valueChanged.connect(lambda _v: self._threshold_timer.start(400))
+        threshold_row.addWidget(self.errorBox)
+        threshold_row.addWidget(QLabel("MAE"))
+        threshold_row.addStretch(1)
+        layout.addLayout(threshold_row)
         self.tree = QTreeWidget()
         self.tree.setObjectName("analysisTree")
-        self.tree.setHeaderLabels(["Page", "Label", "Target", "Images", "Blockers"])
+        self.tree.setHeaderLabels(["Page", "Label", "Target", "Images", "Blockers", "Size"])
         self.tree.setColumnWidth(0, 50)
         self.tree.setSelectionMode(_SINGLE)
         self.tree.setSelectionBehavior(_ROWS)
@@ -114,24 +164,95 @@ class AnalysisPanel(QDockWidget):
             return
         s = data["summary"]
         bpp = "" if s.get("suggested_bpp") is None else ", %s bpp" % s["suggested_bpp"]
+        pct = s.get("savings_pct")
+        if pct is None:
+            pct_s = ""
+        elif pct > 0.5:
+            pct_s = ", %.0f%% smaller" % pct
+        else:
+            pct_s = ""
         self.summary.setText(
-            "Document: %s → %s%s. %d page(s), %d image(s), %d duplicate(s), %d blocker(s)."
-            % (s["label"], s["target"], bpp, s["pages"], s["images"], s["duplicates"], s["blocker_count"]))
+            "Document: %s → %s%s. %d page(s), %d image(s), %d duplicate(s), %d blocker(s). %s → %s%s."
+            % (s["label"], s["target"], bpp, s["pages"], s["images"], s["duplicates"], s["blocker_count"],
+               _fmt_bytes(s.get("image_bytes")), _fmt_bytes(s.get("est_bytes")), pct_s))
         for page in data["pages"]:
-            row = QTreeWidgetItem([
-                str(page["page"]), page["label"], page["target"],
-                page["image_summary"], str(page["blocker_count"])])
+            if not page:
+                continue
+            row = QTreeWidgetItem(["", "", "", "", "", ""])
             row.setData(0, _USER, page["page"])
-            for blocker in page["blockers"]:
-                child = QTreeWidgetItem(["", blocker["text"], "", "", ""])
-                child.setData(0, _USER, page["page"])
-                row.addChild(child)
-            for note in page.get("notes") or []:
-                child = QTreeWidgetItem(["", note, "", "", ""])
-                child.setData(0, _USER, page["page"])
-                row.addChild(child)
+            self._fill_row(row, page)
             self.tree.addTopLevelItem(row)
         self.tree.expandAll()
+
+    def error_threshold(self):
+        return float(self.errorBox.value())
+
+    def _emit_threshold(self):
+        value = float(self.errorBox.value())
+        QSettings().setValue("Analysis/ErrorThreshold", str(value))
+        self.threshold_changed.emit(value)
+
+    def begin(self, count):
+        """Show one pending row per page. Filled in as each page finishes."""
+        self._selecting = True
+        self._arrived = 0
+        self._total = int(count)
+        try:
+            self.tree.clear()
+            self.summary.setText("Analyzing… 0/%d" % count)
+            for number in range(1, int(count) + 1):
+                row = QTreeWidgetItem([str(number), "pending", "", "", "", ""])
+                row.setData(0, _USER, number)
+                self.tree.addTopLevelItem(row)
+        finally:
+            self._selecting = False
+        self._select_followed()
+
+    def add_page(self, page):
+        if not page:
+            return
+        self._selecting = True
+        try:
+            row = self._row_for_page(page["page"])
+            if row is None:
+                row = QTreeWidgetItem(["", "", "", "", "", ""])
+                row.setData(0, _USER, page["page"])
+                self.tree.addTopLevelItem(row)
+            self._fill_row(row, page)
+            self._arrived = getattr(self, "_arrived", 0) + 1
+            total = getattr(self, "_total", self._arrived)
+            self.summary.setText("Analyzing… %d/%d" % (self._arrived, total))
+        finally:
+            self._selecting = False
+        self._select_followed()
+
+    def _fill_row(self, row, page):
+        images = page.get("images") or []
+        count = page.get("image_count")
+        if count is None:
+            count = len(images)
+        row.setText(0, str(page["page"]))
+        row.setText(1, page.get("label") or "")
+        row.setText(2, page.get("target") or "")
+        row.setText(3, str(count))
+        row.setText(4, str(page.get("blocker_count") or 0))
+        row.setText(5, _size_text(page.get("image_bytes"), page.get("image_est"), page.get("savings_pct")))
+        while row.childCount():
+            row.removeChild(row.child(0))
+        for im in images:
+            child = QTreeWidgetItem([
+                "", im.get("detail") or "", im.get("target") or "",
+                im.get("target_text") or "", "", ""])
+            child.setData(0, _USER, page["page"])
+            row.addChild(child)
+        for blocker in page.get("blockers") or []:
+            child = QTreeWidgetItem(["", blocker["text"], "", "", "", ""])
+            child.setData(0, _USER, page["page"])
+            row.addChild(child)
+        for note in page.get("notes") or []:
+            child = QTreeWidgetItem(["", note, "", "", "", ""])
+            child.setData(0, _USER, page["page"])
+            row.addChild(child)
 
     def follow_page(self, page):
         """Select the row for this 1-based page. Does not change the viewer."""
@@ -143,6 +264,7 @@ class AnalysisPanel(QDockWidget):
             return
         self._follow_page = page
         self._select_followed()
+        self.focus_changed.emit(page)
 
     def _row_for_page(self, page):
         for i in range(self.tree.topLevelItemCount()):
@@ -210,3 +332,24 @@ class AnalysisPanel(QDockWidget):
     def _clicked(self, item, _column):
         # Kept for tests that call the handler directly.
         self._on_clicked(item, _column)
+
+
+def _fmt_bytes(n):
+    n = int(n or 0)
+    if n < 1024:
+        return "%d B" % n
+    return "%.1f KB" % (n / 1024.0)
+
+
+def _size_text(current, estimate, pct):
+    if not current and not estimate:
+        return ""
+    if pct is None:
+        pct_s = ""
+    elif pct > 0.5:
+        pct_s = "%.0f%% smaller" % pct
+    elif pct < -0.5:
+        pct_s = "%.0f%% larger" % (-pct)
+    else:
+        pct_s = "0%"
+    return "%s → %s %s" % (_fmt_bytes(current), _fmt_bytes(estimate), pct_s)

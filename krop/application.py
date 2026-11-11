@@ -34,7 +34,7 @@ def _run_analyze_cli(args):
     import sys
     from krop.analyze import MissingDependency, analyze_file, format_report
     try:
-        data = analyze_file(args.file)
+        data = analyze_file(args.file, threshold=args.analyze_error)
     except MissingDependency as exc:
         sys.stderr.write(str(exc) + "\n")
         sys.exit(1)
@@ -142,6 +142,7 @@ def main():
     parser.add_argument('--go', action='store_true', help='output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb-run')
     parser.add_argument('--analyze-only', action='store_true', help='print a color/bit-depth recommendation and exit without opening the window')
     parser.add_argument('--analyze-json', metavar='FILE', help='write the full analysis JSON to FILE and exit without opening the window')
+    parser.add_argument('--analyze-error', type=float, default=None, metavar='MAE', help='mean absolute error (0-255) allowed when recommending a smaller image encoding (default: 4). The maximum error must also stay within max(16, 4 times this value)')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
     parser.add_argument('--use-qt5', action='store_true', help='use PyQt5 instead of PyQt6 (default: use PyQt6 if available)')

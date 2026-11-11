@@ -694,7 +694,78 @@ def _norm_name(name):
     return str(name or "").lstrip("/")
 
 
-def _image_records(doc, page, page_no, placements):
+def _filter_name(filt_s):
+    u = (filt_s or "").upper()
+    for key, name in (("CCITT", "CCITT"), ("JBIG2", "JBIG2"), ("DCT", "DCT"),
+                      ("JPX", "JPX"), ("FLATE", "Flate"), ("LZW", "LZW"),
+                      ("RUNLENGTH", "RL")):
+        if key in u:
+            return name
+    text = str(filt_s or "").replace("/", " ").replace("[", " ").replace("]", " ").strip()
+    if not text or text.lower() == "null":
+        return "none"
+    return text
+
+
+def _xref_flag(doc, xref, key):
+    try:
+        _kind, val = doc.xref_get_key(xref, key)
+    except Exception:
+        return False
+    if not val or val in ("null", "[]", "0"):
+        return False
+    return True
+
+
+def _follow_n(doc, text, depth=0):
+    import re
+    if not text or depth > 4:
+        return "?"
+    match = re.search(r"/N\s+(\d+)", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"(\d+)\s+0\s+R", text)
+    if not match:
+        return "?"
+    try:
+        return _follow_n(doc, doc.xref_object(int(match.group(1))), depth + 1)
+    except Exception:
+        return "?"
+
+
+def _colorspace_text(doc, xref, fallback):
+    """Human colorspace, including ICC N and Indexed/Separation when present."""
+    try:
+        kind, val = doc.xref_get_key(xref, "ColorSpace")
+    except Exception:
+        kind, val = "", ""
+    text = val or ""
+    if kind == "xref" and text and text != "null":
+        try:
+            text = doc.xref_object(int(str(text).split()[0]))
+        except Exception:
+            pass
+    blob = text or fallback or "?"
+    if "ICCBased" in blob or fallback == "ICCBased":
+        return "ICC N=%s" % _follow_n(doc, blob)
+    if "Indexed" in blob:
+        base = "Indexed"
+        for name in ("DeviceGray", "DeviceRGB", "DeviceCMYK"):
+            if name in blob:
+                base = "Indexed " + name
+                break
+        return base
+    if "Separation" in blob:
+        return "Separation"
+    if "DeviceN" in blob:
+        return "DeviceN"
+    name = str(blob).replace("/", " ").replace("[", " ").replace("]", " ").strip()
+    if not name or name == "null":
+        name = fallback or "?"
+    return name
+
+
+def _image_records(doc, page, page_no, placements, threshold=None, decoded=None):
     import numpy as np
     import pymupdf
     by_name = {}
@@ -705,14 +776,28 @@ def _image_records(doc, page, page_no, placements):
         images = page.get_images(full=True)
     except Exception:
         images = []
-    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+    # One row per xref. Several names or draws of that xref share a use count.
+    grouped = []
+    seen = {}
     for im in images:
+        xref = int(im[0])
+        name = _norm_name(im[7])
+        if xref in seen:
+            seen[xref]["names"].append(name)
+            seen[xref]["listed"] += 1
+            continue
+        slot = {"im": im, "names": [name], "listed": 1}
+        seen[xref] = slot
+        grouped.append(slot)
+    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+    for slot in grouped:
+        im = slot["im"]
         xref = int(im[0])
         smask = int(im[1] or 0)
         w, h = int(im[2] or 0), int(im[3] or 0)
         bpc = int(im[4] or 0)
         cs = str(im[5] or "")
-        name = _norm_name(im[7])
+        name = slot["names"][0]
         filt = str(im[8] or "")
         try:
             raw = doc.xref_stream_raw(xref) or b""
@@ -723,44 +808,58 @@ def _image_records(doc, page, page_no, placements):
         except Exception:
             filt_key = filt
         filt_s = str(filt_key)
-        spots = by_name.get(name) or []
+        filt_short = _filter_name(filt_s)
+        spots = []
+        for nm in slot["names"]:
+            spots.extend(by_name.get(nm) or [])
+        if not spots:
+            spots = by_name.get(name) or []
         ppi = None
+        rec_ppi = None
         area_frac = 1.0
+        ppis = []
         if spots and w and h:
             area = 0.0
-            widest = 0.0
             for place in spots:
                 pw = max(0.0, float(place.get("w_pt") or 0))
                 ph = max(0.0, float(place.get("h_pt") or 0))
                 area += pw * ph
-                if pw > widest:
-                    widest = pw
-            if area > 1 and widest > 1:
+                if pw > 1:
+                    ppis.append(w / (pw / 72.0))
+            if area > 1:
                 area_frac = min(1.0, area / page_area)
-                ppi = round(w / (widest / 72.0), 1)
+            if ppis:
+                ppi = round(max(ppis), 1)
+                lo, hi = round(min(ppis), 1), ppi
+                rec_ppi = ("%g dpi" % hi) if lo == hi else ("%g-%g dpi" % (lo, hi))
+            else:
+                rec_ppi = None
+        uses = max(slot["listed"], len(spots) or 1)
         rec = {
             "xref": xref, "name": name, "width": w, "height": h, "bpc": bpc,
-            "colorspace": cs, "filter": filt_s, "bytes": len(raw),
+            "colorspace": cs, "colorspace_text": _colorspace_text(doc, xref, cs),
+            "filter": filt_s, "filter_name": filt_short, "bytes": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest() if raw else "",
-            "ppi": ppi, "area_frac": round(area_frac, 4), "smask": smask,
-            "pages": [page_no], "dup_of": None, "kind": "gray",
+            "ppi": ppi, "ppi_text": rec_ppi or ("dpi ?" if not ppi else "%g dpi" % ppi),
+            "area_frac": round(area_frac, 4), "smask": bool(smask),
+            "mask": _xref_flag(doc, xref, "Mask"),
+            "image_mask": _xref_flag(doc, xref, "ImageMask"),
+            "uses": uses, "pages": [page_no], "dup_of": None, "kind": "gray",
             "levels": None, "photo": False, "suggested_bpp": None,
-            "est_bytes": len(raw), "copier_ccitt": "CCITT" in filt_s.upper(),
+            "est_bytes": len(raw), "rep_bytes": len(raw),
+            "copier_ccitt": filt_short == "CCITT",
         }
-        if rec["copier_ccitt"] or (bpc <= 1 and "RGB" not in cs.upper() and "CMYK" not in cs.upper()):
+        if filt_short in ("CCITT", "JBIG2") or (bpc <= 1 and "RGB" not in cs.upper() and "CMYK" not in cs.upper()):
             rec.update(kind="bilevel", levels=2, photo=False, suggested_bpp=1,
-                       est_bytes=len(raw) or max(1, (w * h) // 8))
+                       est_bytes=len(raw) or max(1, (w * h) // 8),
+                       rep_bytes=len(raw) or max(1, (w * h) // 8))
+            _apply_target(rec, None, threshold)
+            _describe_image(rec)
             records.append(rec)
             continue
         try:
-            pix = pymupdf.Pixmap(doc, xref)
-            if pix.alpha:
-                pix = pymupdf.Pixmap(pix, 0)
-            if pix.colorspace and pix.colorspace.n == 4:
-                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-            n = pix.n
-            arr = np.frombuffer(pix.samples, np.uint8)
-            arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n)
+            arr = _decoded_samples(doc, xref, decoded)
+            n = 1 if arr.ndim == 2 else arr.shape[2]
             step = 1
             if arr.shape[0] * arr.shape[1] > SAMPLE_PIXELS:
                 step = int((arr.shape[0] * arr.shape[1] / SAMPLE_PIXELS) ** 0.5) or 1
@@ -777,21 +876,101 @@ def _image_records(doc, page, page_no, placements):
                 else:
                     rec.update(kind="color", levels=None, suggested_bpp=None, photo=True)
             else:
-                levels = int(np.unique(sample[..., 0]).size)
+                plane = sample if sample.ndim == 2 else sample[..., 0]
+                levels = int(np.unique(plane).size)
                 rec.update(kind="gray", levels=levels, suggested_bpp=bpp_for_levels(levels))
             if rec["kind"] == "gray":
                 rec["photo"] = (rec["levels"] or 0) > 16
-                bpp = rec["suggested_bpp"] or 8
-                rec["est_bytes"] = max(1, w * h * bpp // 8) if w and h else len(raw)
-                if bpc and bpc <= bpp:
-                    rec["est_bytes"] = len(raw) or rec["est_bytes"]
-            else:
-                rec["est_bytes"] = len(raw)
+            _apply_target(rec, arr, threshold)
         except Exception as exc:
-            rec.update(kind="undecodable", est_bytes=len(raw))
+            rec.update(kind="undecodable", est_bytes=len(raw), rep_bytes=len(raw))
             rec["error"] = str(exc)[:120]
+            _apply_target(rec, None, threshold)
+        _describe_image(rec)
         records.append(rec)
     return records
+
+
+def _decoded_samples(doc, xref, cache):
+    """Decode an image once per xref and reuse the samples."""
+    import numpy as np
+    import pymupdf
+    if cache is not None and xref in cache:
+        return cache[xref]
+    pix = pymupdf.Pixmap(doc, xref)
+    if pix.alpha:
+        pix = pymupdf.Pixmap(pix, 0)
+    if pix.colorspace and pix.colorspace.n == 4:
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    n = pix.n
+    arr = np.frombuffer(pix.samples, np.uint8)
+    arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n)
+    # Own the bytes. The pixmap buffer is freed with the pixmap.
+    arr = arr.copy()
+    if n == 1:
+        arr = arr[:, :, 0]
+    if cache is not None:
+        cache[xref] = arr
+    return arr
+
+
+def _apply_target(rec, samples, threshold):
+    from krop.imagetarget import DEFAULT_ERROR_MAE, recommend
+    got = recommend(
+        samples, rec.get("kind") or "gray", rec.get("bpc") or 0,
+        rec.get("filter_name") or "",
+        DEFAULT_ERROR_MAE if threshold is None else threshold,
+        rec.get("width") or 0, rec.get("height") or 0, rec.get("bytes") or 0)
+    bpp = rec.get("suggested_bpp")
+    rec.update(got)
+    if got.get("suggested_bpp") is None and bpp:
+        rec["suggested_bpp"] = bpp
+    rec["rep_bytes"] = int(got.get("rep_bytes") or rec.get("bytes") or 0)
+
+
+def _fmt_bytes(n):
+    n = int(n or 0)
+    if n < 1024:
+        return "%d B" % n
+    return "%.1f KB" % (n / 1024.0)
+
+
+def _describe_image(rec):
+    ppi_s = rec.get("ppi_text") or "dpi ?"
+    masks = []
+    if rec.get("smask"):
+        masks.append("SMask")
+    if rec.get("mask"):
+        masks.append("Mask")
+    if rec.get("image_mask"):
+        masks.append("ImageMask")
+    mask_s = "+".join(masks) if masks else "no mask"
+    uses = int(rec.get("uses") or 1)
+    use_s = ("  %d uses" % uses) if uses > 1 else ""
+    rec["detail"] = "xref %d  %dx%d  %s  %s  %s bpc  %s  %s  %s%s" % (
+        rec.get("xref"), rec.get("width") or 0, rec.get("height") or 0, ppi_s,
+        rec.get("colorspace_text") or rec.get("colorspace") or "?",
+        rec.get("bpc"), rec.get("filter_name") or "?", mask_s,
+        _fmt_bytes(rec.get("bytes")), use_s)
+    mae = rec.get("error_mae")
+    err = ""
+    if mae is not None:
+        err = "  mae %.1f  max %d" % (float(mae), int(rec.get("error_max") or 0))
+    pct = rec.get("savings_pct")
+    if pct is None:
+        pct_s = ""
+    elif pct > 0.5:
+        pct_s = "%.0f%% smaller" % pct
+    elif pct < -0.5:
+        pct_s = "%.0f%% larger" % (-pct)
+    else:
+        pct_s = "0%"
+    rep = rec.get("rep_bytes")
+    if rep is None:
+        rep = rec.get("est_bytes")
+    rec["target_text"] = "%s%s  %s → %s  %s" % (
+        rec.get("target") or "keep", err, _fmt_bytes(rec.get("bytes")),
+        _fmt_bytes(rep), pct_s)
 
 
 def _span_class(color):
@@ -1166,24 +1345,75 @@ def _document(pages, image_table):
         "images": len(image_table),
         "duplicates": dups,
         "est_bytes": est,
+        "image_bytes": sum(int(im.get("bytes") or 0) for im in image_table if not im.get("dup_of")),
+        "savings_pct": _savings(sum(int(im.get("bytes") or 0) for im in image_table if not im.get("dup_of")), est),
     }
 
 
-def analyze_file(path, cancel=None):
-    """Analyze path. cancel is an optional threading.Event checked between pages."""
+def _savings(current, estimate):
+    current = int(current or 0)
+    if current <= 0:
+        return 0.0
+    return round((current - int(estimate or 0)) * 100.0 / current, 1)
+
+
+def page_visit_order(count, focus):
+    """Page indexes starting at focus, then focus+1, focus-1, focus+2, ..."""
+    count = int(count or 0)
+    if count <= 0:
+        return []
+    focus = int(focus or 0)
+    if focus < 0:
+        focus = 0
+    if focus >= count:
+        focus = count - 1
+    order = [focus]
+    for step in range(1, count):
+        hi = focus + step
+        lo = focus - step
+        if hi < count:
+            order.append(hi)
+        if lo >= 0:
+            order.append(lo)
+    return order
+
+
+def analyze_file(path, cancel=None, threshold=None, focus=None, on_page=None, on_start=None):
+    """Analyze path. cancel is an optional threading.Event checked between pages.
+
+    focus is a 0-based page index, or a callable returning one, so a running
+    analysis can follow the page the viewer is showing. on_page(record) is
+    called as soon as that page is finished. on_start(count) runs first.
+    """
     require_analysis_deps()
     import pikepdf
     import pymupdf
     doc = pymupdf.open(path)
     pdf = pikepdf.open(path)
     cache = {"instr": {}, "forms": {}}
+    decoded = {}
     image_table = []
     seen_hash = {}
-    pages = []
     try:
-        for index, page in enumerate(doc):
+        count = doc.page_count
+    except Exception:
+        count = len(doc)
+    pages = [None] * count
+    if on_start:
+        on_start(count)
+    pending = set(range(count))
+    try:
+        while pending:
             if cancel is not None and cancel.is_set():
                 return None
+            where = focus() if callable(focus) else (0 if focus is None else int(focus))
+            index = None
+            for candidate in page_visit_order(count, where):
+                if candidate in pending:
+                    index = candidate
+                    break
+            pending.remove(index)
+            page = doc[index]
             page_no = index + 1
             contrib = _empty_contrib()
             try:
@@ -1195,7 +1425,7 @@ def analyze_file(path, cancel=None):
                 _walk_content(pdf, pk_page.obj, res, contrib, set(), 0, cache)
             except Exception as exc:
                 _add_blocker(contrib, "stream", "content stream could not be parsed (%s) p{p}" % exc, "check")
-            images = _image_records(doc, page, page_no, contrib["placements"])
+            images = _image_records(doc, page, page_no, contrib["placements"], threshold, decoded)
             owned = []
             for im in images:
                 previous = seen_hash.get(im["xref"])
@@ -1208,6 +1438,7 @@ def analyze_file(path, cancel=None):
                 if prev_hash and prev_hash != im["xref"]:
                     im["dup_of"] = prev_hash
                     im["est_bytes"] = 0
+                    im["savings_pct"] = 0.0
                 elif im["sha256"]:
                     seen_hash["sha:" + im["sha256"]] = im["xref"]
                 seen_hash[im["xref"]] = im
@@ -1221,7 +1452,16 @@ def analyze_file(path, cancel=None):
             if rec.get("needs_render"):
                 annots = any(b.get("kind") == "annot" and b.get("severity") == "check" for b in rec["blockers"])
                 rec = _apply_render(rec, _render_measure(page, annots=annots))
-            pages.append(rec)
+            rec["image_count"] = len(images)
+            rec["image_bytes"] = sum(int(im.get("bytes") or 0) for im in images)
+            rec["image_est"] = sum(int((im.get("rep_bytes") if im.get("rep_bytes") is not None else im.get("est_bytes")) or 0) for im in images)
+            if rec["image_bytes"]:
+                rec["savings_pct"] = round((rec["image_bytes"] - rec["image_est"]) * 100.0 / rec["image_bytes"], 1)
+            else:
+                rec["savings_pct"] = 0.0
+            pages[index] = rec
+            if on_page:
+                on_page(rec)
     finally:
         doc.close()
         pdf.close()
@@ -1238,16 +1478,27 @@ def analyze_lines(data):
         lines.extend(data["error"].splitlines())
         return lines
     s = data["summary"]
-    lines = ["document %s target %s pages %d images %d duplicates %d blockers %d" % (
-        s["label"], s["target"], s["pages"], s["images"], s["duplicates"], s["blocker_count"])]
+    lines = ["document %s target %s pages %d images %d duplicates %d blockers %d bytes %d est %d savings %s" % (
+        s["label"], s["target"], s["pages"], s["images"], s["duplicates"], s["blocker_count"],
+        s.get("image_bytes") or 0, s.get("est_bytes") or 0, _pct(s.get("savings_pct")))]
     for p in data["pages"]:
-        lines.append("p%d %s target %s %s blockers %d" % (
-            p["page"], p["label"], p["target"], p["image_summary"], p["blocker_count"]))
+        lines.append("p%d %s target %s %s blockers %d images %d bytes %d est %d savings %s" % (
+            p["page"], p["label"], p["target"], p["image_summary"], p["blocker_count"],
+            p.get("image_count") or 0, p.get("image_bytes") or 0, p.get("image_est") or 0,
+            _pct(p.get("savings_pct"))))
+        for im in p.get("images") or []:
+            lines.append("image %s target %s" % (im.get("detail") or ("xref %d" % im.get("xref")), im.get("target_text") or im.get("target")))
         for b in p["blockers"]:
             lines.append("blocker %s" % b["text"])
         for note in p.get("notes") or []:
             lines.append("note %s" % note)
     return lines
+
+
+def _pct(value):
+    if value is None:
+        return "0%"
+    return "%.1f%%" % float(value)
 
 
 def format_report(data):
@@ -1258,8 +1509,9 @@ def format_report(data):
         return data.get("message") or data["error"]
     s = data["summary"]
     bpp = "" if s["suggested_bpp"] is None else "  bpp %s" % s["suggested_bpp"]
-    lines = ["document: %s  target %s%s  pages %d  images %d (%d duplicates)  est %d B" % (
-        s["label"], s["target"], bpp, s["pages"], s["images"], s["duplicates"], s["est_bytes"])]
+    lines = ["document: %s  target %s%s  pages %d  images %d (%d duplicates)  est %d B  savings %s" % (
+        s["label"], s["target"], bpp, s["pages"], s["images"], s["duplicates"], s["est_bytes"],
+        _pct(s.get("savings_pct")))]
     if s["blockers"]:
         lines.append("blockers:")
         for b in s["blockers"]:
@@ -1267,8 +1519,13 @@ def format_report(data):
     lines.append("")
     for p in data["pages"]:
         pb = "" if p["suggested_bpp"] is None else "  bpp %s" % p["suggested_bpp"]
-        lines.append("page %d: %s  target %s%s  %s  blockers %d" % (
-            p["page"], p["label"], p["target"], pb, p["image_summary"], p["blocker_count"]))
+        lines.append("page %d: %s  target %s%s  %s  blockers %d  images %d  %s -> %s (%s)" % (
+            p["page"], p["label"], p["target"], pb, p["image_summary"], p["blocker_count"],
+            p.get("image_count") or 0, _fmt_bytes(p.get("image_bytes")), _fmt_bytes(p.get("image_est")),
+            _pct(p.get("savings_pct"))))
+        for im in p.get("images") or []:
+            lines.append("  image %s" % (im.get("detail") or ""))
+            lines.append("         %s" % (im.get("target_text") or im.get("target") or ""))
         for b in p["blockers"]:
             lines.append("  - %s" % b["text"])
         for note in p.get("notes") or []:

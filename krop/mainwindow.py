@@ -151,6 +151,8 @@ class MainWindow(QMainWindow):
         from krop.analyzepanel import AnalysisPanel
         self.analysisPanel = AnalysisPanel(self)
         self.analysisPanel.page_requested.connect(self.slotShowAnalysisPage)
+        self.analysisPanel.focus_changed.connect(self._refocusAnalysis)
+        self.analysisPanel.threshold_changed.connect(self._reanalyze)
         try:
             dock_right = Qt.DockWidgetArea.RightDockWidgetArea
         except AttributeError:
@@ -1248,7 +1250,10 @@ class MainWindow(QMainWindow):
         if not path or not getattr(self, "analyzeOnOpen", True):
             return
         from krop.analyzepanel import AnalyzeJob
-        job = AnalyzeJob(path)
+        start = 0 if self.viewer.isEmpty() else self.viewer.currentPageIndex
+        job = AnalyzeJob(path, start, self.analysisPanel.error_threshold())
+        job.counted.connect(self.analysisPanel.begin)
+        job.page_ready.connect(self.analysisPanel.add_page)
         job.done.connect(self._onAnalysis)
         self._analysis_job = job
         self._analysis_jobs.append(job)
@@ -1262,14 +1267,30 @@ class MainWindow(QMainWindow):
         self._analysis_job = None
         try:
             job.cancel.set()
-            try:
-                job.done.disconnect(self._onAnalysis)
-            except Exception:
-                pass
+            for sig, slot in ((job.done, self._onAnalysis),
+                              (job.page_ready, self.analysisPanel.add_page),
+                              (job.counted, self.analysisPanel.begin)):
+                try:
+                    sig.disconnect(slot)
+                except Exception:
+                    pass
             if wait and job.isRunning():
                 job.wait(60000)
         except RuntimeError:
             pass
+
+    def _refocusAnalysis(self, page):
+        job = self._analysis_job
+        if job is not None:
+            try:
+                job.set_focus(int(page) - 1)
+            except RuntimeError:
+                pass
+
+    def _reanalyze(self, _value):
+        path = getattr(self, "originalFileName", None) or self.fileName
+        if path and not self.viewer.isEmpty():
+            self.startAnalysis(path)
 
     def _onAnalysis(self, data):
         self.analysisPanel.set_result(data)

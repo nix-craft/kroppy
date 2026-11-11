@@ -87,5 +87,8 @@ print a per-page color and bit-depth recommendation and exit without opening the
 .B \-\-analyze\-json FILE
 write the full analysis JSON to FILE and exit without opening the window
 .TP
+.B \-\-analyze\-error MAE
+mean absolute error, on a 0\-255 scale, allowed when recommending a smaller image encoding (default: 4). The maximum error must also stay within max(16, 4 times MAE)
+.TP
 .B \-\-go
 output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb\-run

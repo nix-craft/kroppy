@@ -311,7 +311,7 @@ def test_dock_names_missing_package(window, tmp_path, qapp, monkeypatch):
     src = str(tmp_path / "one.pdf")
     _save(doc, src)
 
-    def boom(path, cancel=None):
+    def boom(path, cancel=None, **kwargs):
         raise MissingDependency(["pikepdf"])
 
     monkeypatch.setattr("krop.analyze.analyze_file", boom)
@@ -464,6 +464,123 @@ def test_panel_fills_and_jumps(window, tmp_path, qapp):
     assert "ANALYZE" in text
 
 
+def test_page_visit_order_reprioritizes():
+    from krop.analyze import page_visit_order
+    assert page_visit_order(5, 2) == [2, 3, 1, 4, 0]
+    focus = [2]
+    seen = []
+    pending = set(range(5))
+    while pending:
+        nxt = next(i for i in page_visit_order(5, focus[0]) if i in pending)
+        pending.remove(nxt)
+        seen.append(nxt)
+        if nxt == 2:
+            focus[0] = 0
+    assert seen[0] == 2
+    assert seen[1] == 0
+
+
+def test_image_detail_gray_target_and_uses(tmp_path):
+    import numpy as np
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((40, 80), np.uint8)
+    arr[:, :20] = 0
+    arr[:, 20:40] = 85
+    arr[:, 40:60] = 170
+    arr[:, 60:] = 255
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, 80, 40, arr.tobytes(), False)
+    page.insert_image(pymupdf.Rect(72, 72, 400, 300), pixmap=pix)
+    page.insert_image(pymupdf.Rect(72, 320, 220, 420), pixmap=pix)
+    path = str(tmp_path / "twice.pdf")
+    _save(doc, path)
+    data = analyze_file(path)
+    page = data["pages"][0]
+    assert page["image_count"] == 1
+    im = page["images"][0]
+    assert im["uses"] == 2
+    assert im["target"] == "gray-2"
+    assert im["error_metric"] == "mae"
+    assert im["error_mae"] == 0
+    assert "xref %d" % im["xref"] in im["detail"]
+    assert "ICC N=1" in im["colorspace_text"] or "Gray" in im["colorspace_text"]
+    assert "bpc" in im["detail"] and "dpi" in im["detail"]
+    assert im["rep_bytes"] < im["bytes"]
+    assert page["savings_pct"] > 0
+    blob = "\n".join(__import__("krop.analyze", fromlist=["analyze_lines"]).analyze_lines(data))
+    assert "image xref" in blob and "mae" in blob
+    assert "savings" in blob
+
+
+def test_indexed_target_for_two_colors(tmp_path):
+    import numpy as np
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((24, 48, 3), np.uint8)
+    arr[:, :24] = (210, 20, 20)
+    arr[:, 24:] = (20, 30, 200)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, 48, 24, arr.tobytes(), False)
+    page.insert_image(page.rect, pixmap=pix)
+    path = str(tmp_path / "two-color.pdf")
+    _save(doc, path)
+    data = analyze_file(path)
+    im = data["pages"][0]["images"][0]
+    assert data["summary"]["label"] == "COLOR"
+    assert im["target"] == "indexed-2"
+    assert im["error_mae"] <= 1
+    assert im["codec"] == "Flate"
+
+
+def test_error_threshold_changes_target(tmp_path):
+    import numpy as np
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.arange(256, dtype=np.uint8).reshape(16, 16)
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, 16, 16, arr.tobytes(), False)
+    page.insert_image(pymupdf.Rect(72, 72, 200, 200), pixmap=pix)
+    path = str(tmp_path / "ramp.pdf")
+    _save(doc, path)
+    tight = analyze_file(path, threshold=0)["pages"][0]["images"][0]
+    loose = analyze_file(path, threshold=80)["pages"][0]["images"][0]
+    # At zero tolerance only an exact encoding passes. Re-encoding the
+    # original 8-bit samples is not smaller, so the target stays "keep".
+    assert tight["target"] in ("keep", "gray-8")
+    assert tight["error_mae"] == 0
+    assert loose["target"] == "1bpp"
+    assert loose["error_mae"] <= 80
+
+
+def test_panel_lists_each_image(window, tmp_path, qapp):
+    import numpy as np
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((20, 20), np.uint8)
+    arr[:10] = 0
+    arr[10:] = 255
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, 20, 20, arr.tobytes(), False)
+    page.insert_image(pymupdf.Rect(72, 72, 200, 200), pixmap=pix)
+    src = str(tmp_path / "one.pdf")
+    _save(doc, src)
+    w = window
+    w.show()
+    qapp.processEvents()
+    w.actionAnalysis.setChecked(True)
+    w.openFile(src, False)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        qapp.processEvents()
+        if "Document:" in w.analysisPanel.summary.text():
+            break
+        time.sleep(0.05)
+    assert "Document:" in w.analysisPanel.summary.text()
+    row = w.analysisPanel.tree.topLevelItem(0)
+    assert row.text(3) == "1"
+    assert row.childCount() >= 1
+    detail = row.child(0).text(1)
+    assert "xref" in detail and "bpc" in detail
+    assert row.child(0).text(2) in ("1bpp", "keep", "gray-2", "gray-4", "gray-8")
+
+
 def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypatch):
     """The highlighted row tracks the viewer, and a single click or key moves the viewer."""
     import threading
@@ -493,13 +610,13 @@ def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypat
     gate = threading.Event()
     started = threading.Event()
 
-    def slow(path, cancel=None):
+    def slow(path, cancel=None, **kwargs):
         started.set()
         if not gate.wait(5):
             return None
         if cancel is not None and cancel.is_set():
             return None
-        return real(path, cancel)
+        return real(path, cancel=cancel, **kwargs)
 
     monkeypatch.setattr("krop.analyze.analyze_file", slow)
     w = window
