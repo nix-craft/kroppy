@@ -1112,6 +1112,59 @@ def _indexed_colors(doc, xref):
     return int(match.group(1)) + 1
 
 
+def _short_space(cs):
+    text = (cs or "").replace("/", " ").upper()
+    if "CMYK" in text or "N=4" in text:
+        return "CMYK"
+    if "RGB" in text or "N=3" in text:
+        return "RGB"
+    if "GRAY" in text or "N=1" in text or "CALGRAY" in text:
+        return "Gray"
+    cleaned = (cs or "").replace("/", "").strip()
+    return cleaned or "?"
+
+
+def _fmt_keep_bytes(n):
+    n = int(n or 0)
+    if n < 1024:
+        return "%d B" % n
+    kb = n / 1024.0
+    if abs(kb - round(kb)) < 0.05:
+        return "%d KB" % int(round(kb))
+    return "%.1f KB" % kb
+
+
+def keep_summary(rec):
+    """Current encoding for the keep row, e.g. ``keep: JPEG (DCT) RGB 8bpc, 412 KB``."""
+    filt = rec.get("filter_name") or "none"
+    names = {
+        "DCT": "JPEG (DCT)",
+        "JPX": "JPEG2000 (JPX)",
+        "CCITT": "CCITT",
+        "JBIG2": "JBIG2",
+        "Flate": "Flate",
+        "LZW": "LZW",
+        "RL": "RunLength",
+        "none": "uncompressed",
+    }
+    filt_s = names.get(filt, filt)
+    cs = rec.get("colorspace_text") or rec.get("colorspace") or ""
+    try:
+        bpc = int(rec.get("bpc") or 0)
+    except (TypeError, ValueError):
+        bpc = 0
+    indexed = rec.get("indexed_colors")
+    if not indexed and "INDEXED" in cs.upper():
+        indexed = None
+    if indexed or "INDEXED" in cs.upper():
+        body = "indexed %d colors" % int(indexed) if indexed else "indexed"
+    elif filt in ("CCITT", "JBIG2") or (bpc <= 1 and _short_space(cs) == "Gray"):
+        body = "1bpp"
+    else:
+        body = "%s %dbpc" % (_short_space(cs), bpc or 8)
+    return "keep: %s %s, %s" % (filt_s, body, _fmt_keep_bytes(rec.get("bytes")))
+
+
 def _describe_image(rec):
     ppi_s = rec.get("ppi_text") or "dpi ?"
     masks = []
@@ -1165,6 +1218,12 @@ def _describe_image(rec):
     rec["target_text"] = "%s  %s%s  %s → %s  %s" % (
         label, codec, err, _fmt_bytes(rec.get("bytes")),
         _fmt_bytes(rep), pct_s)
+    rec["keep_text"] = keep_summary(rec)
+    for cand in rec.get("candidates") or []:
+        if cand.get("id") == "keep":
+            cand["label"] = rec["keep_text"]
+            cand["error_mae"] = 0.0
+            cand["error_max"] = 0
 
 
 def apply_chosen_target(data, xref, fields):

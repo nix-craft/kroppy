@@ -663,7 +663,11 @@ def test_target_combo_updates_row(window, tmp_path, qapp):
     combo = w.analysisPanel.tree.itemWidget(child, 2)
     assert combo is not None
     labels = [combo.itemText(i) for i in range(combo.count())]
-    assert any("1ch 1bpp" in text and "(over)" in text for text in labels)
+    assert any("1ch 1bpp" in text and "over limit" in text for text in labels)
+    keep = combo.findData("keep")
+    assert keep >= 0
+    assert combo.itemText(keep).startswith("keep:")
+    assert "mae 0" in combo.itemText(keep)
     assert combo.currentData() == "gray-2"
     # gray-4 is under the threshold but was not encoded yet.
     index = combo.findData("gray-4")
@@ -697,6 +701,91 @@ def test_shared_image_row_appears_before_later_page(window, qapp):
     assert row.childCount() == 1
     assert "xref 9" in row.child(0).text(1)
     assert "p1, p3" in row.child(0).toolTip(1)
+
+
+def test_keep_summary_names_the_current_encoding():
+    from krop.analyze import keep_summary
+    assert keep_summary({
+        "filter_name": "DCT", "colorspace_text": "DeviceRGB", "bpc": 8, "bytes": 421888,
+    }) == "keep: JPEG (DCT) RGB 8bpc, 412 KB"
+    assert keep_summary({
+        "filter_name": "CCITT", "colorspace_text": "DeviceGray", "bpc": 1, "bytes": 38 * 1024,
+    }) == "keep: CCITT 1bpp, 38 KB"
+    assert keep_summary({
+        "filter_name": "Flate", "colorspace_text": "Indexed DeviceRGB",
+        "indexed_colors": 16, "bpc": 8, "bytes": 1200,
+    }) == "keep: Flate indexed 16 colors, 1.2 KB"
+
+
+def test_combo_pending_label_updates_while_popup_is_open(window, qapp):
+    """measuring… is replaced even if the dropdown is open, and a rebuild does not restore it."""
+    from krop.qt import Qt
+    panel = window.analysisPanel
+    panel.show()
+    qapp.processEvents()
+    assert "measuring…" in panel.legend.text()
+    assert "orange" in panel.legend.text()
+    image = {
+        "xref": 5, "page": 1, "pages": [1], "share_key": "x5",
+        "detail": "xref 5", "target": "gray-2", "chosen_target": "gray-2",
+        "recommended_target": "gray-2", "target_text": "1ch 2bpp",
+        "filter_name": "DCT", "colorspace_text": "DeviceRGB", "bpc": 8,
+        "bytes": 421888, "keep_text": "keep: JPEG (DCT) RGB 8bpc, 412 KB",
+        "candidates": [
+            {"id": "gray-2", "label": "1ch 2bpp", "over": False,
+             "error_mae": 0.0, "est_bytes": 100, "savings_pct": 50},
+            {"id": "jpeg-45", "label": "3ch 24bpp JPEG q45", "pending": True, "over": False},
+            {"id": "1bpp", "label": "1ch 1bpp", "over": True,
+             "error_mae": 7.2, "est_bytes": 40, "savings_pct": 90},
+            {"id": "keep", "label": "keep: JPEG (DCT) RGB 8bpc, 412 KB",
+             "over": False, "error_mae": 0, "est_bytes": 421888},
+        ],
+    }
+    page = {"page": 1, "images": [image], "label": "COLOR", "target": "color",
+            "image_count": 1, "blocker_count": 0, "image_bytes": 421888,
+            "image_est": 100, "savings_pct": 50}
+    panel.begin(1)
+    panel.add_page(page)
+    qapp.processEvents()
+    child = panel.tree.topLevelItem(0).child(0)
+    combo = panel.tree.itemWidget(child, 2)
+    jpeg = combo.findData("jpeg-45")
+    one = combo.findData("1bpp")
+    keep = combo.findData("keep")
+    assert "measuring…" in combo.itemText(jpeg)
+    assert combo.itemText(jpeg).count("…") == 1
+    limit = panel.error_threshold()
+    shown = str(int(limit)) if abs(limit - round(limit)) < 1e-6 else ("%g" % limit)
+    assert ("mae 7.2 > %s (over limit)" % shown) in combo.itemText(one)
+    assert combo.itemText(keep).startswith("keep: JPEG (DCT) RGB 8bpc, 412 KB")
+    assert "mae 0" in combo.itemText(keep)
+    try:
+        tip_role = Qt.ItemDataRole.ToolTipRole
+    except AttributeError:
+        tip_role = Qt.ToolTipRole
+    assert "measuring…" in combo.itemData(jpeg, tip_role)
+    assert "over the limit" in combo.itemData(one, tip_role)
+    combo.showPopup()
+    qapp.processEvents()
+    image["candidates"][1] = {
+        "id": "jpeg-45", "label": "3ch 24bpp JPEG q45", "pending": False, "over": True,
+        "error_mae": 7.2, "error_max": 40, "est_bytes": 5000, "savings_pct": 80, "codec": "DCT",
+    }
+    panel._refresh_image_texts(panel.tree.topLevelItem(0), image)
+    qapp.processEvents()
+    text = combo.itemText(jpeg)
+    assert "measuring" not in text
+    assert "over limit" in text
+    model = combo.model()
+    shown_in_popup = model.data(model.index(jpeg, 0))
+    assert "measuring" not in shown_in_popup
+    assert "over limit" in shown_in_popup
+    combo.hidePopup()
+    # Rebuilding the row uses the filled candidate, not the old ellipsis.
+    panel._fill_row(panel.tree.topLevelItem(0), page)
+    qapp.processEvents()
+    combo = panel.tree.itemWidget(panel.tree.topLevelItem(0).child(0), 2)
+    assert "measuring" not in combo.itemText(combo.findData("jpeg-45"))
 
 
 def test_heavy_ladder_is_pending_until_filled(tmp_path):

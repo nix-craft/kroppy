@@ -231,6 +231,10 @@ class AnalysisPanel(QDockWidget):
         self.tree.itemPressed.connect(self._on_clicked)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.tree)
+        self.legend = QLabel("orange = error over limit; measuring… = size still being computed")
+        self.legend.setObjectName("analysisLegend")
+        self.legend.setWordWrap(True)
+        layout.addWidget(self.legend)
         self.setWidget(body)
 
     def set_running(self, name):
@@ -551,15 +555,9 @@ class AnalysisPanel(QDockWidget):
         candidates = list(im.get("candidates") or [])
         if not any(c.get("id") == "keep" for c in candidates):
             candidates.append({"id": "keep", "label": "keep", "over": False})
-        try:
-            role = Qt.ItemDataRole.ForegroundRole
-        except AttributeError:
-            role = Qt.ForegroundRole
-        warn = QBrush(QColor(160, 70, 0))
         for cand in candidates:
-            combo.addItem(_candidate_label(cand), cand.get("id"))
-            if cand.get("over"):
-                combo.setItemData(combo.count() - 1, warn, role)
+            combo.addItem(_candidate_label(cand, im, self.error_threshold()), cand.get("id"))
+            self._style_combo_row(combo, combo.count() - 1, cand, im)
         share = im.get("share_key") or ""
         chosen = self._choices.get(share) or self._choices.get(str(im.get("xref")))
         chosen = chosen or im.get("chosen_target") or im.get("recommended_target") or im.get("target")
@@ -567,6 +565,7 @@ class AnalysisPanel(QDockWidget):
         index = combo.findData(chosen)
         if index >= 0:
             combo.setCurrentIndex(index)
+            self._style_combo_row(combo, index, candidates[index], im)
         combo.blockSignals(False)
         combo.setProperty("xref", im.get("xref"))
         combo.setProperty("share", share)
@@ -731,14 +730,33 @@ class AnalysisPanel(QDockWidget):
             combo.blockSignals(True)
             for index in range(combo.count()):
                 cand = by_id.get(combo.itemData(index))
-                if cand is not None:
-                    combo.setItemText(index, _candidate_label(cand))
+                if cand is None:
+                    continue
+                combo.setItemText(index, _candidate_label(cand, im, self.error_threshold()))
+                self._style_combo_row(combo, index, cand, im)
             chosen = im.get("chosen_target") or im.get("target")
             index = combo.findData(chosen)
             if index >= 0 and combo.currentIndex() != index:
                 combo.setCurrentIndex(index)
             combo.blockSignals(False)
+            _refresh_open_popup(combo)
             return
+
+    def _style_combo_row(self, combo, index, cand, im):
+        try:
+            fg = Qt.ItemDataRole.ForegroundRole
+            tip_role = Qt.ItemDataRole.ToolTipRole
+        except AttributeError:
+            fg = Qt.ForegroundRole
+            tip_role = Qt.ToolTipRole
+        if cand.get("over"):
+            combo.setItemData(index, QBrush(QColor(160, 70, 0)), fg)
+        else:
+            combo.setItemData(index, None, fg)
+        tip = _candidate_tip(cand, im, self.error_threshold())
+        combo.setItemData(index, tip, tip_role)
+        if combo.currentIndex() == index:
+            combo.setToolTip(tip)
 
     def follow_page(self, page):
         """Select the row for this 1-based page. Does not change the viewer."""
@@ -852,27 +870,87 @@ class AnalysisPanel(QDockWidget):
         self._on_clicked(item, _column)
 
 
-def _candidate_label(cand):
-    """Dropdown text: structure, mean error, estimated size, and savings."""
+def _limit_text(limit):
+    if limit is None:
+        return None
+    value = float(limit)
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return "%g" % value
+
+
+def _candidate_label(cand, image=None, limit=None):
+    """Dropdown text: structure, error, size, and why a row is orange or unfinished."""
+    if cand.get("id") == "keep":
+        text = ""
+        if image is not None and image.get("keep_text"):
+            text = image.get("keep_text")
+        elif cand.get("label") and str(cand.get("label")).startswith("keep:"):
+            text = cand.get("label")
+        else:
+            text = "keep"
+        if "mae" not in text:
+            text += "  mae 0"
+        return text
     label = cand.get("label") or cand.get("id") or ""
+    if cand.get("pending"):
+        return "%s  measuring…" % label
     bits = [label]
-    if cand.get("error_mae") is not None:
+    if cand.get("error_mae") is not None and not cand.get("over"):
         bits.append("mae %.1f" % float(cand["error_mae"]))
     if cand.get("est_bytes") is not None:
         bits.append(_fmt_bytes(cand["est_bytes"]))
     pct = cand.get("savings_pct")
-    if pct is not None:
+    if pct is not None and not cand.get("over"):
         pct = float(pct)
         if pct > 0.5:
             bits.append("%.0f%% smaller" % pct)
         elif pct < -0.5:
             bits.append("%.0f%% larger" % (-pct))
-    text = "  ".join(bits)
-    if cand.get("pending"):
-        text += "  …"
     if cand.get("over"):
-        text += "  (over)"
-    return text
+        mae = cand.get("error_mae")
+        shown = _limit_text(limit)
+        if mae is not None and shown is not None:
+            bits.append("mae %.1f > %s (over limit)" % (float(mae), shown))
+        elif mae is not None:
+            bits.append("mae %.1f (over limit)" % float(mae))
+        else:
+            bits.append("over limit")
+    return "  ".join(bits)
+
+
+def _candidate_tip(cand, image=None, limit=None):
+    shown = _limit_text(limit)
+    if cand.get("id") == "keep":
+        return "Original encoding, mean error 0. " + _candidate_label(cand, image, limit)
+    if cand.get("pending"):
+        return "measuring… means the size and error are still being computed."
+    if cand.get("over"):
+        mae = cand.get("error_mae")
+        if mae is not None and shown is not None:
+            return "Orange because mae %.1f is over the limit of %s. You can still choose it." % (float(mae), shown)
+        return "Orange because the error is over the limit. You can still choose it."
+    return _candidate_label(cand, image, limit)
+
+
+def _refresh_open_popup(combo):
+    """Push new labels into a combo whose popup is already open."""
+    view = combo.view()
+    model = combo.model()
+    if model is not None and model.rowCount():
+        try:
+            top = model.index(0, 0)
+            bottom = model.index(model.rowCount() - 1, 0)
+            model.dataChanged.emit(top, bottom)
+        except Exception:
+            pass
+    if view is not None:
+        if view.isVisible():
+            view.reset()
+        view.viewport().update()
+    current = combo.currentIndex()
+    if current >= 0:
+        combo.setCurrentIndex(current)
 
 
 def _fmt_bytes(n):
