@@ -318,6 +318,11 @@ class MainWindow(QMainWindow):
             self.ui.checkGhostscript.setEnabled(False)
 
         self.ui.documentView.setScene(self.pdfScene)
+        try:
+            smooth = QPainter.RenderHint.SmoothPixmapTransform
+        except AttributeError:
+            smooth = QPainter.SmoothPixmapTransform
+        self.ui.documentView.setRenderHint(smooth, True)
         self.ui.documentView.setFocus()
 
 

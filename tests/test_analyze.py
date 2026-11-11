@@ -764,7 +764,7 @@ def test_combo_pending_label_updates_while_popup_is_open(window, qapp):
     except AttributeError:
         tip_role = Qt.ToolTipRole
     assert "measuring…" in combo.itemData(jpeg, tip_role)
-    assert "over the limit" in combo.itemData(one, tip_role)
+    assert "over limit" in combo.itemData(one, tip_role)
     combo.showPopup()
     qapp.processEvents()
     image["candidates"][1] = {
@@ -1051,3 +1051,86 @@ def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypat
     assert current_page() is not None
     assert w.viewer.currentPageIndex == int(current_page()) - 1
     assert len(nav) <= 1
+
+
+def _false_comparisons(text):
+    import re
+    bad = []
+    for left, right in re.findall(r"([0-9]+(?:\.[0-9]+)?) > ([0-9]+(?:\.[0-9]+)?)", text):
+        if float(left) <= float(right):
+            bad.append((left, right))
+    return bad
+
+
+def test_over_limit_label_names_the_test_that_failed():
+    from krop.analyzepanel import _candidate_label
+    # Mean is under the limit; only the percentile tail fails. Do not print "mae 3 > 4".
+    cand = {
+        "id": "jpeg-85", "label": "3ch 24bpp JPEG q85", "over": True,
+        "error_mae": 3.0, "error_p995": 40.0, "error_max": 212,
+    }
+    text = _candidate_label(cand, limit=4)
+    assert "p99.5 40.0 > 16" in text
+    assert "mae 3.0 > 4" not in text
+    assert _false_comparisons(text) == []
+    both = {
+        "id": "jpeg-45", "label": "3ch 24bpp JPEG q45", "over": True,
+        "error_mae": 7.2, "error_p995": 30.0, "error_max": 200,
+    }
+    text = _candidate_label(both, limit=4)
+    assert "mae 7.2 > 4" in text
+    assert "p99.5" in text
+    assert _false_comparisons(text) == []
+    fine = {
+        "id": "gray-4", "label": "1ch 4bpp", "over": False,
+        "error_mae": 1.0, "error_p995": 4.0, "error_max": 200,
+    }
+    assert "over limit" not in _candidate_label(fine, limit=4)
+    assert _false_comparisons(_candidate_label(fine, limit=4)) == []
+
+
+def test_target_combo_popup_scrolls(qapp):
+    from krop.analyzepanel import _scrollable_combo
+    from krop.qt import QComboBox, QListView
+    try:
+        from PyQt6.QtCore import QPoint, QPointF, Qt
+        from PyQt6.QtGui import QWheelEvent
+        from PyQt6.QtWidgets import QWidget
+    except ImportError:
+        from PyQt5.QtCore import QPoint, QPointF, Qt
+        from PyQt5.QtGui import QWheelEvent
+        from PyQt5.QtWidgets import QWidget
+    host = QWidget()
+    host.resize(400, 80)
+    combo = QComboBox(host)
+    _scrollable_combo(combo)
+    for i in range(40):
+        combo.addItem("choice %d" % i, i)
+    host.show()
+    qapp.processEvents()
+    assert combo.maxVisibleItems() == 15
+    assert isinstance(combo.view(), QListView)
+    assert "combobox-popup: 0" in combo.styleSheet()
+    combo.showPopup()
+    qapp.processEvents()
+    view = combo.view()
+    bar = view.verticalScrollBar()
+    assert bar.maximum() > 0
+    before = bar.value()
+    bar.setValue(bar.maximum())
+    qapp.processEvents()
+    assert bar.value() > before
+    center = view.viewport().rect().center()
+    assert view.indexAt(center).row() > 10
+    # Wheel moves the same scrollbar.
+    bar.setValue(0)
+    local = QPointF(center)
+    global_pos = QPointF(view.viewport().mapToGlobal(QPoint(center.x(), center.y())))
+    buttons = Qt.MouseButton.NoButton if hasattr(Qt, "MouseButton") else Qt.NoButton
+    mods = Qt.KeyboardModifier.NoModifier if hasattr(Qt, "KeyboardModifier") else Qt.NoModifier
+    phase = Qt.ScrollPhase.NoScrollPhase if hasattr(Qt, "ScrollPhase") else Qt.ScrollUpdate
+    event = QWheelEvent(local, global_pos, QPoint(0, 0), QPoint(0, -120), buttons, mods, phase, False)
+    qapp.sendEvent(view.viewport(), event)
+    qapp.processEvents()
+    assert bar.value() > 0
+    combo.hidePopup()

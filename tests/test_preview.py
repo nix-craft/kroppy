@@ -115,12 +115,72 @@ def test_rotated_preview_matches_the_mapped_corners():
     doc.close()
 
 
+def test_three_color_preview_stays_full_resolution_and_near_lossless():
+    """A flat blue/black/white picture palettizes cleanly. The preview is not a tiny nearest upsample."""
+    from krop.imagetarget import _mae_max, reconstruct
+    from krop.preview import limit_edge, preview_rgba
+    height, width = 1200, 1600
+    arr = np.zeros((height, width, 3), np.uint8)
+    arr[:] = (255, 255, 255)
+    arr[:500] = (0, 0, 180)
+    arr[500:900] = (0, 0, 0)
+    arr[120:180, 200:900] = (255, 255, 255)
+    arr[600:680, 300:700] = (0, 0, 180)
+    for target, mae_lim in (("indexed-4", 1.0), ("indexed-8", 1.0), ("indexed-16", 1.0)):
+        got = reconstruct(arr, target)
+        assert got.shape == arr.shape
+        mae, p995, _mx = _mae_max(arr, got)
+        assert mae < mae_lim, (target, mae, p995)
+        assert p995 < 8, (target, p995)
+    gray = reconstruct(arr, "gray-2")
+    assert gray.shape == arr.shape
+    gray_mae, _p, _m = _mae_max(arr, gray)
+    assert gray_mae < 25, gray_mae
+    jpg = reconstruct(arr, "jpeg-85")
+    assert jpg.shape == arr.shape
+    jpg_mae, _p, _m = _mae_max(arr, jpg)
+    assert jpg_mae < 12, jpg_mae
+    # Embedding and previewing must not collapse the picture below the on-screen size.
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=500)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, width, height, np.ascontiguousarray(arr).tobytes(), False)
+    xref = page.insert_image(page.rect, pixmap=pix)
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    doc.save(path)
+    doc.close()
+    try:
+        full = preview_rgba(path, xref, "indexed-4", max_edge=None)
+        assert full.shape[0] == height and full.shape[1] == width
+        mae, p995, _mx = _mae_max(arr, full[:, :, :3])
+        assert mae < 1.0, mae
+        shown = preview_rgba(path, xref, "indexed-4", max_edge=900)
+        assert max(shown.shape[0], shown.shape[1]) >= 900
+        assert max(shown.shape[0], shown.shape[1]) <= max(height, width)
+        tiny = limit_edge(arr, 32)
+        assert max(tiny.shape[:2]) == 32
+    finally:
+        os.remove(path)
+
+
 def test_limit_edge_shrinks_a_large_preview_source():
     from krop.preview import limit_edge
     arr = np.zeros((100, 400, 3), np.uint8)
     out = limit_edge(arr, 80)
     assert max(out.shape[:2]) == 80
     assert limit_edge(arr, 1000).shape == arr.shape
+
+
+def test_limit_edge_area_averages_instead_of_nearest():
+    """A checkerboard must blur. Nearest would keep solid black or white blocks."""
+    from krop.preview import limit_edge
+    arr = np.zeros((8, 8, 3), np.uint8)
+    arr[0::2, 1::2] = 255
+    arr[1::2, 0::2] = 255
+    out = limit_edge(arr, 2)
+    assert out.shape[:2] == (2, 2)
+    assert 64 < float(out.mean()) < 192
 
 
 def test_soft_mask_stays_transparent(tmp_path):

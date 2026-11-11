@@ -2,12 +2,16 @@
 """Smallest image encoding whose error stays under a threshold.
 
 The error metric is the mean absolute error (MAE) of decoded samples on a
-0-255 scale. The maximum absolute error is measured on the same pixels and
-reported beside the mean. A candidate is acceptable when
+0-255 scale. A single outlier pixel is not treated as a hard failure: JPEG
+and palette encodings always have a few pixels far from the original, so the
+tail is the 99.5th percentile of absolute error, not the maximum. A candidate
+is acceptable when
 
-    MAE <= threshold  and  max error <= max(16, threshold * 4).
+    MAE <= threshold  and  p99.5 error <= max(16, threshold * 4).
 
-The default threshold is 4, so the maximum allowed error is 16. Pixels of a
+The default threshold is 4, so the percentile limit is 16. The true maximum
+is still recorded as error_max, but it does not mark the row over the limit.
+Pixels of a
 large image are strided down to about 200 000 samples for this search; the
 stride is regular, so thin features still contribute to the mean. Candidates
 are tried from smallest to largest and the search stops at the first one
@@ -46,11 +50,15 @@ def _sample(arr, limit=_SAMPLE_PIXELS):
 
 
 def _mae_max(original, quantized):
+    """Return (mae, p99.5, true max) of absolute error on a 0-255 scale."""
     import numpy as np
     diff = np.abs(original.astype(np.int16) - quantized.astype(np.int16))
     if diff.size == 0:
-        return 0.0, 0
-    return float(diff.mean()), int(diff.max())
+        return 0.0, 0.0, 0
+    mae = float(diff.mean())
+    # One wild pixel must not fail a palette or JPEG. p99.5 is the tail we gate on.
+    p995 = float(np.percentile(diff, 99.5))
+    return mae, p995, int(diff.max())
 
 
 def _quantize_gray(y, bpp):
@@ -455,12 +463,12 @@ def _eval_target(viewed, target_id, filt, full_pixels, stored, threshold, max_ok
         est, codec = _indexed_est(recon, scale)
     else:
         return None
-    mae, mx = _error_against(viewed, recon)
-    over = mae > threshold or mx > max_ok
-    return _entry(tid, mae, mx, over, est, codec, stored)
+    mae, p995, mx = _error_against(viewed, recon)
+    over = mae > threshold or p995 > max_ok
+    return _entry(tid, mae, p995, mx, over, est, codec, stored)
 
 
-def _entry(target_id, mae, mx, over, est, codec, stored):
+def _entry(target_id, mae, p995, mx, over, est, codec, stored):
     est_i = None if est is None else int(est)
     pct = None
     if est_i is not None and stored:
@@ -472,6 +480,7 @@ def _entry(target_id, mae, mx, over, est, codec, stored):
         "label": notation(target_id),
         "over": bool(over),
         "error_mae": None if mae is None else round(float(mae), 2),
+        "error_p995": None if p995 is None else round(float(p995), 2),
         "error_max": None if mx is None else int(mx),
         "est_bytes": est_i,
         "codec": codec,
@@ -479,13 +488,14 @@ def _entry(target_id, mae, mx, over, est, codec, stored):
     }
 
 
-def _result(target, mae, mx, est, stored, codec, bpp=None):
+def _result(target, mae, p995, mx, est, stored, codec, bpp=None):
     stored = int(stored or 0)
     est = int(est or 0)
     pct = 0.0 if stored <= 0 else (stored - est) * 100.0 / stored
     return {
         "target": target,
         "error_mae": round(float(mae), 2),
+        "error_p995": round(float(p995), 2),
         "error_max": int(mx),
         "error_metric": "mae",
         "est_bytes": est,
@@ -497,12 +507,13 @@ def _result(target, mae, mx, est, stored, codec, bpp=None):
 
 
 def _keep(stored, filt):
-    return _result("keep", 0.0, 0, stored, stored, filt or "keep", None)
+    return _result("keep", 0.0, 0.0, 0, stored, stored, filt or "keep", None)
 
 
 def _finish(chosen, candidates, stored, filt, bpp):
     out = _result(
-        chosen["id"], chosen.get("error_mae") or 0, chosen.get("error_max") or 0,
+        chosen["id"], chosen.get("error_mae") or 0, chosen.get("error_p995") or 0,
+        chosen.get("error_max") or 0,
         chosen.get("est_bytes") if chosen.get("est_bytes") is not None else stored,
         stored, chosen.get("codec") or filt or "keep", bpp)
     out["recommended_target"] = chosen["id"]
@@ -552,16 +563,16 @@ def recommend(sample, kind, bpc, filt, threshold, width, height, stored_bytes, d
     stored = int(stored_bytes or 0)
     filt = filt or ""
     if sample is None or kind in ("undecodable", "bilevel"):
-        keep = _entry("keep", 0, 0, False, stored, filt or "keep", stored)
+        keep = _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
         candidates = []
         for tid in ladder_ids("bilevel" if kind == "bilevel" else kind, bpc, filt):
             if tid == "keep":
                 continue
-            candidates.append(_entry(tid, 0 if tid in ("1bpp", "jbig2") else None,
-                                      0 if tid in ("1bpp", "jbig2") else None,
-                                      False, stored if tid == "1bpp" and filt in ("CCITT", "JBIG2") else None,
-                                      filt if tid == "1bpp" and filt in ("CCITT", "JBIG2") else None,
-                                      stored))
+            known = tid in ("1bpp", "jbig2")
+            candidates.append(_entry(
+                tid, 0 if known else None, 0 if known else None, 0 if known else None,
+                False, stored if tid == "1bpp" and filt in ("CCITT", "JBIG2") else None,
+                filt if tid == "1bpp" and filt in ("CCITT", "JBIG2") else None, stored))
         candidates.append(keep)
         if kind == "bilevel" and filt in ("CCITT", "JBIG2"):
             return _finish(keep, candidates, stored, filt, 1)
@@ -573,14 +584,14 @@ def recommend(sample, kind, bpc, filt, threshold, width, height, stored_bytes, d
         if tid == "keep":
             continue
         if defer_heavy and _is_heavy(tid):
-            pending = _entry(tid, None, None, False, None, None, stored)
+            pending = _entry(tid, None, None, None, False, None, None, stored)
             pending["pending"] = True
             candidates.append(pending)
             continue
         entry = _eval_target(viewed, tid, filt, full_pixels, stored, threshold, max_ok)
         if entry is not None:
             candidates.append(entry)
-    keep = _entry("keep", 0, 0, False, stored, filt or "keep", stored)
+    keep = _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
     candidates.append(keep)
     chosen = choose_smallest(candidates, stored) or keep
     return _finish(chosen, candidates, stored, filt, _bpp_of(chosen["id"]))
@@ -647,7 +658,7 @@ def encode_file_image(path, xref, target_id, stored_bytes, filt):
         doc.close()
     stored = int(stored_bytes or 0)
     if target_id == "keep":
-        return _entry("keep", 0, 0, False, stored, filt or "keep", stored)
+        return _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
     viewed, _step = _sample(arr)
     full_pixels = max(1, int(width) * int(height))
     threshold, max_ok = _limit(DEFAULT_ERROR_MAE)

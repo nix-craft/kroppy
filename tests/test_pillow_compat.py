@@ -54,3 +54,23 @@ def test_indexed_quantize_without_pillow_91_enums(monkeypatch):
     dithered, ok_d = _indexed(arr, 4, dither=True)
     assert ok_d
     assert dithered.shape == arr.shape
+
+    # Image.NONE is 0, which is also NEAREST. The preview resampler must not
+    # pass that into resize when the Resampling enum is missing. Pillow 13's
+    # own resize looks up Resampling by name, so record the argument instead.
+    from krop.preview import _resize_box
+    seen = {}
+
+    def fake_resize(self, size, resample=None, *args, **kwargs):
+        seen["resample"] = resample
+        seen["size"] = size
+        bands = len(self.getbands())
+        shape = (size[1], size[0]) if bands == 1 else (size[1], size[0], bands)
+        return Image.fromarray(np.zeros(shape, np.uint8))
+
+    monkeypatch.setattr(Image.Image, "resize", fake_resize)
+    board = np.zeros((8, 8, 3), np.uint8)
+    _resize_box(board, 2, 2)
+    assert seen["size"] == (2, 2)
+    assert seen["resample"] == Image.BOX
+    assert seen["resample"] not in (0, Image.NONE, Image.NEAREST)

@@ -120,7 +120,7 @@ def _run_queued(payload):
         from krop.preview import preview_rgba
         return preview_rgba(
             payload["path"], payload["xref"], payload["target"], payload.get("rotation") or 0,
-            payload.get("max_edge") or 1600)
+            payload.get("max_edge"))
     return None
 
 
@@ -478,17 +478,27 @@ class AnalysisPanel(QDockWidget):
         self._wake.set()
 
     def _preview_edge(self, xref):
+        """On-screen pixels of this image at the current zoom. None means full resolution."""
+        import math
         viewer = getattr(self.parent(), "viewer", None)
         if viewer is None:
-            return 1600
+            return None
         try:
             rects = viewer.imagePlacementRects(int(xref))
         except Exception:
-            rects = []
-        edge = 0
+            return None
+        edge = 0.0
         for rect in rects or []:
-            edge = max(edge, int(rect[2]), int(rect[3]))
-        return edge or 1600
+            edge = max(edge, float(rect[2]), float(rect[3]))
+        if edge <= 0:
+            return None
+        scale = 1.0
+        scene = viewer.scene() if hasattr(viewer, "scene") else None
+        if scene is not None:
+            for view in scene.views():
+                tr = view.transform()
+                scale = max(scale, abs(tr.m11()), abs(tr.m22()))
+        return max(1, int(math.ceil(edge * scale)))
 
     def _start_p0(self, payload):
         job = _P0Job(payload)
@@ -761,9 +771,14 @@ class AnalysisPanel(QDockWidget):
             return
         limit = float(self.error_threshold())
         mae = result.get("error_mae")
-        mx = result.get("error_max") or 0
+        p995 = result.get("error_p995")
         try:
-            over = mae is not None and (float(mae) > limit or float(mx) > max(16.0, limit * 4.0))
+            tail = max(16.0, limit * 4.0)
+            over = False
+            if mae is not None and float(mae) > limit:
+                over = True
+            if p995 is not None and float(p995) > tail:
+                over = True
         except (TypeError, ValueError):
             over = False
         fields = dict(result)
@@ -999,6 +1014,7 @@ class AnalysisPanel(QDockWidget):
     def _install_combo(self, child, im):
         combo = QComboBox()
         combo.setObjectName("imageTarget")
+        _scrollable_combo(combo)
         candidates = list(im.get("candidates") or [])
         if not any(c.get("id") == "keep" for c in candidates):
             candidates.append({"id": "keep", "label": "keep", "over": False})
@@ -1322,6 +1338,38 @@ class AnalysisPanel(QDockWidget):
         self._on_clicked(item, _column)
 
 
+def _over_phrase(cand, limit):
+    """Name the test that actually failed. Never claim a > b when a is not greater."""
+    parts = []
+    try:
+        mae_lim = float(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        mae_lim = None
+    tail = None if mae_lim is None else max(16.0, mae_lim * 4.0)
+    mae = cand.get("error_mae")
+    if mae is not None and mae_lim is not None and float(mae) > mae_lim:
+        parts.append("mae %.1f > %s" % (float(mae), _limit_text(mae_lim)))
+    p995 = cand.get("error_p995")
+    if p995 is not None and tail is not None and float(p995) > tail:
+        parts.append("p99.5 %.1f > %s" % (float(p995), _limit_text(tail)))
+    if not parts:
+        return "over limit"
+    return " and ".join(parts) + " (over limit)"
+
+
+def _scrollable_combo(combo):
+    """A short list with a scrollbar. Native macOS/Fusion popups ignore maxVisibleItems."""
+    view = QListView()
+    try:
+        scroll = Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    except AttributeError:
+        scroll = Qt.ScrollBarAsNeeded
+    view.setVerticalScrollBarPolicy(scroll)
+    combo.setView(view)
+    combo.setMaxVisibleItems(15)
+    combo.setStyleSheet("QComboBox { combobox-popup: 0; }")
+
+
 def _limit_text(limit):
     if limit is None:
         return None
@@ -1362,14 +1410,7 @@ def _candidate_label(cand, image=None, limit=None):
         elif pct < -0.5:
             bits.append("%.0f%% larger" % (-pct))
     if cand.get("over"):
-        mae = cand.get("error_mae")
-        shown = _limit_text(limit)
-        if mae is not None and shown is not None:
-            bits.append("mae %.1f > %s (over limit)" % (float(mae), shown))
-        elif mae is not None:
-            bits.append("mae %.1f (over limit)" % float(mae))
-        else:
-            bits.append("over limit")
+        bits.append(_over_phrase(cand, limit))
     return "  ".join(bits)
 
 
@@ -1384,10 +1425,9 @@ def _candidate_tip(cand, image=None, limit=None):
     if cand.get("pending"):
         return "measuring… means the size and error are still being computed."
     if cand.get("over"):
-        mae = cand.get("error_mae")
-        if mae is not None and shown is not None:
-            return "Orange because mae %.1f is over the limit of %s. You can still choose it." % (float(mae), shown)
-        return "Orange because the error is over the limit. You can still choose it."
+        return ("Orange because %s. The limit is the mean and the 99.5th percentile "
+                "of absolute error, not the single worst pixel. You can still choose it."
+                % _over_phrase(cand, limit))
     return _candidate_label(cand, image, limit)
 
 

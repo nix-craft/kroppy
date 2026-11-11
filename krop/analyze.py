@@ -766,7 +766,7 @@ def _colorspace_text(doc, xref, fallback):
 
 
 _TARGET_KEYS = (
-    "kind", "levels", "photo", "suggested_bpp", "target", "error_mae", "error_max",
+    "kind", "levels", "photo", "suggested_bpp", "target", "error_mae", "error_p995", "error_max",
     "error_metric", "est_bytes", "rep_bytes", "codec", "savings_pct", "copier_ccitt",
     "recommended_target", "chosen_target", "target_label", "candidates",
 )
@@ -1221,7 +1221,9 @@ def _describe_image(rec):
     rec["link_tip"] = "Used on %s (%d placement(s))" % (page_s or "this page", link_placements)
     mae = rec.get("error_mae")
     err = ""
-    if mae is not None:
+    if mae is not None and rec.get("error_p995") is not None:
+        err = "  mae %.1f  p99.5 %.1f" % (float(mae), float(rec.get("error_p995")))
+    elif mae is not None:
         err = "  mae %.1f  max %d" % (float(mae), int(rec.get("error_max") or 0))
     pct = rec.get("savings_pct")
     if pct is None:

@@ -105,8 +105,26 @@ def load_image(path, xref):
         doc.close()
 
 
+def _resize_box(arr, height, width):
+    """Area downsample. Never nearest: Pillow's NEAREST is 0, and so is Image.NONE."""
+    from PIL import Image
+    from krop.imagetarget import pil_const
+    resample = pil_const(Image, "Resampling", "BOX", getattr(Image, "BOX", 4))
+    if int(resample) == 0:
+        resample = getattr(Image, "BOX", 4)
+    mode = "L" if arr.ndim == 2 else "RGB"
+    data = arr if arr.ndim == 2 else np.ascontiguousarray(arr[..., :3])
+    image = Image.fromarray(np.ascontiguousarray(data), mode)
+    out = image.resize((int(width), int(height)), resample)
+    return np.asarray(out)
+
+
 def limit_edge(arr, max_edge):
-    """Shrink an array so its longer side is at most max_edge pixels."""
+    """Shrink so the longer side equals max_edge. Smaller images are left alone.
+
+    The floor is the on-screen size. Shrinking further and stretching back
+    with nearest-neighbor is what painted giant squares.
+    """
     if arr is None or not max_edge:
         return arr
     height, width = arr.shape[:2]
@@ -114,15 +132,15 @@ def limit_edge(arr, max_edge):
     if edge <= int(max_edge):
         return arr
     scale = float(max_edge) / float(edge)
-    return _resize_nearest(arr, max(1, int(round(height * scale))), max(1, int(round(width * scale))))
+    return _resize_box(arr, max(1, int(round(height * scale))), max(1, int(round(width * scale))))
 
 
-def preview_rgba(path, xref, target_id, rotation=0, max_edge=1600):
+def preview_rgba(path, xref, target_id, rotation=0, max_edge=None):
     """Quantized RGBA for one image, oriented for the page rotation.
 
-    Large images are reduced to about the size they occupy on screen before
-    the encode, so one chosen target does not resample a full print-resolution
-    scan.
+    max_edge is the on-screen size of the placement at the current zoom.
+    The source is never reduced below that, and error/size measurements do
+    not use this image at all.
     """
     color, alpha = load_image(path, xref)
     color = limit_edge(color, max_edge)
