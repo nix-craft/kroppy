@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pymupdf
 
-from krop.imagetarget import _mae_max, dither_supported, encode_file_image, reconstruct
+from krop.imagetarget import _mae_max, encode_file_image, reconstruct
 from krop.pdfimage import MIN_PYMUPDF, WorkingCopy, cached_encoded, pymupdf_version, stream_length
 
 
@@ -21,15 +21,16 @@ def _poster(height=240, width=320):
     return arr
 
 
-def test_dither_changes_a_gradient():
-    assert dither_supported()
-    grad = np.zeros((48, 160, 3), np.uint8)
-    grad[:, :, 0] = np.linspace(0, 255, 160, dtype=np.float32).astype(np.uint8)
-    grad[:, :, 2] = 40
-    plain = reconstruct(grad, "indexed-4")
-    dithered = reconstruct(grad, "indexed-4-d")
-    assert plain.shape == dithered.shape == grad.shape
-    assert not np.array_equal(plain, dithered)
+def test_desky_palette_is_exact_on_the_17_grid():
+    """pdf-to-gray.py palettize: colors already on the x17 grid round-trip."""
+    from krop.desky import palettize
+    rng = np.random.default_rng(1)
+    pal = rng.integers(0, 16, (12, 3)) * 17
+    idx = rng.integers(0, 12, (50, 71))
+    rgb = pal[idx].astype(np.uint8)
+    out_idx, out_pal, st = palettize(rgb, 1e-4)
+    assert st["remapped_px"] == 0
+    assert (out_pal[out_idx] == rgb).all()
 
 
 def test_palette_keeps_black_text():

@@ -985,6 +985,15 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None,
                 rec.update(kind="gray", levels=levels, suggested_bpp=bpp_for_levels(levels))
             if rec["kind"] == "gray":
                 rec["photo"] = (rec["levels"] or 0) > 16
+            try:
+                from krop.desky import color_stats, gray_stats
+                if rec["kind"] == "gray":
+                    plane = sample if sample.ndim == 2 else sample[..., 1]
+                    rec["desky"] = gray_stats(plane)
+                elif rec["kind"] == "color" and sample.ndim == 3:
+                    rec["desky"] = color_stats(sample[..., :3])
+            except Exception:
+                pass
             _apply_target(rec, arr, threshold, defer_heavy)
             fresh = _remember_target(rec, analyzed)
         except Exception as exc:

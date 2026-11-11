@@ -836,7 +836,7 @@ def test_indexed_target_for_two_colors(tmp_path):
     for required in ("jpeg-95", "jpeg-85", "jpeg-75", "jpeg-60", "jpeg-45",
                      "indexed-256", "indexed-128", "indexed-64", "indexed-32",
                      "indexed-16", "indexed-8", "indexed-4",
-                     "indexed-4-d", "gray-8", "gray-4", "gray-2",
+                     "gray-8", "gray-4", "gray-2",
                      "gray-jpeg-85", "gray-jpeg-60", "1bpp", "keep"):
         assert required in ids
     under = [c for c in im["candidates"]
@@ -866,8 +866,10 @@ def test_error_threshold_changes_target(tmp_path):
     # original 8-bit samples is not smaller, so the target stays "keep".
     assert tight["target"] in ("keep", "gray-8")
     assert tight["error_mae"] == 0
-    assert loose["target"] == "1bpp"
-    assert loose["error_mae"] <= 80
+    # desky-scan-tools gates on max error. 1-bit Otsu of a ramp exceeds 80;
+    # 2-bit gray (steps of 85, max error 42) is the smallest encoding that passes.
+    assert loose["target"] == "gray-2"
+    assert loose["error_max"] <= 80
 
 
 def test_panel_lists_each_image(window, tmp_path, qapp):

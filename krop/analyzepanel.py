@@ -787,10 +787,15 @@ class AnalysisPanel(QDockWidget):
         try:
             tail = max(16.0, limit * 4.0)
             over = False
-            if mae is not None and float(mae) > limit:
-                over = True
-            if p995 is not None and float(p995) > tail:
-                over = True
+            if result.get("gate") == "max":
+                mx = result.get("error_max")
+                if mx is not None and float(mx) > limit:
+                    over = True
+            else:
+                if mae is not None and float(mae) > limit:
+                    over = True
+                if p995 is not None and float(p995) > tail:
+                    over = True
         except (TypeError, ValueError):
             over = False
         fields = dict(result)
@@ -805,7 +810,11 @@ class AnalysisPanel(QDockWidget):
         chosen = self._choices.get(share) or self._choices.get(str(xref))
         if chosen == target:
             from krop.analyze import apply_chosen_target
+            from krop.pdfimage import arm_save, cached_encoded
             apply_chosen_target(holder, xref, fields)
+            enc = cached_encoded(payload.get("path"), xref, target)
+            if enc:
+                arm_save(enc.get("source_sha"), enc)
         else:
             user_picked = bool(chosen)
             pending_left = any(c.get("pending") for im in matches for c in (im.get("candidates") or []))
@@ -1358,6 +1367,11 @@ def _over_phrase(cand, limit):
     except (TypeError, ValueError):
         mae_lim = None
     tail = None if mae_lim is None else max(16.0, mae_lim * 4.0)
+    if cand.get("gate") == "max":
+        mx = cand.get("error_max")
+        if mx is not None and mae_lim is not None and float(mx) > mae_lim:
+            return "max err %d > %s (over limit)" % (int(round(float(mx))), _limit_text(mae_lim))
+        return "over limit" if cand.get("over") else ""
     mae = cand.get("error_mae")
     if mae is not None and mae_lim is not None and float(mae) > mae_lim:
         parts.append("mae %.1f > %s" % (float(mae), _limit_text(mae_lim)))

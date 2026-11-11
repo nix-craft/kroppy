@@ -494,14 +494,10 @@ def ladder_ids(kind, bpc, filt):
         ids.append("rgb-24")
     for quality in (95, 85, 75, 60, 45):
         ids.append("jpeg-%d" % quality)
-    offer_dither = dither_supported()
     for colors in (256, 128, 64, 32, 16, 8, 4):
+        # Indexed candidates are desky-scan-tools' x17 palette (pdf-to-gray.py
+        # --palette), not a separate dithered encoder.
         ids.append("indexed-%d" % colors)
-        if offer_dither:
-            ids.append("indexed-%d-d" % colors)
-        # Chroma denoise is a separate candidate so its error is visible.
-        if colors <= 32:
-            ids.append("indexed-%d-s" % colors)
     ids.extend(["gray-8", "gray-4", "gray-2", "gray-jpeg-85", "gray-jpeg-60", "1bpp"])
     if _jbig2_available():
         ids.append("jbig2")
@@ -534,6 +530,11 @@ def reconstruct(arr, target_id):
     """Pixels a target would show, including a real JPEG round-trip."""
     import numpy as np
     tid = str(target_id or "keep")
+    if _desky_target(tid) and not tid.startswith("gray-jpeg-"):
+        from krop.pdfimage import encode_stream
+        blob = encode_stream(arr, tid, neutral_tol=2)
+        if blob and blob.get("recon") is not None:
+            return np.ascontiguousarray(blob["recon"], dtype=np.uint8)
     if tid in ("keep", "rgb-24"):
         return _rgb(arr)
     if tid in ("1bpp", "jbig2"):
@@ -586,13 +587,38 @@ def _indexed_est(recon, scale):
     return int(est * scale), "Flate"
 
 
+def _desky_target(tid):
+    from krop.desky import uses_desky
+    return uses_desky(tid)
+
+
+def _eval_desky(viewed, tid, threshold, stored, neutral_tol=0, raw_jpeg=None):
+    """Size and max-error gate from the desky-scan-tools encoders."""
+    from krop.pdfimage import encode_stream
+    blob = encode_stream(viewed, tid, max_err=threshold, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol)
+    if not blob:
+        entry = _entry(tid, 255, 255, 255, True, stored, None, stored)
+        entry["gate"] = "max"
+        entry["note"] = "left unchanged"
+        return entry
+    mae, p995, mx = _error_against(viewed, blob.get("recon"))
+    mx = blob.get("max_err", mx)
+    over = bool(blob.get("over")) or (threshold is not None and mx is not None and float(mx) > float(threshold))
+    entry = _entry(tid, mae if blob.get("mean_err") is None else blob.get("mean_err"),
+                   p995, mx, over, len(blob["data"]), blob.get("codec"), stored)
+    entry["gate"] = "max"
+    return entry
+
+
 def _eval_target(viewed, target_id, filt, full_pixels, stored, threshold, max_ok):
     """Error, estimated size, and codec for one ladder step. None if unavailable."""
     import numpy as np
     tid = str(target_id)
     sample_pixels = max(1, int(viewed.shape[0]) * int(viewed.shape[1]))
     scale = float(full_pixels) / float(sample_pixels) if full_pixels > sample_pixels else 1.0
-    if tid.startswith("jpeg-") or tid.startswith("gray-jpeg-"):
+    if _desky_target(tid):
+        return _eval_desky(viewed, tid, threshold, stored, neutral_tol=2 if (filt or "") == "DCT" else 0)
+    if tid.startswith("jpeg-"):
         quality = int(tid.rsplit("-", 1)[-1])
         src = _as_gray(viewed) if tid.startswith("gray-jpeg-") else _rgb(viewed)
         try:
@@ -756,7 +782,8 @@ def recommend(sample, kind, bpc, filt, threshold, width, height, stored_bytes, d
             pending["pending"] = True
             candidates.append(pending)
             continue
-        entry = _eval_target(viewed, tid, filt, full_pixels, stored, threshold, max_ok)
+        src = sample if _desky_target(tid) else viewed
+        entry = _eval_target(src, tid, filt, full_pixels, stored, threshold, max_ok)
         if entry is not None:
             candidates.append(entry)
     keep = _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
@@ -794,7 +821,8 @@ def fill_pending_file(path, xref, candidates, stored, filt, threshold, width, he
         if not cand.get("pending"):
             filled.append(dict(cand))
             continue
-        measured = _eval_target(viewed, cand.get("id"), filt or "", full_pixels, int(stored or 0), limit, max_ok)
+        src = arr if _desky_target(cand.get("id")) else viewed
+        measured = _eval_target(src, cand.get("id"), filt or "", full_pixels, int(stored or 0), limit, max_ok)
         if measured is None:
             skipped = dict(cand)
             skipped["pending"] = False
@@ -822,17 +850,42 @@ def encode_file_image(path, xref, target_id, stored_bytes, filt):
     if hit is not None:
         return hit
     arr = _load_xref_array(path, xref)
-    encoded = encode_stream(arr, target_id)
+    raw_jpeg = None
+    neutral_tol = 0
+    try:
+        from krop.desky import source_stream
+        src = source_stream(path, xref)
+        if "/DCTDecode" in (src.get("filters") or []):
+            raw_jpeg = src.get("raw")
+            neutral_tol = 2
+    except Exception:
+        src = None
+    threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
+    encoded = encode_stream(
+        arr, target_id, max_err=threshold, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol)
+    if not encoded:
+        entry = _entry(target_id, 255, 255, 255, True, stored, filt or None, stored)
+        entry["gate"] = "max"
+        entry["note"] = "left unchanged"
+        return entry
     try:
         recon = decode_stream(encoded)
     except Exception:
         recon = encoded.get("recon")
-    threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
     mae, p995, mx = _error_against(_rgb(arr), recon)
-    over = mae > threshold or p995 > max_ok
+    if encoded.get("gate") == "max":
+        mx = encoded.get("max_err", mx)
+        mae = encoded.get("mean_err", mae)
+        over = bool(encoded.get("over")) or float(mx) > threshold
+    else:
+        over = mae > threshold or p995 > max_ok
     entry = _entry(
         target_id, mae, p995, mx, over, len(encoded["data"]),
         encoded.get("codec") or "", stored)
+    if encoded.get("gate"):
+        entry["gate"] = encoded["gate"]
+    if src and src.get("sha"):
+        encoded["source_sha"] = src["sha"]
     remember(os.path.abspath(path), int(xref), target_id, encoded, entry)
     return entry
 

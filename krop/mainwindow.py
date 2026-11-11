@@ -274,6 +274,14 @@ class MainWindow(QMainWindow):
         self.spinDust.valueChanged.connect(lambda v: QSettings().setValue("Trim/Dust", str(v)))
         self.ui.toolBar.addWidget(self.checkCopierTrim)
         self.ui.toolBar.addWidget(self.spinDust)
+        self.checkDedup = QCheckBox(self.tr("Merge identical images"))
+        self.checkDedup.setObjectName("dedupImages")
+        self.checkDedup.setToolTip(self.tr(
+            "On save, merge byte-identical images into one object. Off by default."))
+        self.checkDedup.setChecked(QSettings().value("Save/DedupImages", "false") == "true")
+        self.checkDedup.toggled.connect(
+            lambda v: QSettings().setValue("Save/DedupImages", "true" if v else "false"))
+        self.ui.toolBar.addWidget(self.checkDedup)
         # [skip-region patch] minimum white gap that counts as a break between regions
         self.spinMinGap = QSpinBox(self)
         self.spinMinGap.setRange(1, 500)
@@ -649,6 +657,7 @@ class MainWindow(QMainWindow):
                 cropper.writeToFile(outputFileName)
             if self.ui.checkHardCrop.isChecked():
                 self.hardCropFile(outputFileName)
+            self._applyChosenEncodings(outputFileName)
             from krop.activitylog import note_clean_save
             note_clean_save()
             QApplication.restoreOverrideCursor()
@@ -687,6 +696,18 @@ class MainWindow(QMainWindow):
                         self.tr("The following unexpected error has occured:"
                         "\n\n{0}").format(err))
                 raise err
+
+    def _applyChosenEncodings(self, outputFileName):
+        """Write the desky-scan-tools bytes chosen in the dock, unchanged, then optionally dedup."""
+        try:
+            from krop.pdfimage import apply_cached_choices
+            dedup = False
+            box = getattr(self, "checkDedup", None)
+            if box is not None:
+                dedup = bool(box.isChecked())
+            apply_cached_choices(outputFileName, dedup=dedup)
+        except Exception as err:
+            log("SAVE", "chosen encodings not applied: %r" % err)
 
     def hardCropFile(self, outputFileName):
         """Physically crop embedded images to the visible box. Never fails the save."""

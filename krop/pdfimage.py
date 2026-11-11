@@ -60,16 +60,82 @@ def cached_encoded(path, xref, target):
     return None if item is None else item.get("encoded")
 
 
-def encode_stream(arr, target_id):
+_SAVE = {}
+
+
+def arm_save(sha, encoded):
+    """Remember one chosen encoding so save can write those exact bytes."""
+    if sha and encoded and encoded.get("data"):
+        _SAVE[str(sha)] = encoded
+
+
+def apply_cached_choices(output_path, dedup=False):
+    """Replace images in a saved PDF with the chosen desky bytes, then optionally dedup.
+
+    Matching is by the source stream's sha256, so the bytes are reused unchanged.
+    No-op when nothing was chosen and dedup is off.
+    """
+    if not _SAVE and not dedup:
+        return 0
+    import pikepdf
+    from krop.desky import dedup as dedup_images
+    pdf = pikepdf.open(output_path, allow_overwriting_input=True)
+    n = 0
+    if _SAVE:
+        import hashlib
+        name = pikepdf.Name
+        for obj in pdf.objects:
+            if not isinstance(obj, pikepdf.Stream):
+                continue
+            if str(obj.get("/Subtype")) != "/Image":
+                continue
+            sha = hashlib.sha256(obj.read_raw_bytes()).hexdigest()
+            enc = _SAVE.get(sha)
+            if not enc:
+                continue
+            _install_pikepdf(obj, enc, name)
+            n += 1
+    if dedup:
+        dedup_images(pdf)
+    if n or dedup:
+        pdf.save(output_path)
+    pdf.close()
+    return n
+
+
+def _install_pikepdf(obj, enc, name):
+    filt = str(enc.get("keys", {}).get("Filter") or "/FlateDecode")
+    if "/DecodeParms" in obj:
+        del obj["/DecodeParms"]
+    parms = enc.get("decode_parms")
+    obj.write(bytes(enc["data"]), filter=name(filt), decode_parms=pikepdf.Dictionary(parms) if parms else None)
+    obj.Width = int(enc["keys"]["Width"])
+    obj.Height = int(enc["keys"]["Height"])
+    obj.BitsPerComponent = int(enc["keys"]["BitsPerComponent"])
+    if enc.get("palette") is not None:
+        obj.ColorSpace = pikepdf.Array([
+            name.Indexed, name.DeviceRGB, int(enc.get("palette_last") or 0),
+            pikepdf.String(enc["palette"])])
+    else:
+        cs = str(enc["keys"].get("ColorSpace") or "/DeviceGray")
+        if cs.startswith("/"):
+            obj.ColorSpace = name(cs)
+    if enc["keys"].get("DecodeParms") and not parms:
+        pass
+
+
+def encode_stream(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0):
     """Full-resolution PDF image stream for target_id.
 
-    Returns ``{"data", "keys", "codec", "recon"}``. ``data`` is the exact
-    bytes stored in the content stream (already compressed when the filter
-    says so). ``recon`` is what MuPDF should decode it back to.
+    Gray, indexed, gray-JPEG and 1-bit/JBIG2 candidates are the encoders from
+    desky-scan-tools (krop.desky). ``data`` is the exact content stream.
     """
     import numpy as np
-    from krop.imagetarget import _indexed_flags, _jpeg_roundtrip, _quantize_gray, _as_gray, _rgb, reconstruct
+    from krop.desky import encode_target, uses_desky
+    from krop.imagetarget import _jpeg_roundtrip, _rgb
     tid = str(target_id or "keep")
+    if uses_desky(tid):
+        return encode_target(arr, tid, max_err=max_err, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol)
     rgb = _rgb(arr)
     height, width = int(rgb.shape[0]), int(rgb.shape[1])
     if tid.startswith("jpeg-") or tid.startswith("gray-jpeg-"):
