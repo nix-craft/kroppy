@@ -504,7 +504,10 @@ def test_image_detail_gray_target_and_uses(tmp_path):
     assert im["error_mae"] == 0
     assert "xref %d" % im["xref"] in im["detail"]
     assert "ICC N=1" in im["colorspace_text"] or "Gray" in im["colorspace_text"]
-    assert "bpc" in im["detail"] and "dpi" in im["detail"]
+    assert im["structure"] == "1ch 8bpp"
+    assert "1ch 8bpp" in im["detail"] and "dpi" in im["detail"]
+    assert im["chosen_target"] == im["recommended_target"] == "gray-2"
+    assert any(c["id"] == "1bpp" and c["over"] for c in im["candidates"])
     assert im["rep_bytes"] < im["bytes"]
     assert page["savings_pct"] > 0
     blob = "\n".join(__import__("krop.analyze", fromlist=["analyze_lines"]).analyze_lines(data))
@@ -601,6 +604,80 @@ def test_identical_streams_share_one_target(tmp_path, monkeypatch):
     assert data["pages"][1]["images"][0]["link_pages"] == 2
 
 
+def test_chosen_target_updates_shared_rollups(tmp_path):
+    import numpy as np
+    from krop.analyze import apply_chosen_target
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((32, 32), np.uint8)
+    arr[:, :16] = 0
+    arr[:, 16:] = 255
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, 32, 32, arr.tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(72, 72, 200, 200), pixmap=pix)
+    doc.new_page().insert_image(pymupdf.Rect(72, 72, 180, 180), xref=xref)
+    path = str(tmp_path / "choice.pdf")
+    _save(doc, path)
+    data = analyze_file(path)
+    im = data["pages"][0]["images"][0]
+    keep = next(c for c in im["candidates"] if c["id"] == "keep")
+    apply_chosen_target(data, xref, keep)
+    assert data["pages"][0]["images"][0]["chosen_target"] == "keep"
+    assert data["pages"][1]["images"][0]["chosen_target"] == "keep"
+    assert data["pages"][0]["images"][0]["recommended_target"] in ("keep", "1bpp")
+    assert data["pages"][1]["image_bytes"] == 0
+    assert data["summary"]["image_bytes"] == im["bytes"]
+    blob = __import__("json").dumps(data)
+    assert '"chosen_target": "keep"' in blob
+    assert '"recommended_target"' in blob
+
+
+def test_target_combo_updates_row(window, tmp_path, qapp):
+    import numpy as np
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((40, 80), np.uint8)
+    arr[:, :20] = 0
+    arr[:, 20:40] = 85
+    arr[:, 40:60] = 170
+    arr[:, 60:] = 255
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, 80, 40, arr.tobytes(), False)
+    page.insert_image(pymupdf.Rect(72, 72, 300, 200), pixmap=pix)
+    src = str(tmp_path / "combo.pdf")
+    _save(doc, src)
+    w = window
+    w.show()
+    qapp.processEvents()
+    w.actionAnalysis.setChecked(True)
+    w.openFile(src, False)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        qapp.processEvents()
+        if "Document:" in w.analysisPanel.summary.text():
+            break
+        time.sleep(0.05)
+    child = w.analysisPanel.tree.topLevelItem(0).child(0)
+    combo = w.analysisPanel.tree.itemWidget(child, 2)
+    assert combo is not None
+    labels = [combo.itemText(i) for i in range(combo.count())]
+    assert any("1ch 1bpp" in text and "(over)" in text for text in labels)
+    assert combo.currentData() == "gray-2"
+    # gray-4 is under the threshold but was not encoded yet.
+    index = combo.findData("gray-4")
+    assert index >= 0
+    combo.setCurrentIndex(index)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        qapp.processEvents()
+        if child.text(3) != "..." and "1ch 4bpp" in child.text(3):
+            break
+        time.sleep(0.05)
+    assert "1ch 4bpp" in child.text(3)
+    assert "mae" in child.text(3)
+    assert w.analysisPanel._data["pages"][0]["images"][0]["chosen_target"] == "gray-4"
+    # The choice sticks for the session.
+    assert w.analysisPanel._choices
+
+
 def test_shared_image_row_appears_before_later_page(window, qapp):
     w = window
     w.analysisPanel.begin(3)
@@ -632,7 +709,9 @@ def test_indexed_target_for_two_colors(tmp_path):
     data = analyze_file(path)
     im = data["pages"][0]["images"][0]
     assert data["summary"]["label"] == "COLOR"
+    assert im["structure"] == "3ch 24bpp"
     assert im["target"] == "indexed-2"
+    assert im["target_label"] == "idx 1bpp (2 colors)"
     assert im["error_mae"] <= 1
     assert im["codec"] == "Flate"
 
@@ -683,8 +762,10 @@ def test_panel_lists_each_image(window, tmp_path, qapp):
     assert row.text(3) == "1"
     assert row.childCount() >= 1
     detail = row.child(0).text(1)
-    assert "xref" in detail and "bpc" in detail
-    assert row.child(0).text(2) in ("1bpp", "keep", "gray-2", "gray-4", "gray-8")
+    assert "xref" in detail and "1ch" in detail
+    combo = w.analysisPanel.tree.itemWidget(row.child(0), 2)
+    assert combo is not None
+    assert combo.currentData() in ("1bpp", "keep", "gray-2", "gray-4", "gray-8")
 
 
 def test_dock_follows_page_and_click_navigates(window, tmp_path, qapp, monkeypatch):

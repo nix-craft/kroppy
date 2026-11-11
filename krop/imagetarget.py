@@ -242,6 +242,93 @@ def _encode_gray(y, bpp, source_filter, full_pixels, sample_pixels):
     return flate, "Flate"
 
 
+def structure_text(channels, bpc, indexed_colors=None):
+    """Compact channels-and-bits label, e.g. ``1ch 1bpp`` or ``idx 8bpp (16 colors)``."""
+    bpc = int(bpc or 0)
+    if indexed_colors:
+        return "idx %dbpp (%d colors)" % (bpc, int(indexed_colors))
+    channels = int(channels or 1)
+    return "%dch %dbpp" % (channels, channels * max(bpc, 0))
+
+
+def notation(target_id):
+    """Same channels-and-bits notation for a storage target id."""
+    if target_id in ("1bpp", "gray-1"):
+        return "1ch 1bpp"
+    if target_id == "gray-2":
+        return "1ch 2bpp"
+    if target_id == "gray-4":
+        return "1ch 4bpp"
+    if target_id == "gray-8":
+        return "1ch 8bpp"
+    if target_id and str(target_id).startswith("indexed-"):
+        try:
+            n = int(str(target_id).split("-", 1)[1])
+        except ValueError:
+            n = 0
+        bits = 1 if n <= 2 else 2 if n <= 4 else 4 if n <= 16 else 8
+        return structure_text(1, bits, n or None)
+    if target_id == "keep":
+        return "keep"
+    return str(target_id or "keep")
+
+
+def _candidate_specs(neutral):
+    specs = [("1bpp", 1, None), ("gray-2", 2, None), ("gray-4", 4, None), ("gray-8", 8, None)]
+    if not neutral:
+        for n in (2, 4, 16, 256):
+            specs.append(("indexed-%d" % n, None, n))
+    return specs
+
+
+def _measure(viewed, gray, bpp, ncolors):
+    if ncolors:
+        back, ok = _indexed(viewed, ncolors)
+        if not ok:
+            return None
+        return _error_against(viewed, back)
+    if bpp >= 8 and viewed.ndim == 2:
+        return 0.0, 0
+    q = _quantize_gray(gray, bpp)
+    return _error_against(viewed, q)
+
+
+def _encode_measured(viewed, gray, bpp, ncolors, filt, full_pixels, stored):
+    sample_pixels = max(1, viewed.shape[0] * viewed.shape[1])
+    if ncolors:
+        back, ok = _indexed(viewed, ncolors)
+        if not ok:
+            return None
+        import numpy as np
+        flat = back.reshape(-1, 3)
+        _colors, inverse = np.unique(flat, axis=0, return_inverse=True)
+        raw = inverse.astype(np.uint8).tobytes()
+        est = _flate_size(raw) + int(_colors.shape[0]) * 3
+        est = int(est * (float(full_pixels) / float(sample_pixels)))
+        return est, "Flate"
+    est, codec = _encode_gray(gray, bpp or 8, filt, full_pixels, sample_pixels)
+    return est, codec
+
+
+def _entry(target_id, mae, mx, over, est, codec, stored):
+    est_i = None if est is None else int(est)
+    pct = None
+    if est_i is not None and stored:
+        pct = round((stored - est_i) * 100.0 / stored, 1)
+    elif est_i is not None:
+        pct = 0.0
+    return {
+        "id": target_id,
+        "label": notation(target_id),
+        "over": bool(over),
+        "error_mae": None if mae is None else round(float(mae), 2),
+        "error_max": None if mx is None else int(mx),
+        "est_bytes": est_i,
+        "codec": codec,
+        "savings_pct": pct,
+    }
+
+
 def _result(target, mae, mx, est, stored, codec, bpp=None):
     stored = int(stored or 0)
     est = int(est or 0)
@@ -263,76 +350,129 @@ def _keep(stored, filt):
     return _result("keep", 0.0, 0, stored, stored, filt or "keep", None)
 
 
+
+def _finish(chosen, candidates, stored, filt, bpp):
+    out = _result(
+        chosen["id"], chosen.get("error_mae") or 0, chosen.get("error_max") or 0,
+        chosen.get("est_bytes") if chosen.get("est_bytes") is not None else stored,
+        stored, chosen.get("codec") or filt or "keep", bpp)
+    out["recommended_target"] = chosen["id"]
+    out["chosen_target"] = chosen["id"]
+    out["target_label"] = chosen.get("label") or notation(chosen["id"])
+    out["candidates"] = candidates
+    return out
+
+
 def recommend(sample, kind, bpc, filt, threshold, width, height, stored_bytes):
     """Pick a storage target for one decoded image.
 
     sample is a uint8 array HxW or HxWxC, or None when the image was not
-    decoded (already 1-bit, or undecodable). kind is bilevel, gray, color,
-    or undecodable. filt is a short name such as CCITT, JBIG2, DCT, Flate.
+    decoded (already 1-bit, or undecodable). Every valid candidate is
+    measured. Only the recommended one is encoded.
     """
     threshold, max_ok = _limit(threshold if threshold is not None else DEFAULT_ERROR_MAE)
     stored = int(stored_bytes or 0)
     filt = filt or ""
-    if sample is None or kind in ("bilevel", "undecodable"):
-        out = _keep(stored, filt or ("CCITT" if kind == "bilevel" else "keep"))
+    if sample is None or kind == "undecodable":
+        keep = _entry("keep", 0, 0, False, stored, filt or "keep", stored)
+        candidates = [keep]
+        bpp = None
         if kind == "bilevel":
-            out["suggested_bpp"] = 1
-            out["target"] = "1bpp" if filt not in ("CCITT", "JBIG2") else "keep"
-            if out["target"] == "1bpp":
-                # Still 1-bit, but not in a bilevel codec. Encode once.
-                if sample is not None:
-                    y, _step = _sample(_as_gray(sample))
-                    est, codec = _encode_gray(y, 1, filt, width * height, y.size)
-                    if est < stored:
-                        out.update(est_bytes=est, rep_bytes=est, codec=codec,
-                                   savings_pct=round((stored - est) * 100.0 / stored, 1) if stored else 0.0)
-                    else:
-                        out["target"] = "keep"
-        return out
-    viewed, step = _sample(sample)
+            one = _entry("1bpp", 0, 0, False, stored if filt in ("CCITT", "JBIG2") else None,
+                         filt if filt in ("CCITT", "JBIG2") else None, stored)
+            for name in ("gray-2", "gray-4", "gray-8"):
+                pass
+            extras = [
+                _entry(name, 0, 0, False, None, None, stored)
+                for name in ("gray-2", "gray-4", "gray-8")]
+            candidates = [one] + extras + [keep]
+            bpp = 1
+            if filt in ("CCITT", "JBIG2"):
+                return _finish(keep, candidates, stored, filt, 1)
+        return _finish(keep, candidates, stored, filt or "keep", bpp)
+    viewed, _step = _sample(sample)
     gray = _as_gray(viewed)
     neutral = kind == "gray" or _neutral(viewed)
     full_pixels = max(1, int(width or sample.shape[1]) * int(height or sample.shape[0]))
-    # Smallest first. Stop at the first candidate under the threshold.
-    candidates = [("1bpp", 1), ("gray-2", 2), ("gray-4", 4), ("gray-8", 8)]
-    for name, bpp in candidates:
-        if bpp >= 8 and neutral and kind == "gray":
-            q = gray
-            mae, mx = 0.0, 0
-        else:
-            q = _quantize_gray(gray, bpp)
-            mae, mx = _error_against(viewed, q)
-        if mae <= threshold and mx <= max_ok:
-            if name == "gray-8" and neutral and filt in ("Flate", "LZW", "DCT") and (bpc or 8) >= 8:
-                # Already stored at 8 bpp gray. Keep unless a DCT/Flate trial is smaller,
-                # which we only bother with for DCT sources.
-                if filt != "DCT":
-                    return _keep(stored, filt)
-            est, codec = _encode_gray(q, bpp, filt, full_pixels, gray.shape[0] * gray.shape[1])
-            if est >= stored and stored:
-                kept = _keep(stored, filt)
-                kept["error_mae"] = round(float(mae), 2)
-                kept["error_max"] = int(mx)
-                return kept
-            return _result(name, mae, mx, est, stored, codec, bpp)
-    if not neutral:
-        import numpy as np
-        for n in (2, 4, 16, 256):
-            back, ok = _indexed(viewed, n)
-            if not ok:
-                break
-            mae, mx = _error_against(viewed, back)
-            if mae <= threshold and mx <= max_ok:
-                flat = back.reshape(-1, 3)
-                _colors, inverse = np.unique(flat, axis=0, return_inverse=True)
-                raw = inverse.astype(np.uint8).tobytes()
-                est = _flate_size(raw) + int(_colors.shape[0]) * 3
-                scale = float(full_pixels) / float(max(1, viewed.shape[0] * viewed.shape[1]))
-                est = int(est * scale)
-                if est >= stored and stored:
-                    kept = _keep(stored, filt)
-                    kept["error_mae"] = round(float(mae), 2)
-                    kept["error_max"] = int(mx)
-                    return kept
-                return _result("indexed-%d" % n, mae, mx, est, stored, "Flate", None)
-    return _keep(stored, filt)
+    candidates = []
+    chosen = None
+    for name, bpp, ncolors in _candidate_specs(neutral):
+        measured = _measure(viewed, gray, bpp, ncolors)
+        if measured is None:
+            continue
+        mae, mx = measured
+        over = mae > threshold or mx > max_ok
+        entry = _entry(name, mae, mx, over, None, None, stored)
+        candidates.append(entry)
+        if chosen is not None or over:
+            continue
+        if name == "gray-8" and neutral and filt in ("Flate", "LZW") and (bpc or 8) >= 8:
+            continue
+        encoded = _encode_measured(viewed, gray, bpp, ncolors, filt, full_pixels, stored)
+        if not encoded:
+            continue
+        est, codec = encoded
+        entry["est_bytes"] = int(est)
+        entry["codec"] = codec
+        entry["savings_pct"] = round((stored - est) * 100.0 / stored, 1) if stored else 0.0
+        if stored and est >= stored:
+            continue
+        chosen = entry
+    keep = _entry("keep", 0, 0, False, stored, filt or "keep", stored)
+    candidates.append(keep)
+    if chosen is None:
+        chosen = keep
+    bpp_out = None
+    if chosen["id"] == "1bpp":
+        bpp_out = 1
+    elif str(chosen["id"]).startswith("gray-"):
+        bpp_out = int(str(chosen["id"]).split("-")[1])
+    return _finish(chosen, candidates, stored, filt, bpp_out)
+
+
+def encode_file_image(path, xref, target_id, stored_bytes, filt):
+    """Trial-encode one candidate for xref. Safe to call off the UI thread."""
+    import numpy as np
+    import pymupdf
+    doc = pymupdf.open(path)
+    try:
+        pix = pymupdf.Pixmap(doc, int(xref))
+        if pix.alpha:
+            pix = pymupdf.Pixmap(pix, 0)
+        if pix.colorspace and pix.colorspace.n == 4:
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        n = pix.n
+        arr = np.frombuffer(pix.samples, np.uint8)
+        arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n).copy()
+        if n == 1:
+            arr = arr[:, :, 0]
+        width, height = pix.w, pix.h
+    finally:
+        doc.close()
+    if target_id == "keep":
+        stored = int(stored_bytes or 0)
+        return _entry("keep", 0, 0, False, stored, filt or "keep", stored)
+    viewed, _step = _sample(arr)
+    gray = _as_gray(viewed)
+    full_pixels = max(1, int(width) * int(height))
+    ncolors = None
+    bpp = None
+    if str(target_id).startswith("indexed-"):
+        ncolors = int(str(target_id).split("-", 1)[1])
+    elif target_id == "1bpp":
+        bpp = 1
+    elif str(target_id).startswith("gray-"):
+        bpp = int(str(target_id).split("-")[1])
+    else:
+        return None
+    measured = _measure(viewed, gray, bpp, ncolors)
+    if measured is None:
+        return None
+    mae, mx = measured
+    encoded = _encode_measured(viewed, gray, bpp, ncolors, filt, full_pixels, stored_bytes)
+    if not encoded:
+        return None
+    est, codec = encoded
+    threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
+    over = mae > threshold or mx > max_ok
+    return _entry(target_id, mae, mx, over, est, codec, int(stored_bytes or 0))

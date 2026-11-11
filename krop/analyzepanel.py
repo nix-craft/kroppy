@@ -98,6 +98,34 @@ class AnalyzeJob(QThread):
             self.done.emit(result)
 
 
+class _EncodeJob(QThread):
+    """Trial-encode one image candidate away from the UI thread."""
+    ready = pyqtSignal(object)
+
+    def __init__(self, path, xref, target_id, stored, filt, token, share):
+        QThread.__init__(self)
+        self.path = path
+        self.xref = xref
+        self.target_id = target_id
+        self.stored = stored
+        self.filt = filt
+        self.token = token
+        self.share = share
+
+    def run(self):
+        result = None
+        error = None
+        try:
+            from krop.imagetarget import encode_file_image
+            result = encode_file_image(self.path, self.xref, self.target_id, self.stored, self.filt)
+        except Exception as exc:
+            error = str(exc)
+        self.ready.emit({
+            "xref": self.xref, "share": self.share, "target": self.target_id,
+            "token": self.token, "result": result, "error": error,
+        })
+
+
 class AnalysisPanel(QDockWidget):
     page_requested = pyqtSignal(int)
     focus_changed = pyqtSignal(int)
@@ -110,6 +138,12 @@ class AnalysisPanel(QDockWidget):
         self._follow_page = None
         self._selecting = False
         self._pending_nav = None
+        self._path = None
+        self._data = None
+        self._choices = {}
+        self._encoded = {}
+        self._tokens = {}
+        self._encode_jobs = []
         body = QWidget()
         layout = QVBoxLayout(body)
         self.summary = QLabel("Open a PDF to analyze it.")
@@ -158,6 +192,7 @@ class AnalysisPanel(QDockWidget):
         self.setWidget(body)
 
     def set_running(self, name):
+        self._path = name
         self.summary.setText("Analyzing %s…" % name)
         self._selecting = True
         try:
@@ -166,6 +201,9 @@ class AnalysisPanel(QDockWidget):
             self._selecting = False
 
     def set_result(self, data):
+        self._data = data
+        if data and not data.get("error"):
+            self._reapply_choices()
         self._selecting = True
         try:
             self._fill(data)
@@ -187,7 +225,18 @@ class AnalysisPanel(QDockWidget):
             for line in data["error"].splitlines()[-12:]:
                 self.tree.addTopLevelItem(QTreeWidgetItem(["", "", "", line, ""]))
             return
-        s = data["summary"]
+        self._show_summary(data["summary"])
+        for page in data["pages"]:
+            if not page:
+                continue
+            row = QTreeWidgetItem(["", "", "", "", "", ""])
+            row.setData(0, _USER, page["page"])
+            self._fill_row(row, page)
+            self.tree.addTopLevelItem(row)
+        self.tree.expandAll()
+
+    def _show_summary(self, summary):
+        s = summary or {}
         bpp = "" if s.get("suggested_bpp") is None else ", %s bpp" % s["suggested_bpp"]
         pct = s.get("savings_pct")
         if pct is None:
@@ -198,16 +247,9 @@ class AnalysisPanel(QDockWidget):
             pct_s = ""
         self.summary.setText(
             "Document: %s → %s%s. %d page(s), %d image(s), %d duplicate(s), %d blocker(s). %s → %s%s."
-            % (s["label"], s["target"], bpp, s["pages"], s["images"], s["duplicates"], s["blocker_count"],
+            % (s.get("label"), s.get("target"), bpp, s.get("pages") or 0, s.get("images") or 0,
+               s.get("duplicates") or 0, s.get("blocker_count") or 0,
                _fmt_bytes(s.get("image_bytes")), _fmt_bytes(s.get("est_bytes")), pct_s))
-        for page in data["pages"]:
-            if not page:
-                continue
-            row = QTreeWidgetItem(["", "", "", "", "", ""])
-            row.setData(0, _USER, page["page"])
-            self._fill_row(row, page)
-            self.tree.addTopLevelItem(row)
-        self.tree.expandAll()
 
     def error_threshold(self):
         return float(self.errorBox.value())
@@ -263,15 +305,14 @@ class AnalysisPanel(QDockWidget):
         child.setData(0, _PAGES, _page_list(im.get("pages"), page_no))
         self._paint_image(child, im)
         row.insertChild(0, child)
+        self._install_combo(child, im)
 
     def _paint_image(self, child, im):
         child.setText(1, im.get("detail") or "")
-        child.setText(2, im.get("target") or "")
         child.setText(3, im.get("target_text") or "")
         tip = im.get("link_tip") or ""
         if tip:
             child.setToolTip(1, tip)
-            child.setToolTip(2, tip)
 
     def add_page(self, page):
         if not page:
@@ -311,6 +352,7 @@ class AnalysisPanel(QDockWidget):
             child.setData(0, _PAGES, _page_list(im.get("pages"), page["page"]))
             self._paint_image(child, im)
             row.addChild(child)
+            self._install_combo(child, im)
         for blocker in page.get("blockers") or []:
             child = QTreeWidgetItem(["", blocker["text"], "", "", "", ""])
             child.setData(0, _USER, page["page"])
@@ -323,6 +365,198 @@ class AnalysisPanel(QDockWidget):
             child = QTreeWidgetItem(["", note, "", "", "", ""])
             child.setData(0, _USER, page["page"])
             row.addChild(child)
+
+    def _install_combo(self, child, im):
+        combo = QComboBox()
+        combo.setObjectName("imageTarget")
+        candidates = list(im.get("candidates") or [])
+        if not any(c.get("id") == "keep" for c in candidates):
+            candidates.append({"id": "keep", "label": "keep", "over": False})
+        try:
+            role = Qt.ItemDataRole.ForegroundRole
+        except AttributeError:
+            role = Qt.ForegroundRole
+        warn = QBrush(QColor(160, 70, 0))
+        for cand in candidates:
+            label = cand.get("label") or cand.get("id") or ""
+            if cand.get("over"):
+                label = "%s  (over)" % label
+            combo.addItem(label, cand.get("id"))
+            if cand.get("over"):
+                combo.setItemData(combo.count() - 1, warn, role)
+        share = im.get("share_key") or ""
+        chosen = self._choices.get(share) or self._choices.get(str(im.get("xref")))
+        chosen = chosen or im.get("chosen_target") or im.get("recommended_target") or im.get("target")
+        combo.blockSignals(True)
+        index = combo.findData(chosen)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        combo.setProperty("xref", im.get("xref"))
+        combo.setProperty("share", share)
+        try:
+            signal = combo.currentIndexChanged[int]
+        except Exception:
+            signal = combo.currentIndexChanged
+        signal.connect(lambda i, box=combo, item=child: self._on_target_changed(box, item, i))
+        self.tree.setItemWidget(child, 2, combo)
+
+    def _on_target_changed(self, combo, item, index):
+        if combo.signalsBlocked() or self._selecting:
+            return
+        target = combo.itemData(index)
+        if not target:
+            return
+        xref = combo.property("xref")
+        share = str(combo.property("share") or "")
+        self.tree.setCurrentItem(item)
+        self._choose(xref, share, str(target))
+
+    def _choose(self, xref, share, target_id):
+        key = share or str(xref)
+        self._choices[key] = target_id
+        self._choices[str(xref)] = target_id
+        cached = self._encoded.get((key, target_id))
+        cand = self._candidate(xref, target_id)
+        if cached:
+            fields = dict(cand or {})
+            fields.update(cached)
+            fields["id"] = target_id
+            self._apply_fields(xref, fields)
+            return
+        if cand and cand.get("est_bytes") is not None:
+            fields = dict(cand)
+            fields["id"] = target_id
+            self._apply_fields(xref, fields)
+            return
+        self._mark_pending(xref)
+        token = self._tokens.get(key, 0) + 1
+        self._tokens[key] = token
+        stored, filt = self._image_facts(xref)
+        job = _EncodeJob(self._path, xref, target_id, stored, filt, token, key)
+        job.ready.connect(self._on_encoded)
+        self._encode_jobs.append(job)
+        job.start()
+
+    def _candidate(self, xref, target_id):
+        im = self._find_image(xref)
+        for cand in (im or {}).get("candidates") or []:
+            if cand.get("id") == target_id:
+                return cand
+        return None
+
+    def _find_image(self, xref):
+        data = self._data or {}
+        for page in data.get("pages") or []:
+            if not page:
+                continue
+            for im in page.get("images") or []:
+                if im.get("xref") == xref:
+                    return im
+        return None
+
+    def _image_facts(self, xref):
+        im = self._find_image(xref) or {}
+        return int(im.get("bytes") or 0), im.get("filter_name") or ""
+
+    def _mark_pending(self, xref):
+        for page in (self._data or {}).get("pages") or []:
+            if not page:
+                continue
+            row = self._row_for_page(page["page"])
+            if row is None:
+                continue
+            for i in range(row.childCount()):
+                child = row.child(i)
+                if child.data(0, _XREF) == xref:
+                    child.setText(3, "...")
+
+    def _on_encoded(self, payload):
+        key = payload.get("share") or str(payload.get("xref"))
+        if payload.get("token") != self._tokens.get(key):
+            return
+        result = payload.get("result")
+        if not result:
+            return
+        target = payload.get("target")
+        self._encoded[(key, target)] = result
+        result = dict(result)
+        result["id"] = target
+        self._apply_fields(payload.get("xref"), result)
+
+    def _apply_fields(self, xref, fields):
+        if not self._data:
+            return
+        from krop.analyze import apply_chosen_target
+        apply_chosen_target(self._data, xref, fields)
+        self._refresh_after_choice()
+
+    def _reapply_choices(self):
+        if not self._data or not self._choices:
+            return
+        from krop.analyze import apply_chosen_target
+        seen = set()
+        for page in self._data.get("pages") or []:
+            if not page:
+                continue
+            for im in page.get("images") or []:
+                key = im.get("share_key") or str(im.get("xref"))
+                if key in seen:
+                    continue
+                chosen = self._choices.get(key) or self._choices.get(str(im.get("xref")))
+                if not chosen or chosen == im.get("target"):
+                    continue
+                cand = None
+                for item in im.get("candidates") or []:
+                    if item.get("id") == chosen and item.get("est_bytes") is not None:
+                        cand = item
+                        break
+                cached = self._encoded.get((key, chosen))
+                if cached:
+                    cand = dict(cand or {})
+                    cand.update(cached)
+                    cand["id"] = chosen
+                if not cand:
+                    continue
+                seen.add(key)
+                apply_chosen_target(self._data, im.get("xref"), cand)
+
+    def _refresh_after_choice(self):
+        data = self._data or {}
+        self._selecting = True
+        try:
+            for page in data.get("pages") or []:
+                if not page:
+                    continue
+                row = self._row_for_page(page["page"])
+                if row is None:
+                    continue
+                row.setText(5, _size_text(page.get("image_bytes"), page.get("image_est"), page.get("savings_pct")))
+                for im in page.get("images") or []:
+                    self._refresh_image_texts(row, im)
+            summary = data.get("summary")
+            if summary:
+                self._show_summary(summary)
+        finally:
+            self._selecting = False
+
+    def _refresh_image_texts(self, row, im):
+        for i in range(row.childCount()):
+            child = row.child(i)
+            if child.data(0, _XREF) != im.get("xref"):
+                continue
+            child.setText(1, im.get("detail") or "")
+            child.setText(3, im.get("target_text") or "")
+            combo = self.tree.itemWidget(child, 2)
+            if combo is None:
+                continue
+            chosen = im.get("chosen_target") or im.get("target")
+            index = combo.findData(chosen)
+            if index >= 0 and combo.currentIndex() != index:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+            return
 
     def follow_page(self, page):
         """Select the row for this 1-based page. Does not change the viewer."""

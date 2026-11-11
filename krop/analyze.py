@@ -768,6 +768,7 @@ def _colorspace_text(doc, xref, fallback):
 _TARGET_KEYS = (
     "kind", "levels", "photo", "suggested_bpp", "target", "error_mae", "error_max",
     "error_metric", "est_bytes", "rep_bytes", "codec", "savings_pct", "copier_ccitt",
+    "recommended_target", "chosen_target", "target_label", "candidates",
 )
 
 
@@ -912,6 +913,7 @@ def _image_records(doc, page, page_no, placements, threshold=None, decoded=None,
             "area_frac": round(area_frac, 4), "smask": bool(smask),
             "mask": _xref_flag(doc, xref, "Mask"),
             "image_mask": _xref_flag(doc, xref, "ImageMask"),
+            "indexed_colors": _indexed_colors(doc, xref),
             "uses": uses, "pages": [page_no], "dup_of": None, "kind": "gray",
             "levels": None, "photo": False, "suggested_bpp": None,
             "est_bytes": raw_len, "rep_bytes": raw_len,
@@ -1006,6 +1008,7 @@ def _link_image(rec, info):
         rec["link_placements"] = int(rec.get("uses") or 1)
         rec["counted_on"] = rec.get("page")
         rec["shared"] = False
+        rec["share_key"] = _share_key(rec)
         return
     pages = list(info.get("link_pages_list") or [])
     rec["pages"] = pages
@@ -1013,6 +1016,7 @@ def _link_image(rec, info):
     rec["link_placements"] = int(info.get("link_placements") or rec.get("uses") or 1)
     rec["counted_on"] = info.get("counted_on") or rec.get("page")
     rec["shared"] = rec["link_pages"] > 1 or len(info.get("group") or []) > 1
+    rec["share_key"] = _share_key(rec)
     canonical = info.get("canonical")
     if canonical and canonical != rec.get("xref"):
         rec["dup_of"] = canonical
@@ -1074,6 +1078,39 @@ def _fmt_bytes(n):
     return "%.1f KB" % (n / 1024.0)
 
 
+def image_structure(rec):
+    """Current storage as channels and bits, e.g. ``3ch 24bpp`` or ``idx 8bpp (16 colors)``."""
+    from krop.imagetarget import structure_text
+    cs = ((rec.get("colorspace_text") or "") + " " + (rec.get("colorspace") or "")).upper()
+    bpc = int(rec.get("bpc") or 0) or 8
+    indexed = rec.get("indexed_colors")
+    if "INDEXED" in cs or indexed:
+        return structure_text(1, bpc, indexed or None)
+    if "CMYK" in cs or "N=4" in cs:
+        return structure_text(4, bpc)
+    if "RGB" in cs or "N=3" in cs:
+        return structure_text(3, bpc)
+    return structure_text(1, bpc)
+
+
+def _indexed_colors(doc, xref):
+    import re
+    try:
+        kind, val = doc.xref_get_key(xref, "ColorSpace")
+    except Exception:
+        return None
+    text = val or ""
+    if kind == "xref" and text and text != "null":
+        try:
+            text = doc.xref_object(int(str(text).split()[0]))
+        except Exception:
+            pass
+    match = re.search(r"Indexed\s*/?\w+\s+(\d+)", text or "")
+    if not match:
+        return None
+    return int(match.group(1)) + 1
+
+
 def _describe_image(rec):
     ppi_s = rec.get("ppi_text") or "dpi ?"
     masks = []
@@ -1098,10 +1135,11 @@ def _describe_image(rec):
     owner = rec.get("counted_on")
     if rec.get("shared") and owner and owner != rec.get("page"):
         link_s += "  shared, counted on p%d" % owner
-    rec["detail"] = "xref %d  %dx%d  %s  %s  %s bpc  %s  %s  %s%s%s" % (
+    rec["structure"] = image_structure(rec)
+    rec["detail"] = "xref %d  %dx%d  %s  %s  %s  %s  %s  %s%s%s" % (
         rec.get("xref"), rec.get("width") or 0, rec.get("height") or 0, ppi_s,
         rec.get("colorspace_text") or rec.get("colorspace") or "?",
-        rec.get("bpc"), rec.get("filter_name") or "?", mask_s,
+        rec["structure"], rec.get("filter_name") or "?", mask_s,
         _fmt_bytes(rec.get("bytes")), use_s, link_s)
     rec["link_tip"] = "Used on %s (%d placement(s))" % (page_s or "this page", link_placements)
     mae = rec.get("error_mae")
@@ -1120,9 +1158,93 @@ def _describe_image(rec):
     rep = rec.get("rep_bytes")
     if rep is None:
         rep = rec.get("est_bytes")
-    rec["target_text"] = "%s%s  %s → %s  %s" % (
-        rec.get("target") or "keep", err, _fmt_bytes(rec.get("bytes")),
+    from krop.imagetarget import notation
+    label = rec.get("target_label") or notation(rec.get("chosen_target") or rec.get("target"))
+    codec = rec.get("codec") or ""
+    rec["target_text"] = "%s  %s%s  %s → %s  %s" % (
+        label, codec, err, _fmt_bytes(rec.get("bytes")),
         _fmt_bytes(rep), pct_s)
+
+
+def apply_chosen_target(data, xref, fields):
+    """Apply one image's chosen target everywhere that image is used.
+
+    fields comes from a candidate (id, label, error_mae, error_max, est_bytes,
+    codec, savings_pct). Shared images are counted once. Returns the page
+    numbers whose roll-ups changed.
+    """
+    if not data or xref is None:
+        return []
+    share = None
+    for page in data.get("pages") or []:
+        if not page:
+            continue
+        for im in page.get("images") or []:
+            if im.get("xref") == xref:
+                share = im.get("share_key")
+                break
+        if share:
+            break
+
+    def matches(im):
+        if im.get("xref") == xref:
+            return True
+        return bool(share) and im.get("share_key") == share
+
+    def assign(im):
+        im["chosen_target"] = fields.get("id")
+        im["target"] = fields.get("id")
+        im["target_label"] = fields.get("label")
+        im["error_mae"] = fields.get("error_mae")
+        im["error_max"] = fields.get("error_max")
+        im["codec"] = fields.get("codec")
+        if fields.get("est_bytes") is not None:
+            im["rep_bytes"] = int(fields["est_bytes"])
+            im["est_bytes"] = int(fields["est_bytes"])
+            im["savings_pct"] = fields.get("savings_pct")
+        for cand in im.get("candidates") or []:
+            if cand.get("id") == fields.get("id") and fields.get("est_bytes") is not None:
+                cand["est_bytes"] = int(fields["est_bytes"])
+                cand["codec"] = fields.get("codec")
+                cand["savings_pct"] = fields.get("savings_pct")
+                cand["error_mae"] = fields.get("error_mae")
+                cand["error_max"] = fields.get("error_max")
+        _describe_image(im)
+
+    touched = []
+    for page in data.get("pages") or []:
+        if not page:
+            continue
+        hit = False
+        for im in page.get("images") or []:
+            if matches(im):
+                assign(im)
+                hit = True
+        if not hit:
+            continue
+        current, estimate = _owned_image_bytes(page.get("images") or [], page["page"])
+        page["image_bytes"] = current
+        page["image_est"] = estimate
+        page["savings_pct"] = _savings(current, estimate) if current else 0.0
+        touched.append(page["page"])
+    for im in data.get("images") or []:
+        if matches(im):
+            assign(im)
+    summary = data.get("summary")
+    if summary is not None:
+        seen = set()
+        current = estimate = 0
+        for im in data.get("images") or []:
+            key = im.get("share_key") or _share_key(im)
+            if key in seen:
+                continue
+            seen.add(key)
+            current += int(im.get("bytes") or 0)
+            estimate += int(im.get("rep_bytes") if im.get("rep_bytes") is not None else im.get("est_bytes") or 0)
+        summary["image_bytes"] = current
+        summary["est_bytes"] = estimate
+        summary["savings_pct"] = _savings(current, estimate)
+    return touched
 
 
 def _span_class(color):
