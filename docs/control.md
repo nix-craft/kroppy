@@ -28,7 +28,7 @@ Commands run on the GUI thread. `wait_idle` does not freeze the window: the clie
 | Command | Args | Result |
 | --- | --- | --- |
 | `ping` | | `{"pong": true}` |
-| `state` | | file, page count, current page, zoom, window size, selection, scheduler queues, worker, error limit and toggles |
+| `state` | | file, page count, current page, zoom, window size, selection, scheduler queues, worker, error limit, toggles, and `padding` (the live Padding field) |
 | `open` | `path` | pages opened |
 | `goto` | `page` | 1-based page |
 | `zoom` | `factor` or `"fit"` | zoom factor |
@@ -37,6 +37,9 @@ Commands run on the GUI thread. `wait_idle` does not freeze the window: the clie
 | `select_image` | `page`, `xref` | selects that row |
 | `set_target` | `xref`, `target` | `indexed16` and `indexed-16` are the same target |
 | `set_option` | `name`, `value` | `mean_error`, `preview`, `analyze_other_pages` |
+| `set_padding` | `value` | writes the Padding field. The next trim reads that text, not a value saved at startup |
+| `trim` | `scope` | `current` trims the selection, `page` trims every selection on this page, `every` trims each page on its own. Uses the Padding field as it is now |
+| `trim_copier` | `scope` | same scopes, with Copier trim on |
 | `wait_idle` | `timeout` optional | `{"idle": true}` |
 | `grab_view` | `path` | PNG of the page view, overlays included |
 | `grab_window` | `path` | PNG of the window |
@@ -51,4 +54,9 @@ python -m krop.ctl --sock "$SOCK" state
 python -m krop.ctl set_target 59 indexed16
 python -m krop.ctl export_image 59 preview_display /tmp/p.png
 kroppyctl wait_idle 20
+kroppyctl set_padding 0
+kroppyctl trim page
+kroppyctl set_padding 12
+kroppyctl trim every
+kroppyctl trim_copier current
 ```

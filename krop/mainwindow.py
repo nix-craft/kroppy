@@ -912,25 +912,14 @@ class MainWindow(QMainWindow):
         self.pdfScene.update()
 
     def getPadding(self):
-        """Return [top, right, bottom, left] tuple specifying padding for trimming margins."""
+        """[top, right, bottom, left] from the Padding field as it is now.
+
+        Called at the moment a trim runs. Do not store the result on the
+        window or on an action.
+        """
+        from krop.padding import padding_from_window
         try:
-            # padding can be specified as in CSS (using one to four values):
-            # top, right, bottom, left
-            # top, right+left, bottom
-            # top+bottom, right+left
-            # top+bottom+right+left
-            padding = [ float(a) for a in self.ui.editPadding.text().split(',') if a ]
-            if len(padding) == 0:
-                return [0,0,0,0]
-            if len(padding) == 1:
-                return 4*padding
-            if len(padding) == 2:
-                return 2*padding
-            if len(padding) == 3:
-                return padding + [padding[1]]
-            if len(padding) == 4:
-                return padding
-            raise ValueError
+            return padding_from_window(self)
         except ValueError:
             self.showWarning(self.tr("Bad value for padding"), self.tr("The value of padding "
                 "(under settings for trimming margins) must be a list of one to four floats, "
@@ -939,7 +928,7 @@ class MainWindow(QMainWindow):
                 "\n(four values) top, right, bottom, left"
                 "\n(three values) top, right+left, bottom"
                 "\n(two values) top+bottom, right+left"))
-            return [0,0,0,0]
+            return [0, 0, 0, 0]
 
     def slotTrimMarginsAll(self):
         # trim margins of all selections on the current page
@@ -1127,9 +1116,7 @@ class MainWindow(QMainWindow):
             progress.setMinimumDuration(500)
         dust = self.spinDust.value() if getattr(self, 'spinDust', None) is not None else 4
         moved = 0
-        pad = self.getPadding() or [0, 0, 0, 0]   # [top, right, bottom, left]
         mingap = self.spinMinGap.value() if getattr(self, 'spinMinGap', None) is not None else 1
-        log("SKIP", "padding t,r,b,l = %s, min gap %d px, dust %d" % (pad, mingap, dust))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             for k, idx in enumerate(pages):
@@ -1149,6 +1136,11 @@ class MainWindow(QMainWindow):
                 else:
                     undo["rects"].append((s, idx, self._selFrac(s)))
                 img = self.viewer.getImage(idx)
+                # Read again for this page. A padding change before the next
+                # page, or before the next skip, has to be the one that is used.
+                pad = self.getPadding() or [0, 0, 0, 0]
+                log("SKIP", "page %d padding t,r,b,l = %s, min gap %d px, dust %d" % (
+                    idx + 1, pad, mingap, dust))
                 for e in edges:
                     orect = s.mapRectToImage(s.rect).toRect()
                     nrect, d = skip_rect(img, orect, e, n, dust, mingap)
@@ -1242,7 +1234,7 @@ class MainWindow(QMainWindow):
             orect = QRectF(orect)
             nrect = QRectF(nrect)
 
-            # adjust for padding ...
+            # Live Padding field, read here and not earlier in the run.
             dtop, dright, dbottom, dleft = self.getPadding()
             nrect.adjust(-dleft, -dtop, dright, dbottom)
             # ... but don't overadjust

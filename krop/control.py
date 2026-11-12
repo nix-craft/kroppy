@@ -392,6 +392,24 @@ class ControlServer(object):
             return {"name": "analyze_other_pages", "value": bool(panel.backgroundBox.isChecked())}
         raise ControlError("unknown option %s" % name)
 
+    def _cmd_set_padding(self, args, sock, req_id):
+        if "value" not in args and "padding" not in args:
+            raise ControlError("set_padding requires value")
+        text = args.get("value", args.get("padding"))
+        from krop.padding import parse_padding
+        try:
+            parse_padding(text)
+        except ValueError as exc:
+            raise ControlError(str(exc))
+        self.window.ui.editPadding.setText(str(text))
+        return _padding_info(self.window)
+
+    def _cmd_trim(self, args, sock, req_id):
+        return _run_trim(self.window, args, copier=False)
+
+    def _cmd_trim_copier(self, args, sock, req_id):
+        return _run_trim(self.window, args, copier=True)
+
     def _cmd_wait_idle(self, args, sock, req_id):
         timeout = args.get("timeout", 30)
         try:
@@ -561,6 +579,53 @@ def _analysis_document(panel):
     return {"summary": summary, "pages": pages, "images": images}
 
 
+def _padding_info(window):
+    """The Padding field, read now."""
+    pad = window.getPadding()
+    return {
+        "text": window.ui.editPadding.text(),
+        "top": pad[0], "right": pad[1], "bottom": pad[2], "left": pad[3],
+    }
+
+
+def _crop_report(window):
+    viewer = window.viewer
+    if viewer.isEmpty():
+        return []
+    pages = []
+    for index in range(viewer.numPages()):
+        pages.append([list(box) for box in viewer.cropValues(index)])
+    return pages
+
+
+def _run_trim(window, args, copier):
+    """Run one trim action. Padding is whatever the field says at that moment."""
+    scope = str(args.get("scope") or args.get("which") or "page").strip().lower().replace("-", "_")
+    if copier:
+        if getattr(window, "checkCopierTrim", None) is None:
+            raise ControlError("copier trim is not available")
+        window.checkCopierTrim.setChecked(True)
+    if scope in ("current", "selection"):
+        if window.selections.currentSelection is None:
+            raise ControlError("no selection to trim")
+        window.slotTrimMargins()
+    elif scope in ("page", "all_on_page"):
+        window.slotTrimMarginsAll()
+    elif scope in ("every", "every_page", "all"):
+        if window.viewer.isEmpty():
+            raise ControlError("no document")
+        window.ui.radioSelIndividual.setChecked(True)
+        window.slotTrimMarginsEveryPage()
+    else:
+        raise ControlError("scope must be current, page, or every")
+    return {
+        "scope": scope,
+        "copier": bool(getattr(window, "checkCopierTrim", None) and window.checkCopierTrim.isChecked()),
+        "padding": _padding_info(window),
+        "crops": _crop_report(window),
+    }
+
+
 def _state(window):
     viewer = window.viewer
     panel = window.analysisPanel
@@ -615,6 +680,7 @@ def _state(window):
             "preview": bool(panel.preview_enabled()),
             "analyze_other_pages": bool(panel.backgroundBox.isChecked()),
         },
+        "padding": _padding_info(window),
     }
 
 
