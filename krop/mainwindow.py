@@ -1205,6 +1205,11 @@ class MainWindow(QMainWindow):
         log("SKIP", "undo: restored %d selection(s), removed %d" % (len(undo["rects"]), len(undo["created"])))
 
     def slotTrimMargins(self):
+        if self.viewer.isEmpty():
+            return
+        # The toolbar trim works with no box yet: make a full-page selection.
+        if self.selections.currentSelection is None:
+            self.selections.addSelection()
         if self.selections.currentSelection is not None:
             self.trimMarginsSelection(self.selections.currentSelection)
             self.pdfScene.update()
@@ -1220,24 +1225,25 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # orect is the original selection, nrect is the trimmed version
-            orect = sel.mapRectToImage(sel.rect).toRect()
+            # Always search the full page image (MediaBox / KropFullBox as shown),
+            # not the box left by the previous trim or by crop recovery.
+            # A second run with a different Padding can then grow or shrink.
             nrect = None
+            full = None
             for idx in pages:
-                # calculate values for trimming
                 img = self.viewer.getImage(idx)
+                full = img.rect()
                 if getattr(self, 'checkCopierTrim', None) is not None and self.checkCopierTrim.isChecked():
-                    nrect = copierTrimMargins(img, orect, nrect, dust=self.spinDust.value())
+                    nrect = copierTrimMargins(img, full, nrect, dust=self.spinDust.value())
                 else:
-                    nrect = autoTrimMargins(img, orect, nrect, sensitivity, allowedchanges)
+                    nrect = autoTrimMargins(img, full, nrect, sensitivity, allowedchanges)
 
-            orect = QRectF(orect)
+            orect = QRectF(self.viewer.getImage(self.viewer.currentPageIndex).rect())
             nrect = QRectF(nrect)
 
             # Live Padding field, read here and not earlier in the run.
             dtop, dright, dbottom, dleft = self.getPadding()
             nrect.adjust(-dleft, -dtop, dright, dbottom)
-            # ... but don't overadjust
             nrect = nrect.intersected(orect)
 
             # take fixed aspect ratio into account

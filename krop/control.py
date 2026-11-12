@@ -606,8 +606,9 @@ def _run_trim(window, args, copier):
             raise ControlError("copier trim is not available")
         window.checkCopierTrim.setChecked(True)
     if scope in ("current", "selection"):
-        if window.selections.currentSelection is None:
-            raise ControlError("no selection to trim")
+        if window.viewer.isEmpty():
+            raise ControlError("no document")
+        # Same as the toolbar: a page with no selection gets a full-page box, then trim.
         window.slotTrimMargins()
     elif scope in ("page", "all_on_page"):
         window.slotTrimMarginsAll()

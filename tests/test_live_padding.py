@@ -57,9 +57,8 @@ def _margins(window):
     return crops[0]
 
 
-def _assert_padding_delta(window, tight, loose, pixels):
+def _assert_padding_delta(image, tight, loose, pixels):
     """loose used the larger padding, so each margin is smaller by that many pixels."""
-    image = window.viewer.getImage(0)
     sizes = (image.width(), image.height(), image.width(), image.height())
     for index, size in enumerate(sizes):
         got = (tight[index] - loose[index]) * size
@@ -118,4 +117,89 @@ def _run_actions(window, qapp, sock, actions, pixels):
         assert again["padding"]["left"] == pixels
         assert again["copier"] is cmd.startswith("trim_copier")
         loose = _margins(window)
-        _assert_padding_delta(window, tight, loose, pixels)
+        _assert_padding_delta(window.viewer.getImage(0), tight, loose, pixels)
+
+
+def _with_existing_crop(path):
+    """Same sheet, but CropBox is inset and /KropFullBox keeps the full page."""
+    _sheet(path)
+    doc = pymupdf.open(path)
+    for page in doc:
+        box = page.mediabox
+        doc.xref_set_key(page.xref, "KropFullBox", "[%g %g %g %g]" % (box.x0, box.y0, box.x1, box.y1))
+        page.set_cropbox(pymupdf.Rect(box.x0 + 18, box.y0 + 18, box.x1 - 18, box.y1 - 18))
+    tmp = path + ".tmp"
+    doc.save(tmp)
+    doc.close()
+    os.replace(tmp, path)
+
+
+def test_retrim_without_reset_on_a_file_with_crops(window, tmp_path, qapp, monkeypatch):
+    """Nick's sequence: trim, change padding, trim again. Do not rebuild the selection."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    os.makedirs(tmp_path / "run")
+    path = str(tmp_path / "cropped.pdf")
+    _with_existing_crop(path)
+    window.resize(900, 700)
+    window.show()
+    qapp.processEvents()
+    window.openFile(path, True)
+    qapp.processEvents()
+    assert window.selections.items, "crop recovery should restore a selection per page"
+    recovered = [window.viewer.cropValues(i) for i in range(window.viewer.numPages())]
+    assert recovered[0][0][0] > 0.02
+
+    sock = str(tmp_path / "run" / ("kroppy-%d.sock" % os.getpid()))
+    server = start_control(window, sock)
+    assert server is not None
+    window.checkCopierTrim.setChecked(False)
+
+    def run(cmd, scope, padding):
+        _call(qapp, sock, "set_padding", {"value": str(padding)})
+        result = _call(qapp, sock, cmd, {"scope": scope})
+        assert result["padding"]["top"] == padding
+        crops = []
+        for index in range(window.viewer.numPages()):
+            boxes = window.viewer.cropValues(index)
+            crops.append(boxes[0] if boxes else None)
+        return crops
+
+    actions = (
+        ("trim", "every"),
+        ("trim", "page"),
+        ("trim", "current"),
+        ("trim_copier", "every"),
+        ("trim_copier", "page"),
+        ("trim_copier", "current"),
+    )
+    pixels = 30
+    try:
+        for cmd, scope in actions:
+            window.openFile(path, True)
+            qapp.processEvents()
+            window.checkCopierTrim.setChecked(False)
+            wide = run(cmd, scope, pixels)
+            tight = run(cmd, scope, 0)
+            again = run(cmd, scope, pixels)
+            # page/current trim the page on screen. every trims each page.
+            indexes = range(window.viewer.numPages()) if scope == "every" else (0,)
+            for index in indexes:
+                assert None not in (tight[index], wide[index], again[index]), (cmd, scope, index)
+                _assert_padding_delta(window.viewer.getImage(index), tight[index], wide[index], pixels)
+                for edge in range(4):
+                    assert abs(wide[index][edge] - again[index][edge]) < 0.004, (
+                        cmd, scope, index, wide[index], again[index])
+        # No box yet: trim current and trim page still trim this page.
+        window.openFile(path, False)
+        qapp.processEvents()
+        window.selections.deleteSelections()
+        window.checkCopierTrim.setChecked(False)
+        assert window.selections.currentSelection is None
+        made = run("trim", "current", 0)
+        assert made[0][0] > 0.05
+        window.selections.deleteSelections()
+        made = run("trim", "page", pixels)
+        assert made[0][0] < 0.1
+    finally:
+        window.ui.editPadding.setText("2")
+        window.checkCopierTrim.setChecked(True)
