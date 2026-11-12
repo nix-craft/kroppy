@@ -338,9 +338,14 @@ def _jbig2_bytes(bits):
 
 
 def install_image(doc, xref, encoded):
-    """Replace xref's stream and image dictionary. SMask and Mask stay."""
+    """Replace xref's stream and image dictionary. SMask and Mask stay.
+
+    ``compress=0`` stores the bytes as they are. The stream is already
+    Flate, DCT, CCITT, or JBIG2; asking MuPDF to compress it again is a
+    second full deflate of data that will not get smaller.
+    """
     data = bytes(encoded["data"])
-    doc.update_stream(int(xref), data, compress=False)
+    doc.update_stream(int(xref), data, compress=0)
     for key, value in encoded["keys"].items():
         doc.xref_set_key(int(xref), key, value)
     for key in ("Decode", "ImageMask"):
@@ -384,23 +389,22 @@ def _placement(doc, xref):
 def render_page_array(path, xref, encoded, dpi=96):
     """Install ``encoded`` and return the page RGB at ``dpi``, plus install/render seconds.
 
-    The array owns its samples. ``encoded`` None renders the original page.
+    The working copy stays open. A later target replaces the stream in place
+    instead of parsing the PDF again. The array owns its samples.
     """
     import time
     dpi_i = int(round(float(dpi)))
-    wc = WorkingCopy(path)
-    try:
-        started = time.perf_counter()
-        page_i, _rect = _placement(wc.doc, xref)
-        if encoded:
-            wc.rebuild({int(xref): "placed"}, {(int(xref), "placed"): encoded})
-        install_s = time.perf_counter() - started
-        started = time.perf_counter()
-        rgb = _clip_rgb(wc.doc[page_i], dpi_i, None)
-        render_s = time.perf_counter() - started
-        return rgb, install_s, render_s, page_i
-    finally:
-        wc.close()
+    wc = live_copy(path)
+    started = time.perf_counter()
+    if encoded:
+        wc.rebuild({int(xref): "placed"}, {(int(xref), "placed"): encoded})
+    install_s = time.perf_counter() - started
+    page_i = wc.page_for(xref)
+    started = time.perf_counter()
+    rgb = _clip_rgb(wc.doc[page_i], dpi_i, None)
+    wc.note_page(page_i)
+    render_s = time.perf_counter() - started
+    return rgb, install_s, render_s, page_i
 
 
 def paired_display(path, xref, encoded, dpi=96):
@@ -500,39 +504,145 @@ def stream_length(doc, xref):
         return len(doc.xref_stream(int(xref)))
 
 
+_SNAP_KEYS = (
+    "Filter", "DecodeParms", "ColorSpace", "BitsPerComponent",
+    "Width", "Height", "Decode", "ImageMask",
+)
+
+_LIVE = {}
+_LIVE_LOCK = None
+
+
+def _live_lock():
+    global _LIVE_LOCK
+    if _LIVE_LOCK is None:
+        import threading
+        _LIVE_LOCK = threading.Lock()
+    return _LIVE_LOCK
+
+
+def live_copy(path):
+    """One working copy per file. Switching targets does not parse the PDF again."""
+    path = os.path.abspath(path)
+    with _live_lock():
+        wc = _LIVE.get(path)
+        if wc is None or wc.doc is None:
+            wc = WorkingCopy(path)
+            _LIVE[path] = wc
+        return wc
+
+
 class WorkingCopy(object):
-    """In-memory copy of a PDF. The file on disk is not opened for writing."""
+    """In-memory copy of a PDF. The file on disk is not opened for writing.
+
+    ``rebuild`` replaces streams in the document that is already open. It does
+    not close, reopen, garbage-collect, or save the document.
+    """
 
     def __init__(self, path):
+        import pymupdf
         self.path = os.path.abspath(path)
         with open(self.path, "rb") as fh:
             self._bytes = fh.read()
-        self.doc = None
+        self.doc = pymupdf.open(stream=self._bytes, filetype="pdf")
         self.choices = {}
-        self.rebuild({}, {})
+        self._snap = {}
+        self._sig = {}
+        self._pages = set()
+        self._page_for = {}
 
     def close(self):
         if self.doc is not None:
             self.doc.close()
             self.doc = None
+        if _LIVE.get(self.path) is self:
+            _LIVE.pop(self.path, None)
+
+    def page_for(self, xref):
+        xref = int(xref)
+        cached = self._page_for.get(xref)
+        if cached is not None:
+            return cached
+        page_i, _rect = _placement(self.doc, xref)
+        self._page_for[xref] = page_i
+        return page_i
+
+    def note_page(self, page_i):
+        self._pages.add(int(page_i))
+
+    def drop_cached_pages(self):
+        """Drop pages already drawn so the next pixmap sees the new stream."""
+        if self.doc is None:
+            return
+        for page_i in list(self._pages):
+            try:
+                self.doc.reload_page(self.doc[page_i])
+            except Exception:
+                pass
+
+    def _snapshot(self, xref):
+        xref = int(xref)
+        if xref in self._snap:
+            return
+        try:
+            raw = self.doc.xref_stream_raw(xref)
+        except Exception:
+            raw = None
+        keys = {}
+        for key in _SNAP_KEYS:
+            try:
+                keys[key] = self.doc.xref_get_key(xref, key)
+            except Exception:
+                keys[key] = ("null", "null")
+        self._snap[xref] = (None if raw is None else bytes(raw), keys)
+
+    def _restore(self, xref):
+        xref = int(xref)
+        snap = self._snap.get(xref)
+        if not snap or snap[0] is None:
+            return False
+        raw, keys = snap
+        self.doc.update_stream(xref, raw, compress=0)
+        for key, (kind, value) in keys.items():
+            try:
+                if kind == "null" or value in ("null", None, ""):
+                    self.doc.xref_set_key(xref, key, "null")
+                else:
+                    self.doc.xref_set_key(xref, key, value)
+            except Exception:
+                pass
+        return True
 
     def rebuild(self, choices, blobs):
-        """Reset to the original bytes, then install each non-keep choice.
+        """Install each non-keep choice into the open document.
 
-        blobs maps (xref, target) to an encoded stream dict.
+        A choice that was dropped is put back from the original stream bytes.
+        The PDF is not opened again and nothing is written to disk.
         """
-        import pymupdf
-        if self.doc is not None:
-            self.doc.close()
-        self.doc = pymupdf.open(stream=self._bytes, filetype="pdf")
-        applied = {}
+        wanted = {}
         for xref, target in (choices or {}).items():
-            if not target or target == "keep":
+            if target and str(target) != "keep":
+                wanted[int(xref)] = str(target)
+        dropped = False
+        changed = False
+        for xref in list(self.choices):
+            if xref not in wanted:
+                self._restore(xref)
+                self.choices.pop(xref, None)
+                self._sig.pop(xref, None)
+                dropped = True
+        for xref, target in wanted.items():
+            blob = blobs[(xref, target)]
+            sig = id(blob.get("data"))
+            if self.choices.get(xref) == target and self._sig.get(xref) == sig:
                 continue
-            blob = blobs[(int(xref), str(target))]
-            install_image(self.doc, int(xref), blob)
-            applied[int(xref)] = str(target)
-        self.choices = applied
+            self._snapshot(xref)
+            install_image(self.doc, xref, blob)
+            self.choices[xref] = target
+            self._sig[xref] = sig
+            changed = True
+        if changed or dropped:
+            self.drop_cached_pages()
         return self.doc
 
     def original_bytes(self):

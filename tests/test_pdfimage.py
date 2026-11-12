@@ -143,6 +143,31 @@ def test_indexed_text_stays_black_when_mupdf_renders_it(tmp_path):
     copy.close()
 
 
+def test_second_target_replaces_the_stream_in_place(tmp_path):
+    """Switching targets must not reopen the PDF, and the new stream has to show."""
+    arr = np.zeros((48, 64, 3), np.uint8)
+    arr[:] = (20, 40, 180)
+    arr[16:24] = (0, 0, 0)
+    path = str(tmp_path / "switch.pdf")
+    xref, _rect = _place(path, arr, twice=False)
+    encode_file_image(path, xref, "indexed-4", 10000, "")
+    encode_file_image(path, xref, "gray-4", 10000, "")
+    indexed = cached_encoded(path, xref, "indexed-4")
+    gray = cached_encoded(path, xref, "gray-4")
+    copy = WorkingCopy(path)
+    copy.rebuild({xref: "indexed-4"}, {(xref, "indexed-4"): indexed})
+    copy.note_page(0)
+    first = _page_rgb(copy.doc, 0)
+    copy.rebuild({xref: "gray-4"}, {(xref, "gray-4"): gray})
+    second = _page_rgb(copy.doc, 0)
+    assert stream_length(copy.doc, xref) == len(gray["data"])
+    assert not np.array_equal(first, second)
+    # Gray replacement: the channels match. Indexed color does not.
+    assert int(np.abs(second[:, :, 0].astype(int) - second[:, :, 2].astype(int)).max()) < 8
+    assert int(np.abs(first[:, :, 0].astype(int) - first[:, :, 2].astype(int)).max()) > 8
+    copy.close()
+
+
 def test_preview_off_uses_the_original_page(window, tmp_path, qapp):
     grad = np.zeros((48, 80, 3), np.uint8)
     grad[:, :, 0] = np.linspace(0, 255, 80, dtype=np.float32).astype(np.uint8)

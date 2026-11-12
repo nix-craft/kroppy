@@ -911,7 +911,7 @@ def _encode_timed(path, xref, target_id, stored, filt):
     threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
     encoded = encode_stream(
         arr, target_id, max_err=threshold, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol,
-        flate_level=6)
+        flate_level=1)
     if not encoded:
         stages_take()
         entry = _entry(target_id, None, None, None, True, stored, filt or None, stored)

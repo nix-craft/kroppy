@@ -104,9 +104,9 @@ def stages_format(parts):
 def flate_best(rows, bpc, w, level=9):
     """Smallest of raw Flate and PNG predictor 15 (Sub or Up), as in pdf-to-gray.py.
 
-    Preview passes a lower zlib level. The uncompressed winner is returned
-    so save can compress it at level 9. On a large image the predictor is
-    chosen at level 1, then only that candidate is compressed.
+    Preview passes zlib level 1. The uncompressed winner is returned so save
+    can compress it at level 9. On a large image the predictor is chosen from
+    a sample, then only that candidate is compressed.
     """
     rows = np.ascontiguousarray(rows)
     level = int(level)
@@ -118,8 +118,48 @@ def flate_best(rows, bpc, w, level=9):
     if len(raws[0]) < 2_000_000:
         packed = [(zlib.compress(raw, level), parm, raw) for raw, parm in zip(raws, parms)]
         return min(packed, key=lambda c: len(c[0]))
-    pick = min(range(len(raws)), key=lambda i: len(zlib.compress(raws[i], 1)))
+
+    def probe(raw):
+        chunk = raw if len(raw) <= 524288 else raw[:524288]
+        return len(zlib.compress(chunk, 1))
+
+    pick = min(range(len(raws)), key=lambda i: probe(raws[i]))
     return zlib.compress(raws[pick], level), parms[pick], raws[pick]
+
+
+def _flate_while(rows, bpc, width, level, compare):
+    """Compress on a side thread while ``compare`` runs. Returns (flate tuple, compare result).
+
+    The stage line records both durations and the overlapped wall time, which
+    is the one that adds to the preview.
+    """
+    box = {}
+    started = time.perf_counter()
+
+    def work():
+        t0 = time.perf_counter()
+        try:
+            box["result"] = flate_best(rows, bpc, width, level=level)
+        except Exception as exc:
+            box["error"] = exc
+        box["flate"] = time.perf_counter() - t0
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    t0 = time.perf_counter()
+    compared = compare()
+    compare_s = time.perf_counter() - t0
+    thread.join()
+    wall = time.perf_counter() - started
+    if getattr(_STAGES, "on", False):
+        _STAGES.parts.append((
+            "flate %.2f/compare %.2f" % (box.get("flate", 0.0), compare_s),
+            wall,
+        ))
+        _STAGES.t = time.perf_counter()
+    if box.get("error") is not None:
+        raise box["error"]
+    return box["result"], compared
 
 
 def _pin_extreme_codes(keep, limit):
@@ -332,20 +372,22 @@ def encode_gray_flate(arr, bits, max_err=None, neutral_tol=0, level=9):
     q, level_err = quantize_bits(g, bits)
     stage("quantize")
     bpc = 8 if int(bits) >= 8 else int(bits)
-    rows = pack_indexed(q, bpc)
-    data, parms, raw = flate_best(np.ascontiguousarray(rows), bpc, width, level=level)
-    stage("flate")
+    rows = np.ascontiguousarray(pack_indexed(q, bpc))
+    plane = q if int(bits) >= 8 else (q.astype(np.uint16) * (255 // ((1 << int(bits)) - 1))).astype(np.uint8)
+
+    def compare():
+        # Color error is the gray plane against the original RGB, not gray-vs-gray.
+        if chroma <= int(neutral_tol):
+            mx = int(level_err.max()) if level_err.size else 0
+            mean = float(level_err.mean()) if level_err.size else 0.0
+            p995 = float(np.percentile(level_err, 99.5)) if level_err.size else 0.0
+            return mx, mean, p995
+        return _gray_against_color(plane, rgb)
+
+    (data, parms, raw), (mx, mean, p995) = _flate_while(rows, bpc, width, level, compare)
     keys = _image_keys(width, height, bpc, "/DeviceGray", "/FlateDecode")
     if parms:
         keys["DecodeParms"] = _parms_pdf(parms)
-    plane = q if int(bits) >= 8 else (q.astype(np.uint16) * (255 // ((1 << int(bits)) - 1))).astype(np.uint8)
-    # Color error is the gray plane against the original RGB, not gray-vs-gray.
-    mx, mean, p995 = _gray_against_color(plane, rgb)
-    if chroma <= int(neutral_tol):
-        mx = int(level_err.max()) if level_err.size else 0
-        mean = float(level_err.mean()) if level_err.size else 0.0
-        p995 = float(np.percentile(level_err, 99.5)) if level_err.size else 0.0
-    stage("compare")
     over = max_err is not None and mx > int(max_err)
     return _blob(
         data, keys, "Flate", None, mx, mean, over, chroma=chroma, decode_parms=parms,
@@ -362,16 +404,14 @@ def encode_indexed(arr, n, min_frac=1e-4, max_err=None, level=9):
     stage("quantize")
     bpc = 4 if len(pal) <= 16 else 8
     rows = np.ascontiguousarray(pack_indexed(idx, bpc))
-    data, parms, raw = flate_best(rows, bpc, width, level=level)
-    stage("flate")
+    (data, parms, raw), (mx, mean, p995) = _flate_while(
+        rows, bpc, width, level, lambda: _palette_against_color(idx, pal, src))
     hexpal = pal.astype(np.uint8).tobytes().hex().upper()
     last = max(0, int(len(pal)) - 1)
     space = "[/Indexed /DeviceRGB %d <%s>]" % (last, hexpal)
     keys = _image_keys(width, height, bpc, space, "/FlateDecode")
     if parms:
         keys["DecodeParms"] = _parms_pdf(parms)
-    mx, mean, p995 = _palette_against_color(idx, pal, src)
-    stage("compare")
     over = max_err is not None and mx > int(max_err)
     return _blob(
         data, keys, "Flate", None, mx, mean, over,

@@ -587,14 +587,9 @@ class AbstractViewerItem(QGraphicsItem):
             blobs[key] = blob
         if not choices:
             return False
-        import os
-        from krop.pdfimage import WorkingCopy
-        working = getattr(self, "_working", None)
-        if working is None or working.path != os.path.abspath(path):
-            if working is not None:
-                working.close()
-            working = WorkingCopy(path)
-            self._working = working
+        from krop.pdfimage import live_copy
+        working = live_copy(path)
+        self._working = working
         working.rebuild(choices, blobs)
         self._preview_doc = working.doc
         self._preview_choices = tuple(sorted(choices.items()))
