@@ -29,6 +29,33 @@ from krop.pdfimage import apply_cached_choices, arm_save
 N = pikepdf.Name
 
 
+def test_display_keep_is_exact_and_rgb24_is_close(tmp_path):
+    """preview_display is compared to the original render of the same clip."""
+    from krop.imagetarget import _mae_max, encode_file_image
+    from krop.pdfimage import cached_encoded, paired_display
+    arr = np.zeros((48, 64, 3), np.uint8)
+    arr[:] = (30, 90, 200)
+    arr[16:20, 8:56] = (0, 0, 0)
+    arr[:, :, 0] = np.linspace(20, 220, 64, dtype=np.float32).astype(np.uint8)
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=240)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, 64, 48, np.ascontiguousarray(arr).tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(20, 30, 160, 150), pixmap=pix)
+    path = str(tmp_path / "clip.pdf")
+    doc.save(path)
+    doc.close()
+    shown, original = paired_display(path, xref, None, dpi=72)
+    mae, _p, _m = _mae_max(original, shown)
+    assert mae == 0
+    encode_file_image(path, xref, "rgb-24", 10000, "")
+    enc = cached_encoded(path, xref, "rgb-24")
+    assert enc
+    shown, original = paired_display(path, xref, enc, dpi=72)
+    assert shown.shape == original.shape
+    mae, _p, _m = _mae_max(original, shown)
+    assert mae < 1, mae
+
+
 def test_indexed_keeps_black_text_on_blue():
     """Black type on a blue page must survive indexed-16 and indexed-8."""
     from krop.imagetarget import reconstruct

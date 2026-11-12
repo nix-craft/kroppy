@@ -711,17 +711,26 @@ def _export_image(window, xref, which, path):
         saved = _write_array(path, rgba[:, :, :3], rgba[:, :, 3])
         stats = _error_stats(color, rgba[:, :, :3])
     else:
-        image = _display_image(window, source, xref, target, rotation)
-        if image is None or image.isNull():
-            raise ControlError("no display preview for xref %d" % xref)
-        if not image.save(path, "PNG"):
-            raise ControlError("could not write %s" % path)
-        shown = _qimage_rgb(image)
-        oriented = orient_for_page(color, rotation)
-        if shown.shape[:2] != oriented.shape[:2]:
-            oriented = _resize_box(oriented, shown.shape[0], shown.shape[1])
-        saved = {"width": int(image.width()), "height": int(image.height())}
-        stats = _error_stats(oriented, shown)
+        from krop.imagetarget import encode_file_image
+        from krop.imagehighlight import VIEW_DPI
+        from krop.pdfimage import cached_encoded, paired_display
+        encoded = None
+        if target != "keep":
+            encode_file_image(source, xref, target, 0, "")
+            encoded = cached_encoded(source, xref, target)
+            if not encoded:
+                raise ControlError("no display preview for xref %d" % xref)
+        zoom = 1.0
+        try:
+            scene = viewer.scene()
+            for view in scene.views() if scene is not None else []:
+                zoom = max(zoom, abs(float(view.transform().m11())))
+        except Exception:
+            zoom = 1.0
+        dpi = int(round(max(72.0, min(216.0, float(VIEW_DPI) * zoom))))
+        shown, original = paired_display(source, xref, encoded, dpi=dpi)
+        saved = _write_array(path, shown, None)
+        stats = _error_stats(original, shown)
     saved.update(stats)
     saved.update({"path": path, "which": which, "xref": xref, "target": target})
     return saved

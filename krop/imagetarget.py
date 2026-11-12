@@ -833,22 +833,60 @@ def fill_pending_file(path, xref, candidates, stored, filt, threshold, width, he
     return filled
 
 
+_ENCODE_LOCK = None
+_ENCODE_WAIT = {}
+
+
+def _encode_lock():
+    global _ENCODE_LOCK
+    if _ENCODE_LOCK is None:
+        import threading
+        _ENCODE_LOCK = threading.Lock()
+    return _ENCODE_LOCK
+
+
 def encode_file_image(path, xref, target_id, stored_bytes, filt):
     """Trial-encode one candidate for xref. Safe to call off the UI thread.
 
-    The size is the encoded stream length, not an estimate. The error is
-    MuPDF's decode of that stream against the full-resolution original.
-    The bytes are cached for the working-copy preview and a later save.
+    The size is the encoded stream length, not an estimate. Measure and
+    preview share one encode: a second caller waits for the first instead
+    of starting again.
     """
     import os
-    from krop.pdfimage import cached_entry, decode_stream, encode_stream, remember
+    import threading
+    from krop.pdfimage import cached_entry
     stored = int(stored_bytes or 0)
     target_id = str(target_id)
     if target_id == "keep":
         return _entry("keep", 0, 0, 0, False, stored, filt or "keep", stored)
-    hit = cached_entry(path, xref, target_id)
-    if hit is not None:
-        return hit
+    key = (os.path.abspath(path), int(xref), target_id)
+    while True:
+        lock = _encode_lock()
+        with lock:
+            hit = cached_entry(path, xref, target_id)
+            if hit is not None:
+                return hit
+            waiter = _ENCODE_WAIT.get(key)
+            if waiter is None:
+                waiter = threading.Event()
+                _ENCODE_WAIT[key] = waiter
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waiter.wait()
+            continue
+        try:
+            return _encode_file_image_now(path, xref, target_id, stored, filt)
+        finally:
+            with lock:
+                _ENCODE_WAIT.pop(key, None)
+            waiter.set()
+
+
+def _encode_file_image_now(path, xref, target_id, stored, filt):
+    import os
+    from krop.pdfimage import encode_stream, remember
     arr = _load_xref_array(path, xref)
     raw_jpeg = None
     neutral_tol = 0
@@ -868,11 +906,22 @@ def encode_file_image(path, xref, target_id, stored_bytes, filt):
         entry["gate"] = "max"
         entry["note"] = "left unchanged"
         return entry
-    try:
-        recon = decode_stream(encoded)
-    except Exception:
-        recon = encoded.get("recon")
-    mae, p995, mx = _error_against(_rgb(arr), recon)
+    recon = encoded.get("recon")
+    if recon is None:
+        from krop.pdfimage import decode_stream
+        try:
+            recon = decode_stream(encoded)
+        except Exception:
+            recon = None
+    if recon is None:
+        mae, p995, mx = 0.0, 0.0, 0
+    else:
+        # Percentile on a stride. The max-error gate already used every pixel.
+        step = 1
+        n = recon.shape[0] * recon.shape[1]
+        if n > 200000:
+            step = int(round((n / 200000.0) ** 0.5)) or 1
+        mae, p995, mx = _error_against(_rgb(arr)[::step, ::step], recon[::step, ::step])
     if encoded.get("gate") == "max":
         mx = encoded.get("max_err", mx)
         mae = encoded.get("mean_err", mae)

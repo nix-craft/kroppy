@@ -335,6 +335,53 @@ def install_image(doc, xref, encoded):
     return len(data)
 
 
+def _clip_rgb(page, dpi, rect):
+    import numpy as np
+    kwargs = {"alpha": False, "dpi": int(dpi)}
+    if rect is not None:
+        kwargs["clip"] = rect
+    pix = page.get_pixmap(**kwargs)
+    raw = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.stride)[:, :pix.w * pix.n]
+    return np.ascontiguousarray(raw.reshape(pix.h, pix.w, pix.n)[..., :3])
+
+
+def _placement(doc, xref):
+    for i, page in enumerate(doc):
+        try:
+            rects = page.get_image_rects(int(xref))
+        except Exception:
+            rects = []
+        if rects:
+            return i, rects[0]
+    return 0, None
+
+
+def paired_display(path, xref, encoded, dpi=96):
+    """(shown, original) renders with the same page, clip, dpi, and matrix.
+
+    ``encoded`` None is the original image (target keep): the two arrays match.
+    """
+    import pymupdf
+    dpi_i = int(round(float(dpi)))
+    original = pymupdf.open(path)
+    try:
+        page_i, rect = _placement(original, xref)
+        base = _clip_rgb(original[page_i], dpi_i, rect)
+    finally:
+        original.close()
+    if not encoded:
+        return base.copy(), base
+    wc = WorkingCopy(path)
+    try:
+        wc.rebuild({int(xref): "placed"}, {(int(xref), "placed"): encoded})
+        shown = _clip_rgb(wc.doc[page_i], dpi_i, rect)
+    finally:
+        wc.close()
+    h = min(shown.shape[0], base.shape[0])
+    w = min(shown.shape[1], base.shape[1])
+    return shown[:h, :w].copy(), base[:h, :w].copy()
+
+
 def render_placed_image(path, xref, encoded, dpi=96):
     """MuPDF render of one replaced image, cropped to its placement on the page.
 

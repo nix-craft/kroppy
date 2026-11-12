@@ -67,11 +67,23 @@ def pack4(q):
 
 
 def flate_best(rows, bpc, w):
-    cands = [(zlib.compress(rows.tobytes(), 9), None)]
+    """Smallest of raw Flate and PNG predictor 15 (Sub or Up), as in pdf-to-gray.py.
+
+    On a large image the three level-9 compressions dominate the encode.
+    The predictor is chosen at level 1, then only the winner is compressed
+    at level 9.
+    """
+    rows = np.ascontiguousarray(rows)
+    raws = [rows.tobytes()]
+    parms = [None]
     for f in (1, 2):
-        cands.append((zlib.compress(png_predict(rows, f), 9),
-                      {"Predictor": 15, "Colors": 1, "BitsPerComponent": int(bpc), "Columns": int(w)}))
-    return min(cands, key=lambda c: len(c[0]))
+        raws.append(png_predict(rows, f))
+        parms.append({"Predictor": 15, "Colors": 1, "BitsPerComponent": int(bpc), "Columns": int(w)})
+    if len(raws[0]) < 2_000_000:
+        cands = [(zlib.compress(raw, 9), parm) for raw, parm in zip(raws, parms)]
+        return min(cands, key=lambda c: len(c[0]))
+    pick = min(range(len(raws)), key=lambda i: len(zlib.compress(raws[i], 1)))
+    return zlib.compress(raws[pick], 9), parms[pick]
 
 
 def _pin_extreme_codes(keep, limit):
@@ -89,20 +101,27 @@ def _pin_extreme_codes(keep, limit):
 
 
 def _claim_extremes(idx, pal, rgb):
-    """Move pixels that are nearer black or white than to their snapped color."""
-    pal = np.asarray(pal, np.int16)
-    if not len(pal):
+    """Send near-black and near-white pixels to those palette entries.
+
+    A luma test only. Comparing every pixel with its snapped color made a
+    full-resolution indexed encode several times slower.
+    """
+    pal_i = np.asarray(pal, np.int16)
+    if not len(pal_i):
         return idx, pal
-    black_i = int(np.argmin(np.abs(pal).sum(axis=1)))
-    white_i = int(np.argmin(np.abs(pal - 255).sum(axis=1)))
-    pix = rgb.astype(np.int16)
-    current = pal[idx]
-    dcur = np.abs(current - pix).sum(axis=-1)
-    dblack = np.abs(pix).sum(axis=-1)
-    dwhite = np.abs(pix - 255).sum(axis=-1)
-    out = np.array(idx, copy=True)
-    out[dblack + 16 < dcur] = black_i
-    out[dwhite + 16 < dcur] = white_i
+    black_i = int(np.argmin(pal_i.sum(axis=1)))
+    white_i = int(np.argmin(np.abs(pal_i - 255).sum(axis=1)))
+    # 54/183/19 is the 8-bit form of 0.2126/0.7152/0.0722.
+    r = rgb[..., 0].astype(np.uint16)
+    g = rgb[..., 1].astype(np.uint16)
+    b = rgb[..., 2].astype(np.uint16)
+    luma = (r * 54 + g * 183 + b * 19) >> 8
+    # Chroma guard: pure blue is dark in luma but must not become black.
+    chroma = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+    out = np.array(idx, dtype=np.uint8, copy=True)
+    # Luma 18 keeps blue-fringed black text and leaves a dark Oxford blue (~24).
+    out[(luma <= 18) & (chroma <= 48)] = np.uint8(black_i)
+    out[(luma >= 242) & (chroma <= 24)] = np.uint8(white_i)
     return out, pal
 
 
