@@ -728,25 +728,28 @@ def _export_image(window, xref, which, path):
 
 
 def _display_image(window, source, xref, target, rotation):
-    viewer = window.viewer
-    cached = None
-    try:
-        cached = viewer.previewImage(xref, target, rotation)
-    except Exception:
-        cached = None
-    if cached is not None and not cached.isNull():
-        return cached
+    """The pixmap MuPDF draws for this image at the current zoom, not a Pillow thumbnail."""
     if target == "keep":
         return None
-    from krop.preview import preview_rgba
-    edge = None
-    try:
-        edge = window.analysisPanel._preview_edge(xref)
-    except Exception:
-        edge = None
-    rgba = preview_rgba(source, xref, target, rotation=rotation, max_edge=edge)
+    from krop.imagetarget import encode_file_image
+    from krop.imagehighlight import VIEW_DPI
+    from krop.pdfimage import cached_encoded, render_placed_image
     from krop.vieweritem import _rgba_qimage
-    return _rgba_qimage(rgba)
+    encode_file_image(source, xref, target, 0, "")
+    encoded = cached_encoded(source, xref, target)
+    if not encoded:
+        return None
+    zoom = 1.0
+    viewer = window.viewer
+    try:
+        scene = viewer.scene()
+        for view in scene.views() if scene is not None else []:
+            zoom = max(zoom, abs(float(view.transform().m11())))
+    except Exception:
+        zoom = 1.0
+    dpi = int(round(max(72.0, min(216.0, float(VIEW_DPI) * zoom))))
+    shown = render_placed_image(source, xref, encoded, dpi=dpi)
+    return _rgba_qimage(shown)
 
 
 def _write_array(path, color, alpha):

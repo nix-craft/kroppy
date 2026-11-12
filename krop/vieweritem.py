@@ -625,7 +625,10 @@ class AbstractViewerItem(QGraphicsItem):
         return item.rects()
 
     def deliverPreview(self, payload):
-        """Store a preview. A token that is no longer current is ignored."""
+        """Store a preview. A token that is no longer current is ignored.
+
+        A non-array payload is refused. The caller clears the busy overlay.
+        """
         if not payload or payload.get("rgba") is None:
             return False
         try:
@@ -636,8 +639,15 @@ class AbstractViewerItem(QGraphicsItem):
         expected = (getattr(self, "_preview_tokens", None) or {}).get(xref)
         if expected is not None and token != expected:
             return False
+        rgba = payload.get("rgba")
+        if not hasattr(rgba, "shape"):
+            return False
+        try:
+            image = _rgba_qimage(rgba)
+        except Exception:
+            return False
         key = (xref, str(payload.get("target")), int(payload.get("rotation") or 0))
-        self._preview_cache[key] = _rgba_qimage(payload.get("rgba"))
+        self._preview_cache[key] = image
         self._preview_pending.discard(key)
         if self._busy_token is not None and token == self._busy_token and xref == self._busy_xref:
             self.clearBusy()

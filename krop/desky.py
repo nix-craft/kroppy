@@ -74,6 +74,38 @@ def flate_best(rows, bpc, w):
     return min(cands, key=lambda c: len(c[0]))
 
 
+def _pin_extreme_codes(keep, limit):
+    """Ensure codes for (0,0,0) and (255,255,255) are in the palette."""
+    keep = [int(v) for v in keep]
+    if limit < 2:
+        return np.array(keep, np.int64)
+    for code in (0, (15 << 8) | (15 << 4) | 15):
+        if code in keep:
+            continue
+        if len(keep) >= limit:
+            keep.pop()
+        keep.append(code)
+    return np.array(keep, np.int64)
+
+
+def _claim_extremes(idx, pal, rgb):
+    """Move pixels that are nearer black or white than to their snapped color."""
+    pal = np.asarray(pal, np.int16)
+    if not len(pal):
+        return idx, pal
+    black_i = int(np.argmin(np.abs(pal).sum(axis=1)))
+    white_i = int(np.argmin(np.abs(pal - 255).sum(axis=1)))
+    pix = rgb.astype(np.int16)
+    current = pal[idx]
+    dcur = np.abs(current - pix).sum(axis=-1)
+    dblack = np.abs(pix).sum(axis=-1)
+    dwhite = np.abs(pix - 255).sum(axis=-1)
+    out = np.array(idx, copy=True)
+    out[dblack + 16 < dcur] = black_i
+    out[dwhite + 16 < dcur] = white_i
+    return out, pal
+
+
 def palettize(rgb, min_frac, max_colors=None):
     """rgb uint8 (h,w,3) -> (indices, palette, stats).
 
@@ -97,6 +129,10 @@ def palettize(rgb, min_frac, max_colors=None):
             keep = k16
     if max_colors is not None and len(keep) > int(max_colors):
         keep = order[:int(max_colors)]
+    if max_colors is not None:
+        # Black and white are on the x17 grid. Keep them even when rare, so
+        # thin text is not remapped onto a blue JPEG-noise cluster.
+        keep = _pin_extreme_codes(keep, int(max_colors))
     kc = np.stack([(keep >> 8) & 15, (keep >> 4) & 15, keep & 15], 1).astype(np.int32)
     lut = np.zeros(4096, np.uint8)
     lut[keep] = np.arange(len(keep))
@@ -167,22 +203,18 @@ def encode_gray_flate(arr, bits, max_err=None, neutral_tol=0):
     """
     rgb = _as_rgb(arr)
     height, width = rgb.shape[:2]
+    # Luma, even when the image is real color. pdf-to-gray.py would skip a
+    # color image; a chosen gray target still has to produce a preview.
     if rgb.shape[2] == 3:
-        b = rgb.astype(np.int16)
-        chroma = int(max(np.abs(b[..., 0] - b[..., 1]).max(), np.abs(b[..., 1] - b[..., 2]).max()))
-        if chroma > int(neutral_tol):
-            return None
-        g = rgb[..., 1]
+        chroma = int(max(
+            np.abs(rgb[..., 0].astype(np.int16) - rgb[..., 1].astype(np.int16)).max(),
+            np.abs(rgb[..., 1].astype(np.int16) - rgb[..., 2].astype(np.int16)).max()))
+        g = np.clip(np.rint(
+            0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]), 0, 255).astype(np.uint8)
     else:
         chroma = 0
         g = rgb[..., 0]
-    q, err = quantize_bits(g, bits)
-    mx = int(err.max()) if err.size else 0
-    mean = float(err.mean()) if err.size else 0.0
-    if max_err is not None and int(bits) < 8 and mx > int(max_err):
-        over = True
-    else:
-        over = False
+    q, _level_err = quantize_bits(g, bits)
     bpc = 8 if int(bits) >= 8 else int(bits)
     rows = pack_indexed(q, bpc)
     data, parms = flate_best(np.ascontiguousarray(rows), bpc, width)
@@ -190,6 +222,16 @@ def encode_gray_flate(arr, bits, max_err=None, neutral_tol=0):
     if parms:
         keys["DecodeParms"] = _parms_pdf(parms)
     recon = _gray_recon(q, bits, (height, width))
+    per = np.abs(recon.astype(np.int16) - rgb.astype(np.int16))
+    mx = int(per.max()) if per.size else 0
+    mean = float(per.mean()) if per.size else 0.0
+    # Neutral images use the quantizer error. Color images are over the gate
+    # when the gray version is far from the original, same --max-err rule.
+    if chroma <= int(neutral_tol):
+        _q, level_err = quantize_bits(g, bits)
+        mx = int(level_err.max()) if level_err.size else 0
+        mean = float(level_err.mean()) if level_err.size else 0.0
+    over = max_err is not None and mx > int(max_err)
     return _blob(data, keys, "Flate", recon, mx, mean, over, chroma=chroma, decode_parms=parms)
 
 
@@ -197,7 +239,11 @@ def encode_indexed(arr, n, min_frac=1e-4, max_err=None):
     """Indexed DeviceRGB via pdf-to-gray.py palettize (x17 grid)."""
     rgb = _as_rgb(arr)
     height, width = rgb.shape[:2]
-    idx, pal, st = palettize(np.ascontiguousarray(rgb[..., :3]), min_frac, max_colors=int(n))
+    src = np.ascontiguousarray(rgb[..., :3])
+    idx, pal, st = palettize(src, min_frac, max_colors=int(n))
+    idx, pal = _claim_extremes(idx, pal, src)
+    st = dict(st)
+    st["max_err"] = int(np.abs(pal[idx].astype(np.int16) - src.astype(np.int16)).max()) if src.size else 0
     bpc = 4 if len(pal) <= 16 else 8
     rows = np.ascontiguousarray(pack_indexed(idx, bpc))
     data, parms = flate_best(rows, bpc, width)

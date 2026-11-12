@@ -683,18 +683,24 @@ class AnalysisPanel(QDockWidget):
             self._fail_p0(payload, error or RuntimeError("preview returned nothing"))
             return
         viewer = getattr(self.parent(), "viewer", None)
-        if isinstance(result, dict) and result.get("encoded"):
-            if result.get("entry"):
-                self._apply_measure(payload, result["entry"])
-            if viewer is not None:
-                viewer.install_preview(
-                    payload.get("path"), int(xref), target, result["encoded"], token,
-                    int(payload.get("rotation") or 0))
-        elif viewer is not None:
-            viewer.deliverPreview({
-                "xref": xref, "target": target,
-                "rotation": payload.get("rotation") or 0, "token": token, "rgba": result,
-            })
+        try:
+            if isinstance(result, dict) and result.get("encoded"):
+                if result.get("entry"):
+                    self._apply_measure(payload, result["entry"])
+                if viewer is None or not viewer.install_preview(
+                        payload.get("path"), int(xref), target, result["encoded"], token,
+                        int(payload.get("rotation") or 0)):
+                    raise RuntimeError("preview was not drawn")
+            elif isinstance(result, dict):
+                # A measurement dict is not pixels. Never hand it to the image converter.
+                raise RuntimeError(result.get("entry", {}).get("note") or "preview produced no image stream")
+            elif viewer is None or not viewer.deliverPreview({
+                    "xref": xref, "target": target,
+                    "rotation": payload.get("rotation") or 0, "token": token, "rgba": result}):
+                raise RuntimeError("preview was not drawn")
+        except Exception as exc:
+            self._fail_p0(payload, exc)
+            return
         if watch and watch[2] == token:
             self._preview_timer.stop()
 
@@ -705,6 +711,9 @@ class AnalysisPanel(QDockWidget):
         target = str(payload.get("target"))
         token = payload.get("token")
         self._close_preview(xref, token)
+        watch = getattr(self, "_watch", None)
+        if watch and token is not None and watch[2] == token:
+            self._preview_timer.stop()
         short = str(exc).strip().splitlines()[0] if exc else "unknown"
         if len(short) > 80:
             short = short[:77] + "..."

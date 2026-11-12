@@ -29,6 +29,25 @@ from krop.pdfimage import apply_cached_choices, arm_save
 N = pikepdf.Name
 
 
+def test_indexed_keeps_black_text_on_blue():
+    """Black type on a blue page must survive indexed-16 and indexed-8."""
+    from krop.imagetarget import reconstruct
+    arr = np.zeros((180, 240, 3), np.uint8)
+    arr[:] = (30, 90, 200)
+    arr[30:60] = (150, 190, 245)
+    arr[80:140, 16:110] = (8, 24, 70)
+    arr[88:92, 20:210] = (0, 0, 0)
+    arr[108:112, 20:210] = (12, 16, 36)
+    for tid in ("indexed-16", "indexed-8"):
+        got = reconstruct(arr, tid)
+        bar = got[88:92, 20:210].astype(np.float32)
+        luma = bar @ np.array([0.2126, 0.7152, 0.0722])
+        assert float(luma.mean()) < 25, (tid, float(luma.mean()))
+        colors = np.unique(got.reshape(-1, 3), axis=0).astype(np.float32)
+        darkest = float((colors @ np.array([0.2126, 0.7152, 0.0722])).min())
+        assert darkest < 20, (tid, darkest)
+
+
 def test_palette_matches_desky_cases():
     idx, pal, st = palettize(np.dstack([np.full((100, 100), 255, np.uint8)] * 3), 1e-4)
     assert st["palette"] == 1 and (pal[idx] == 255).all()
@@ -122,6 +141,59 @@ def test_jbig2_p_and_ccitt_and_predictor_and_jpegtran(tmp_path):
     except Exception:
         pytest.skip("jpegtran crop unavailable")
     assert out[:2] == b"\xff\xd8" and w > 0 and h > 0
+
+
+def test_every_ladder_target_finishes_without_leaving_the_overlay(window, tmp_path, qapp):
+    """set_target used to hand a dict to deliverPreview and spin until timeout."""
+    from krop.analyzepanel import _run_queued
+    from krop.imagetarget import ladder_ids
+    doc = pymupdf.open()
+    page = doc.new_page()
+    arr = np.zeros((36, 48, 3), np.uint8)
+    arr[:] = (30, 90, 200)
+    arr[12:16, 6:40] = (0, 0, 0)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, 48, 36, np.ascontiguousarray(arr).tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(40, 50, 200, 170), pixmap=pix)
+    path = str(tmp_path / "ladder.pdf")
+    doc.save(path)
+    doc.close()
+    window.analyzeOnOpen = False
+    window.openFile(path, False)
+    qapp.processEvents()
+    panel = window.analysisPanel
+    viewer = window.viewer
+    for tid in ladder_ids("color", 8, "DCT"):
+        if tid == "keep":
+            continue
+        token = 3
+        viewer.setPreviewPlan(path, [{"xref": xref, "target": tid}], 0)
+        viewer.showBusy(xref, token, [(10, 12, 40, 24, True)])
+        payload = {
+            "kind": "preview", "path": path, "xref": xref, "target": tid,
+            "stored": 80000, "filt": "DCT", "rotation": 0, "token": token,
+            "gen": panel._ladder_gen,
+        }
+        try:
+            result = _run_queued(payload)
+        except Exception as exc:
+            result = None
+            error = exc
+        else:
+            error = None
+        panel._on_p0({"payload": payload, "result": result, "error": error, "elapsed": 0.01})
+        qapp.processEvents()
+        assert not viewer.busyVisible(), tid
+    # The crash: rgba is a dict. The overlay must clear, not spin.
+    viewer.showBusy(xref, 9, [(10, 12, 40, 24, True)])
+    assert viewer.deliverPreview({
+        "xref": xref, "target": "gray-4", "rotation": 0, "token": 9, "rgba": {"entry": {}},
+    }) is False
+    panel._finish_preview(
+        {"xref": xref, "target": "gray-4", "token": 9, "path": path},
+        {"entry": {"id": "gray-4", "note": "left unchanged"}, "encoded": None},
+        None, 0.1)
+    qapp.processEvents()
+    assert not viewer.busyVisible()
 
 
 def test_dedup_merges_identical_images(tmp_path):

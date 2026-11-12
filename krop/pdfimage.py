@@ -335,6 +335,45 @@ def install_image(doc, xref, encoded):
     return len(data)
 
 
+def render_placed_image(path, xref, encoded, dpi=96):
+    """MuPDF render of one replaced image, cropped to its placement on the page.
+
+    This is the same raster the viewer draws, not a Pillow downsample of the
+    encoded samples. dpi is the viewer resolution times the current zoom.
+    """
+    import numpy as np
+    wc = WorkingCopy(path)
+    try:
+        wc.rebuild({int(xref): "placed"}, {(int(xref), "placed"): encoded})
+        page_i = 0
+        rect = None
+        for i, page in enumerate(wc.doc):
+            try:
+                rects = page.get_image_rects(int(xref))
+            except Exception:
+                rects = []
+            if rects:
+                page_i = i
+                rect = rects[0]
+                break
+        dpi_i = int(round(float(dpi)))
+        pix = wc.doc[page_i].get_pixmap(alpha=False, dpi=dpi_i)
+        raw = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.stride)[:, :pix.w * pix.n]
+        raw = raw.reshape(pix.h, pix.w, pix.n)[..., :3].copy()
+        if rect is None:
+            return raw
+        scale = float(dpi_i) / 72.0
+        x0 = max(0, int(rect.x0 * scale))
+        y0 = max(0, int(rect.y0 * scale))
+        x1 = min(raw.shape[1], int(rect.x1 * scale))
+        y1 = min(raw.shape[0], int(rect.y1 * scale))
+        if x1 <= x0 or y1 <= y0:
+            return raw
+        return raw[y0:y1, x0:x1]
+    finally:
+        wc.close()
+
+
 def decode_stream(encoded):
     """RGB (or gray expanded to RGB) pixels MuPDF produces from the stream."""
     import numpy as np
