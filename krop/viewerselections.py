@@ -265,6 +265,9 @@ class ViewerSelectionItem(QGraphicsItem):
 
 
     def adjustBoundingRect(self, dx1=0, dy1=0, dx2=0, dy2=0):
+        # A hand edit, skip, or other move drops the remembered content box.
+        # Trim writes a new one after this returns.
+        self._trim_memory = None
         orect = self.mapRectToParent(self.rect)
         prect = self.viewer.irect
         nrect = orect.adjusted(dx1, dy1, dx2, dy2)

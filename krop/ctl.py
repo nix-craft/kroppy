@@ -24,8 +24,9 @@ _USAGE = {
     "set_target": ["xref", "target"],
     "set_option": ["name", "value"],
     "set_padding": ["value"],
-    "trim": ["scope"],
-    "trim_copier": ["scope"],
+    "trim": ["scope", "fresh"],
+    "trim_copier": ["scope", "fresh"],
+    "recrop": ["scope"],
     "grab_view": ["path"],
     "grab_window": ["path"],
     "export_image": ["xref", "which", "path"],
@@ -33,7 +34,7 @@ _USAGE = {
     "wait_idle": ["timeout"],
     "log_tail": ["n"],
 }
-_OPTIONAL = {"analysis": 1, "wait_idle": 1, "log_tail": 1}
+_OPTIONAL = {"analysis": 1, "wait_idle": 1, "log_tail": 1, "trim": 1, "trim_copier": 1}
 
 
 def build_args(cmd, rest):

@@ -410,6 +410,9 @@ class ControlServer(object):
     def _cmd_trim_copier(self, args, sock, req_id):
         return _run_trim(self.window, args, copier=True)
 
+    def _cmd_recrop(self, args, sock, req_id):
+        return _run_trim(self.window, args, copier=False, fresh=True)
+
     def _cmd_wait_idle(self, args, sock, req_id):
         timeout = args.get("timeout", 30)
         try:
@@ -598,31 +601,53 @@ def _crop_report(window):
     return pages
 
 
-def _run_trim(window, args, copier):
-    """Run one trim action. Padding is whatever the field says at that moment."""
+def _fresh_flag(value):
+    if value is None or value is False:
+        return False
+    text = str(value).strip().lower().lstrip("-")
+    return text in ("fresh", "1", "true", "yes", "on", "recrop")
+
+
+def _run_trim(window, args, copier, fresh=False):
+    """Run one trim action. Padding is whatever the field says at that moment.
+
+    ``fresh`` searches the full page again. Otherwise a selection that was
+    already trimmed only has the new padding applied.
+    """
+    import time
     scope = str(args.get("scope") or args.get("which") or "page").strip().lower().replace("-", "_")
+    fresh = bool(fresh) or _fresh_flag(args.get("fresh"))
     if copier:
         if getattr(window, "checkCopierTrim", None) is None:
             raise ControlError("copier trim is not available")
         window.checkCopierTrim.setChecked(True)
-    if scope in ("current", "selection"):
-        if window.viewer.isEmpty():
-            raise ControlError("no document")
-        # Same as the toolbar: a page with no selection gets a full-page box, then trim.
-        window.slotTrimMargins()
-    elif scope in ("page", "all_on_page"):
-        window.slotTrimMarginsAll()
-    elif scope in ("every", "every_page", "all"):
-        if window.viewer.isEmpty():
-            raise ControlError("no document")
-        window.ui.radioSelIndividual.setChecked(True)
-        window.slotTrimMarginsEveryPage()
-    else:
-        raise ControlError("scope must be current, page, or every")
+    window._trim_force_fresh = fresh
+    window._trim_log = []
+    started = time.perf_counter()
+    try:
+        if scope in ("current", "selection"):
+            if window.viewer.isEmpty():
+                raise ControlError("no document")
+            # Same as the toolbar: a page with no selection gets a full-page box, then trim.
+            window.slotTrimMargins()
+        elif scope in ("page", "all_on_page"):
+            window.slotTrimMarginsAll()
+        elif scope in ("every", "every_page", "all"):
+            if window.viewer.isEmpty():
+                raise ControlError("no document")
+            window.ui.radioSelIndividual.setChecked(True)
+            window.slotTrimMarginsEveryPage()
+        else:
+            raise ControlError("scope must be current, page, or every")
+    finally:
+        window._trim_force_fresh = False
     return {
         "scope": scope,
+        "fresh": fresh,
+        "elapsed": round(time.perf_counter() - started, 4),
         "copier": bool(getattr(window, "checkCopierTrim", None) and window.checkCopierTrim.isChecked()),
         "padding": _padding_info(window),
+        "pages": list(getattr(window, "_trim_log", None) or []),
         "crops": _crop_report(window),
     }
 

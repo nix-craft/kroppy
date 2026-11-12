@@ -12,6 +12,79 @@ from krop.padding import parse_padding
 from tests.test_control import _call
 
 
+def test_padding_only_retrim_skips_detection_and_matches_fresh(window, tmp_path, qapp, monkeypatch):
+    """Padding 30, 0, 30 from the remembered box matches a fresh search."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    os.makedirs(tmp_path / "run")
+    path = str(tmp_path / "sheet.pdf")
+    _sheet(path)
+    window.resize(900, 700)
+    window.show()
+    qapp.processEvents()
+    window.openFile(path, False)
+    qapp.processEvents()
+    sock = str(tmp_path / "run" / ("kroppy-%d.sock" % os.getpid()))
+    assert start_control(window, sock) is not None
+    window.checkCopierTrim.setChecked(False)
+    window.ui.checkTrimUseAllPages.setChecked(False)
+    _prepare(window, individual=False)
+
+    def run(padding, fresh=""):
+        _call(qapp, sock, "set_padding", {"value": str(padding)})
+        args = {"scope": "page"}
+        if fresh:
+            args["fresh"] = fresh
+        return _call(qapp, sock, "trim", args)
+
+    try:
+        window._trim_detection_count = 0
+        first = run(30)
+        assert first["pages"][0]["detection"] == "fresh"
+        assert window._trim_detection_count == 1
+        assert first["elapsed"] >= 0
+        crops_30 = _margins(window)
+
+        window._trim_detection_count = 0
+        zero = run(0)
+        assert zero["pages"][0]["detection"] == "remembered"
+        assert window._trim_detection_count == 0
+        _assert_padding_delta(window.viewer.getImage(0), _margins(window), crops_30, 30)
+
+        window._trim_detection_count = 0
+        again = run(30)
+        assert again["pages"][0]["detection"] == "remembered"
+        assert window._trim_detection_count == 0
+        back = _margins(window)
+        for edge in range(4):
+            assert abs(back[edge] - crops_30[edge]) < 0.004
+
+        window._trim_detection_count = 0
+        fresh = run(30, "fresh")
+        assert fresh["fresh"] is True
+        assert fresh["pages"][0]["detection"] == "fresh"
+        assert window._trim_detection_count == 1
+        for edge in range(4):
+            assert abs(_margins(window)[edge] - crops_30[edge]) < 0.004
+
+        # A hand edit forgets the content box, so the next trim searches again.
+        window.selections.currentSelection.adjustBoundingRect(6, 0, 6, 0)
+        assert window.selections.currentSelection._trim_memory is None
+        window._trim_detection_count = 0
+        edited = run(30)
+        assert edited["pages"][0]["detection"] == "fresh"
+        assert window._trim_detection_count == 1
+
+        assert build_args("trim", ["every", "--fresh"]) == {"scope": "every", "fresh": "--fresh"}
+        assert build_args("recrop", ["every"]) == {"scope": "every"}
+        recrop = _call(qapp, sock, "recrop", {"scope": "page"})
+        assert recrop["fresh"] is True
+        assert recrop["pages"][0]["detection"] == "fresh"
+    finally:
+        window.ui.editPadding.setText("2")
+        window.checkCopierTrim.setChecked(True)
+        window.checkRecrop.setChecked(False)
+
+
 def test_parse_padding_is_css_and_has_no_memory():
     assert parse_padding("") == [0, 0, 0, 0]
     assert parse_padding("4") == [4, 4, 4, 4]

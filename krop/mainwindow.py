@@ -271,7 +271,9 @@ class MainWindow(QMainWindow):
         self.checkCopierTrim.setChecked(_s.value("Trim/CopierTrim", "true") == "true")
         self.spinDust.setValue(int(_s.value("Trim/Dust", "4")))
         self.checkCopierTrim.toggled.connect(lambda v: QSettings().setValue("Trim/CopierTrim", "true" if v else "false"))
+        self.checkCopierTrim.toggled.connect(self._forget_trim_memory)
         self.spinDust.valueChanged.connect(lambda v: QSettings().setValue("Trim/Dust", str(v)))
+        self.spinDust.valueChanged.connect(self._forget_trim_memory)
         self.ui.toolBar.addWidget(self.checkCopierTrim)
         self.ui.toolBar.addWidget(self.spinDust)
         self.checkDedup = QCheckBox(self.tr("Merge identical images"))
@@ -304,6 +306,13 @@ class MainWindow(QMainWindow):
         self.ui.comboDistributeDevice.currentIndexChanged.connect(self.slotDeviceTypeChanged)
         self.ui.editDistributeAspectRatio.editingFinished.connect(self.slotDistributeAspectRatioChanged)
         self.ui.splitter.splitterMoved.connect(self.slotSplitterMoved)
+        self.ui.comboRotation.currentIndexChanged.connect(self._forget_trim_memory)
+        self.checkRecrop = QCheckBox(self.tr("Recrop from beginning"), self.ui.groupTrimMargins)
+        self.checkRecrop.setObjectName("checkRecropFromBeginning")
+        self.checkRecrop.setToolTip(self.tr(
+            "The next trim searches the full page again and replaces the remembered content boxes, then this turns off. "
+            "Leave it off to change only Padding."))
+        self.ui.gridLayout_3.addWidget(self.checkRecrop, 4, 0, 1, 2)
 
         self.pdfScene = QGraphicsScene(self.ui.documentView)
         self.pdfScene.setBackgroundBrush(self.pdfScene.palette().dark())
@@ -502,6 +511,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.statusBar().showMessage(self.tr("Run log: %s") % fallback)
             log("OPEN", fileName)
+            self._forget_trim_memory()
             self.startAnalysis(fileName)
             if recoverCrops is None:
                 recoverCrops = self.recoverCrops
@@ -932,15 +942,18 @@ class MainWindow(QMainWindow):
 
     def slotTrimMarginsAll(self):
         # trim margins of all selections on the current page
-        noSelections = True
-        for sel in self.selections.items:
-            if sel.isVisible():
-                noSelections = False
+        try:
+            noSelections = True
+            for sel in self.selections.items:
+                if sel.isVisible():
+                    noSelections = False
+                    self.trimMarginsSelection(sel)
+            # if there is no selections, then create one
+            if noSelections and not self.viewer.isEmpty():
+                sel = self.selections.addSelection()
                 self.trimMarginsSelection(sel)
-        # if there is no selections, then create one
-        if noSelections and not self.viewer.isEmpty():
-            sel = self.selections.addSelection()
-            self.trimMarginsSelection(sel)
+        finally:
+            self._finish_trim_request()
         self.pdfScene.update()
 
     def updateTrimEveryPageAction(self):
@@ -982,6 +995,7 @@ class MainWindow(QMainWindow):
                     self.trimMarginsSelection(sel)
             progress.setValue(n)
         finally:
+            self._finish_trim_request()
             self.ui.checkTrimUseAllPages.setChecked(useAll)
             self.viewer.currentPageIndex = orig
             self.pdfScene.update()
@@ -1204,6 +1218,33 @@ class MainWindow(QMainWindow):
         self.pdfScene.update()
         log("SKIP", "undo: restored %d selection(s), removed %d" % (len(undo["rects"]), len(undo["created"])))
 
+    def _forget_trim_memory(self, *args):
+        """Drop remembered content boxes. The next trim searches the full page."""
+        sels = getattr(getattr(self, "viewer", None), "selections", None)
+        if sels is None:
+            return
+        for sel in list(getattr(sels, "items", []) or []):
+            sel._trim_memory = None
+
+    def _page_rotation(self, idx):
+        try:
+            return int(self.viewer.pageGetRotation(idx) or 0)
+        except Exception:
+            return 0
+
+    def _trim_is_fresh(self):
+        box = getattr(self, "checkRecrop", None)
+        if box is not None and box.isChecked():
+            return True
+        return bool(getattr(self, "_trim_force_fresh", False))
+
+    def _finish_trim_request(self):
+        """A one-shot Recrop checkbox turns off after the trim that honored it."""
+        box = getattr(self, "checkRecrop", None)
+        if box is not None and box.isChecked():
+            box.setChecked(False)
+        self._trim_force_fresh = False
+
     def slotTrimMargins(self):
         if self.viewer.isEmpty():
             return
@@ -1211,7 +1252,10 @@ class MainWindow(QMainWindow):
         if self.selections.currentSelection is None:
             self.selections.addSelection()
         if self.selections.currentSelection is not None:
-            self.trimMarginsSelection(self.selections.currentSelection)
+            try:
+                self.trimMarginsSelection(self.selections.currentSelection)
+            finally:
+                self._finish_trim_request()
             self.pdfScene.update()
 
     def trimMarginsSelection(self, sel):
@@ -1225,24 +1269,42 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # Always search the full page image (MediaBox / KropFullBox as shown),
-            # not the box left by the previous trim or by crop recovery.
-            # A second run with a different Padding can then grow or shrink.
-            nrect = None
-            full = None
-            for idx in pages:
-                img = self.viewer.getImage(idx)
-                full = img.rect()
-                if getattr(self, 'checkCopierTrim', None) is not None and self.checkCopierTrim.isChecked():
-                    nrect = copierTrimMargins(img, full, nrect, dust=self.spinDust.value())
-                else:
-                    nrect = autoTrimMargins(img, full, nrect, sensitivity, allowedchanges)
-
+            # Search the full page (MediaBox / KropFullBox as shown), unless this
+            # selection already has a content box and only Padding changed.
+            copier = bool(getattr(self, "checkCopierTrim", None) and self.checkCopierTrim.isChecked())
+            dust = self.spinDust.value() if getattr(self, "spinDust", None) is not None else 0
+            rots = tuple(self._page_rotation(idx) for idx in pages)
+            memory = getattr(sel, "_trim_memory", None)
+            reuse = (
+                memory is not None
+                and not self._trim_is_fresh()
+                and memory.get("copier") == copier
+                and memory.get("dust") == dust
+                and memory.get("pages") == tuple(pages)
+                and memory.get("rotation") == rots
+            )
             orect = QRectF(self.viewer.getImage(self.viewer.currentPageIndex).rect())
-            nrect = QRectF(nrect)
+            if reuse:
+                content = QRectF(memory["content"])
+                mode = "remembered"
+            else:
+                nrect = None
+                for idx in pages:
+                    img = self.viewer.getImage(idx)
+                    full = img.rect()
+                    self._trim_detection_count = getattr(self, "_trim_detection_count", 0) + 1
+                    if copier:
+                        nrect = copierTrimMargins(img, full, nrect, dust=dust)
+                    else:
+                        nrect = autoTrimMargins(img, full, nrect, sensitivity, allowedchanges)
+                if nrect is None:
+                    return
+                content = QRectF(nrect)
+                mode = "fresh"
 
             # Live Padding field, read here and not earlier in the run.
             dtop, dright, dbottom, dleft = self.getPadding()
+            nrect = QRectF(content)
             nrect.adjust(-dleft, -dtop, dright, dbottom)
             nrect = nrect.intersected(orect)
 
@@ -1267,9 +1329,23 @@ class MainWindow(QMainWindow):
                     d2 = nh - h - d1
                     nrect.adjust(0, -d1, 0, d2)
 
-            # set selection to new values
+            # set selection to new values. Moving the box clears any old memory.
             nrect = sel.mapRectFromImage(nrect)
             sel.setBoundingRect(nrect.topLeft(), nrect.bottomRight())
+            sel._trim_memory = {
+                "content": QRectF(content),
+                "pad": (dtop, dright, dbottom, dleft),
+                "copier": copier,
+                "dust": dust,
+                "pages": tuple(pages),
+                "rotation": rots,
+            }
+            log = getattr(self, "_trim_log", None)
+            if isinstance(log, list):
+                log.append({
+                    "page": int(self.viewer.currentPageIndex) + 1,
+                    "detection": mode,
+                })
         finally:
             QApplication.restoreOverrideCursor()
 
