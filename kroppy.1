@@ -81,5 +81,14 @@ always: keep the run log; on\-error: delete it when the session ends with no err
 .B \-\-log\-location {beside,central}
 where an automatic run log is written: beside the PDF (default) or a central folder. Ignored when \-\-log names a file. Central logs older than 30 days are removed on startup
 .TP
+.B \-\-analyze\-only
+print a per-page color and bit-depth recommendation and exit without opening the window
+.TP
+.B \-\-analyze\-json FILE
+write the full analysis JSON to FILE and exit without opening the window
+.TP
+.B \-\-analyze\-error MAE
+mean absolute error, on a 0\-255 scale, allowed when recommending a smaller image encoding (default: 4). The maximum error must also stay within max(16, 4 times MAE)
+.TP
 .B \-\-go
 output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb\-run

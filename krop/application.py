@@ -29,6 +29,60 @@ import sys
 from krop.version import __version__
 
 
+def _run_analyze_cli(args):
+    import json
+    import sys
+    from krop.analyze import MissingDependency, analyze_file, format_report
+    try:
+        data = analyze_file(args.file, threshold=args.analyze_error)
+    except MissingDependency as exc:
+        sys.stderr.write(str(exc) + "\n")
+        sys.exit(1)
+    if args.analyze_only:
+        print(format_report(data))
+    if args.analyze_json:
+        with open(args.analyze_json, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+    _append_analyze_log(args, data)
+
+
+def _append_analyze_log(args, data):
+    """Write ANALYZE lines the same way a run log would, then drop a clean one."""
+    import os
+    import time
+    from krop.analyze import analyze_lines
+    path = args.log or os.environ.get("KROP_LOG")
+    keep = getattr(args, "log_keep", None) or "on-error"
+    if path and str(path).lower() in ("off", "0", "no", "false"):
+        return
+    if keep == "never" and not (path and str(path).lower() not in ("off", "0", "no", "false")):
+        return
+    explicit = bool(path) and str(path).lower() not in ("off", "0", "no", "false")
+    if explicit:
+        log_path = os.path.expanduser(path)
+    else:
+        loc = getattr(args, "log_location", None) or "beside"
+        stem = os.path.splitext(os.path.basename(args.file))[0] + ".kroppy.log"
+        if loc == "central":
+            from krop.activitylog import user_log_dir
+            log_path = os.path.join(user_log_dir(), stem)
+        else:
+            log_path = os.path.splitext(os.path.abspath(args.file))[0] + ".kroppy.log"
+    parent = os.path.dirname(log_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(log_path, "a", buffering=1) as fh:
+        for line in analyze_lines(data):
+            stamp = time.strftime("%H:%M:%S") + ".%03d" % (int(time.time() * 1000) % 1000)
+            fh.write("%s ANALYZE %s\n" % (stamp, line))
+            fh.flush()
+    if explicit or keep == "always":
+        return
+    if keep in ("on-error", None):
+        os.remove(log_path)
+
+
 def migrate_qsettings():
     """Copy settings saved when the application name was "krop", once.
 
@@ -86,6 +140,10 @@ def main():
     parser.add_argument('--log-keep', choices=['always', 'on-error', 'never'], help='always: keep the run log; on-error: delete it when the session ends with no errors (default); never: do not write a run log (same as --log off). Ignored when --log names a file, which is always kept')
     parser.add_argument('--log-location', choices=['beside', 'central'], help='where an automatic run log is written: beside the PDF (default) or a central folder (~/.local/state/kroppy, ~/Library/Logs/kroppy, or %%LOCALAPPDATA%%\\kroppy\\logs). Ignored when --log names a file. Central logs older than 30 days are removed on startup')
     parser.add_argument('--go', action='store_true', help='output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb-run')
+    parser.add_argument('--analyze-only', action='store_true', help='print a color/bit-depth recommendation and exit without opening the window')
+    parser.add_argument('--analyze-json', metavar='FILE', help='write the full analysis JSON to FILE and exit without opening the window')
+    parser.add_argument('--analyze-error', type=float, default=None, metavar='MAE', help='mean absolute error (0-255) allowed when recommending a smaller image encoding (default: 4). The 99.5th percentile of absolute error must also stay within max(16, 4 times this value)')
+    parser.add_argument('--control', nargs='?', const='default', default=None, metavar='PATH', help='listen for kroppyctl on a user-only local socket. With no PATH, uses $XDG_RUNTIME_DIR/kroppy-<pid>.sock or /tmp/kroppy-$USER.sock. KROPPY_CONTROL=PATH enables the same socket. Off unless set')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
     parser.add_argument('--use-qt5', action='store_true', help='use PyQt5 instead of PyQt6 (default: use PyQt6 if available)')
@@ -96,6 +154,12 @@ def main():
     parser.add_argument('--use-poppler', action='store_true', help='use Poppler Qt for rendering (PyQt5 only, default: use PyMuPDF)')
 
     args = parser.parse_args()
+
+    if args.analyze_only or args.analyze_json:
+        if not args.file:
+            parser.error("a PDF file is required")
+        _run_analyze_cli(args)
+        return
 
     from krop.qt import QApplication
     app = QApplication(sys.argv)
@@ -114,6 +178,19 @@ def main():
     window=MainWindow()
     _installLog(window, _logPath, keep=args.log_keep, location=args.log_location)
 
+    # After the window and the log exist, and before the file opens, so a
+    # client can connect while startup continues. --analyze-only and
+    # --analyze-json already returned. --go is not an interactive session.
+    if not args.go:
+        from krop.control import resolve_control_path, start_control
+        _control_path = resolve_control_path(getattr(args, "control", None), os.environ.get("KROPPY_CONTROL"))
+        if _control_path:
+            try:
+                start_control(window, _control_path)
+            except Exception as exc:
+                sys.stderr.write("kroppy: control socket failed: %s\n" % exc)
+
+    window.analyzeOnOpen = not args.go
     if args.file is not None:
         fileName = args.file
         window.openFile(fileName, False if args.no_recover_crops else None)

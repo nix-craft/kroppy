@@ -146,6 +146,33 @@ class MainWindow(QMainWindow):
         log_prefs = QAction(self.tr("Run log..."), self)
         log_prefs.triggered.connect(self.slotLogPreferences)
         settings_menu.addAction(log_prefs)
+        self._analysis_job = None
+        self._analysis_jobs = []
+        from krop.analyzepanel import AnalysisPanel
+        self.analysisPanel = AnalysisPanel(self)
+        self.analysisPanel.page_requested.connect(self.slotShowAnalysisPage)
+        self.analysisPanel.focus_changed.connect(self._refocusAnalysis)
+        self.analysisPanel.threshold_changed.connect(self._reanalyze)
+        self.analysisPanel.highlight_requested.connect(self._showImageHighlight)
+        self.analysisPanel.preview_changed.connect(self._updatePreview)
+        self.analysisPanel.visibilityChanged.connect(self._analysisDockVisibility)
+        self._preview_hold = False
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        try:
+            dock_right = Qt.DockWidgetArea.RightDockWidgetArea
+        except AttributeError:
+            dock_right = Qt.RightDockWidgetArea
+        self.addDockWidget(dock_right, self.analysisPanel)
+        view_menu = self.menuBar().addMenu(self.tr("&View"))
+        self.actionAnalysis = QAction(self.tr("Analysis"), self)
+        self.actionAnalysis.setCheckable(True)
+        self.actionAnalysis.setChecked(False)
+        self.actionAnalysis.toggled.connect(self.analysisPanel.setVisible)
+        self.analysisPanel.visibilityChanged.connect(self.actionAnalysis.setChecked)
+        view_menu.addAction(self.actionAnalysis)
+        self.analysisPanel.hide()
 
         # these options are awkwardly named and possibly confusing, so they are
         # not shown by default
@@ -244,9 +271,19 @@ class MainWindow(QMainWindow):
         self.checkCopierTrim.setChecked(_s.value("Trim/CopierTrim", "true") == "true")
         self.spinDust.setValue(int(_s.value("Trim/Dust", "4")))
         self.checkCopierTrim.toggled.connect(lambda v: QSettings().setValue("Trim/CopierTrim", "true" if v else "false"))
+        self.checkCopierTrim.toggled.connect(self._forget_trim_memory)
         self.spinDust.valueChanged.connect(lambda v: QSettings().setValue("Trim/Dust", str(v)))
+        self.spinDust.valueChanged.connect(self._forget_trim_memory)
         self.ui.toolBar.addWidget(self.checkCopierTrim)
         self.ui.toolBar.addWidget(self.spinDust)
+        self.checkDedup = QCheckBox(self.tr("Merge identical images"))
+        self.checkDedup.setObjectName("dedupImages")
+        self.checkDedup.setToolTip(self.tr(
+            "On save, merge byte-identical images into one object. Off by default."))
+        self.checkDedup.setChecked(QSettings().value("Save/DedupImages", "false") == "true")
+        self.checkDedup.toggled.connect(
+            lambda v: QSettings().setValue("Save/DedupImages", "true" if v else "false"))
+        self.ui.toolBar.addWidget(self.checkDedup)
         # [skip-region patch] minimum white gap that counts as a break between regions
         self.spinMinGap = QSpinBox(self)
         self.spinMinGap.setRange(1, 500)
@@ -269,6 +306,23 @@ class MainWindow(QMainWindow):
         self.ui.comboDistributeDevice.currentIndexChanged.connect(self.slotDeviceTypeChanged)
         self.ui.editDistributeAspectRatio.editingFinished.connect(self.slotDistributeAspectRatioChanged)
         self.ui.splitter.splitterMoved.connect(self.slotSplitterMoved)
+        self.ui.comboRotation.currentIndexChanged.connect(self._forget_trim_memory)
+        self.checkRecrop = QCheckBox(self.tr("Re-detect margins (ignore remembered crops)"), self.ui.groupTrimMargins)
+        self.checkRecrop.setObjectName("checkRecropFromBeginning")
+        self.checkRecrop.setToolTip(self.tr(
+            "Search every page's content again instead of reusing the last trim; turns itself off after the next trim."))
+        self.ui.gridLayout_3.addWidget(self.checkRecrop, 4, 0, 1, 2)
+        self.checkMaintainOrientation = QCheckBox(self.tr("Maintain orientation"), self.ui.groupTrimMargins)
+        self.checkMaintainOrientation.setObjectName("checkMaintainOrientation")
+        self.checkMaintainOrientation.setToolTip(self.tr(
+            "If a portrait page's crop comes out wider than it is tall, add white space on the more open side "
+            "(top or bottom) so it stays portrait. A landscape page that comes out taller than it is wide grows "
+            "left or right the same way."))
+        saved_orient = QSettings().value("Trim/MaintainOrientation", "false")
+        self.checkMaintainOrientation.setChecked(str(saved_orient) == "true")
+        self.checkMaintainOrientation.toggled.connect(
+            lambda on: QSettings().setValue("Trim/MaintainOrientation", "true" if on else "false"))
+        self.ui.gridLayout_3.addWidget(self.checkMaintainOrientation, 1, 2, 1, 1)
 
         self.pdfScene = QGraphicsScene(self.ui.documentView)
         self.pdfScene.setBackgroundBrush(self.pdfScene.palette().dark())
@@ -291,6 +345,11 @@ class MainWindow(QMainWindow):
             self.ui.checkGhostscript.setEnabled(False)
 
         self.ui.documentView.setScene(self.pdfScene)
+        try:
+            smooth = QPainter.RenderHint.SmoothPixmapTransform
+        except AttributeError:
+            smooth = QPainter.SmoothPixmapTransform
+        self.ui.documentView.setRenderHint(smooth, True)
         self.ui.documentView.setFocus()
 
 
@@ -327,6 +386,8 @@ class MainWindow(QMainWindow):
         if splitter:
             self.ui.splitter.restoreState(splitter)
         self.ui.actionFitInView.setChecked(settings.value("Window/FitInView", "") == "true")
+        if settings.value("Window/Analysis", "") == "true":
+            self.actionAnalysis.setChecked(True)
 
         self.ui.checkTrimUseAllPages.setChecked(settings.value("Trim/UseAllPages", "") == "true")
         self.ui.editPadding.setText(
@@ -350,6 +411,8 @@ class MainWindow(QMainWindow):
         settings.setValue("Window/Splitter", self.ui.splitter.saveState())
         settings.setValue("Window/FitInView", "true" if
                 self.ui.actionFitInView.isChecked() else "false")
+        settings.setValue("Window/Analysis", "true" if
+                self.analysisPanel.isVisible() else "false")
 
         settings.setValue("Trim/UseAllPages", "true" if
                 self.ui.checkTrimUseAllPages.isChecked() else "false")
@@ -359,6 +422,9 @@ class MainWindow(QMainWindow):
                 self.ui.editAllowedChanges.text())
         settings.setValue("Trim/Sensitivity",
                 self.ui.editSensitivity.text())
+        box = getattr(self, "checkMaintainOrientation", None)
+        if box is not None:
+            settings.setValue("Trim/MaintainOrientation", "true" if box.isChecked() else "false")
 
         settings.setValue("PDF/Optimize", "gs" if
                 self.ui.checkGhostscript.isChecked() else "no")
@@ -458,6 +524,8 @@ class MainWindow(QMainWindow):
                 else:
                     self.statusBar().showMessage(self.tr("Run log: %s") % fallback)
             log("OPEN", fileName)
+            self._forget_trim_memory()
+            self.startAnalysis(fileName)
             if recoverCrops is None:
                 recoverCrops = self.recoverCrops
             recovered = None
@@ -612,6 +680,7 @@ class MainWindow(QMainWindow):
                 cropper.writeToFile(outputFileName)
             if self.ui.checkHardCrop.isChecked():
                 self.hardCropFile(outputFileName)
+            self._applyChosenEncodings(outputFileName)
             from krop.activitylog import note_clean_save
             note_clean_save()
             QApplication.restoreOverrideCursor()
@@ -650,6 +719,18 @@ class MainWindow(QMainWindow):
                         self.tr("The following unexpected error has occured:"
                         "\n\n{0}").format(err))
                 raise err
+
+    def _applyChosenEncodings(self, outputFileName):
+        """Write the desky-scan-tools bytes chosen in the dock, unchanged, then optionally dedup."""
+        try:
+            from krop.pdfimage import apply_cached_choices
+            dedup = False
+            box = getattr(self, "checkDedup", None)
+            if box is not None:
+                dedup = bool(box.isChecked())
+            apply_cached_choices(outputFileName, dedup=dedup)
+        except Exception as err:
+            log("SAVE", "chosen encodings not applied: %r" % err)
 
     def hardCropFile(self, outputFileName):
         """Physically crop embedded images to the visible box. Never fails the save."""
@@ -854,25 +935,14 @@ class MainWindow(QMainWindow):
         self.pdfScene.update()
 
     def getPadding(self):
-        """Return [top, right, bottom, left] tuple specifying padding for trimming margins."""
+        """[top, right, bottom, left] from the Padding field as it is now.
+
+        Called at the moment a trim runs. Do not store the result on the
+        window or on an action.
+        """
+        from krop.padding import padding_from_window
         try:
-            # padding can be specified as in CSS (using one to four values):
-            # top, right, bottom, left
-            # top, right+left, bottom
-            # top+bottom, right+left
-            # top+bottom+right+left
-            padding = [ float(a) for a in self.ui.editPadding.text().split(',') if a ]
-            if len(padding) == 0:
-                return [0,0,0,0]
-            if len(padding) == 1:
-                return 4*padding
-            if len(padding) == 2:
-                return 2*padding
-            if len(padding) == 3:
-                return padding + [padding[1]]
-            if len(padding) == 4:
-                return padding
-            raise ValueError
+            return padding_from_window(self)
         except ValueError:
             self.showWarning(self.tr("Bad value for padding"), self.tr("The value of padding "
                 "(under settings for trimming margins) must be a list of one to four floats, "
@@ -881,19 +951,22 @@ class MainWindow(QMainWindow):
                 "\n(four values) top, right, bottom, left"
                 "\n(three values) top, right+left, bottom"
                 "\n(two values) top+bottom, right+left"))
-            return [0,0,0,0]
+            return [0, 0, 0, 0]
 
     def slotTrimMarginsAll(self):
         # trim margins of all selections on the current page
-        noSelections = True
-        for sel in self.selections.items:
-            if sel.isVisible():
-                noSelections = False
+        try:
+            noSelections = True
+            for sel in self.selections.items:
+                if sel.isVisible():
+                    noSelections = False
+                    self.trimMarginsSelection(sel)
+            # if there is no selections, then create one
+            if noSelections and not self.viewer.isEmpty():
+                sel = self.selections.addSelection()
                 self.trimMarginsSelection(sel)
-        # if there is no selections, then create one
-        if noSelections and not self.viewer.isEmpty():
-            sel = self.selections.addSelection()
-            self.trimMarginsSelection(sel)
+        finally:
+            self._finish_trim_request()
         self.pdfScene.update()
 
     def updateTrimEveryPageAction(self):
@@ -935,6 +1008,7 @@ class MainWindow(QMainWindow):
                     self.trimMarginsSelection(sel)
             progress.setValue(n)
         finally:
+            self._finish_trim_request()
             self.ui.checkTrimUseAllPages.setChecked(useAll)
             self.viewer.currentPageIndex = orig
             self.pdfScene.update()
@@ -1069,9 +1143,7 @@ class MainWindow(QMainWindow):
             progress.setMinimumDuration(500)
         dust = self.spinDust.value() if getattr(self, 'spinDust', None) is not None else 4
         moved = 0
-        pad = self.getPadding() or [0, 0, 0, 0]   # [top, right, bottom, left]
         mingap = self.spinMinGap.value() if getattr(self, 'spinMinGap', None) is not None else 1
-        log("SKIP", "padding t,r,b,l = %s, min gap %d px, dust %d" % (pad, mingap, dust))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             for k, idx in enumerate(pages):
@@ -1091,6 +1163,11 @@ class MainWindow(QMainWindow):
                 else:
                     undo["rects"].append((s, idx, self._selFrac(s)))
                 img = self.viewer.getImage(idx)
+                # Read again for this page. A padding change before the next
+                # page, or before the next skip, has to be the one that is used.
+                pad = self.getPadding() or [0, 0, 0, 0]
+                log("SKIP", "page %d padding t,r,b,l = %s, min gap %d px, dust %d" % (
+                    idx + 1, pad, mingap, dust))
                 for e in edges:
                     orect = s.mapRectToImage(s.rect).toRect()
                     nrect, d = skip_rect(img, orect, e, n, dust, mingap)
@@ -1154,9 +1231,44 @@ class MainWindow(QMainWindow):
         self.pdfScene.update()
         log("SKIP", "undo: restored %d selection(s), removed %d" % (len(undo["rects"]), len(undo["created"])))
 
+    def _forget_trim_memory(self, *args):
+        """Drop remembered content boxes. The next trim searches the full page."""
+        sels = getattr(getattr(self, "viewer", None), "selections", None)
+        if sels is None:
+            return
+        for sel in list(getattr(sels, "items", []) or []):
+            sel._trim_memory = None
+
+    def _page_rotation(self, idx):
+        try:
+            return int(self.viewer.pageGetRotation(idx) or 0)
+        except Exception:
+            return 0
+
+    def _trim_is_fresh(self):
+        box = getattr(self, "checkRecrop", None)
+        if box is not None and box.isChecked():
+            return True
+        return bool(getattr(self, "_trim_force_fresh", False))
+
+    def _finish_trim_request(self):
+        """The re-detect checkbox turns off after the trim that honored it."""
+        box = getattr(self, "checkRecrop", None)
+        if box is not None and box.isChecked():
+            box.setChecked(False)
+        self._trim_force_fresh = False
+
     def slotTrimMargins(self):
+        if self.viewer.isEmpty():
+            return
+        # The toolbar trim works with no box yet: make a full-page selection.
+        if self.selections.currentSelection is None:
+            self.selections.addSelection()
         if self.selections.currentSelection is not None:
-            self.trimMarginsSelection(self.selections.currentSelection)
+            try:
+                self.trimMarginsSelection(self.selections.currentSelection)
+            finally:
+                self._finish_trim_request()
             self.pdfScene.update()
 
     def trimMarginsSelection(self, sel):
@@ -1170,24 +1282,43 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # orect is the original selection, nrect is the trimmed version
-            orect = sel.mapRectToImage(sel.rect).toRect()
-            nrect = None
-            for idx in pages:
-                # calculate values for trimming
-                img = self.viewer.getImage(idx)
-                if getattr(self, 'checkCopierTrim', None) is not None and self.checkCopierTrim.isChecked():
-                    nrect = copierTrimMargins(img, orect, nrect, dust=self.spinDust.value())
-                else:
-                    nrect = autoTrimMargins(img, orect, nrect, sensitivity, allowedchanges)
+            # Search the full page (MediaBox / KropFullBox as shown), unless this
+            # selection already has a content box and only Padding changed.
+            copier = bool(getattr(self, "checkCopierTrim", None) and self.checkCopierTrim.isChecked())
+            dust = self.spinDust.value() if getattr(self, "spinDust", None) is not None else 0
+            rots = tuple(self._page_rotation(idx) for idx in pages)
+            memory = getattr(sel, "_trim_memory", None)
+            reuse = (
+                memory is not None
+                and not self._trim_is_fresh()
+                and memory.get("copier") == copier
+                and memory.get("dust") == dust
+                and memory.get("pages") == tuple(pages)
+                and memory.get("rotation") == rots
+            )
+            orect = QRectF(self.viewer.getImage(self.viewer.currentPageIndex).rect())
+            if reuse:
+                content = QRectF(memory["content"])
+                mode = "remembered"
+            else:
+                nrect = None
+                for idx in pages:
+                    img = self.viewer.getImage(idx)
+                    full = img.rect()
+                    self._trim_detection_count = getattr(self, "_trim_detection_count", 0) + 1
+                    if copier:
+                        nrect = copierTrimMargins(img, full, nrect, dust=dust)
+                    else:
+                        nrect = autoTrimMargins(img, full, nrect, sensitivity, allowedchanges)
+                if nrect is None:
+                    return
+                content = QRectF(nrect)
+                mode = "fresh"
 
-            orect = QRectF(orect)
-            nrect = QRectF(nrect)
-
-            # adjust for padding ...
+            # Live Padding field, read here and not earlier in the run.
             dtop, dright, dbottom, dleft = self.getPadding()
+            nrect = QRectF(content)
             nrect.adjust(-dleft, -dtop, dright, dbottom)
-            # ... but don't overadjust
             nrect = nrect.intersected(orect)
 
             # take fixed aspect ratio into account
@@ -1211,14 +1342,209 @@ class MainWindow(QMainWindow):
                     d2 = nh - h - d1
                     nrect.adjust(0, -d1, 0, d2)
 
-            # set selection to new values
+            orient_box = getattr(self, "checkMaintainOrientation", None)
+            oriented = False
+            if orient_box is not None and orient_box.isChecked():
+                from krop.orienttrim import keep_page_orientation
+                kept, oriented = keep_page_orientation(
+                    (nrect.left(), nrect.top(), nrect.right(), nrect.bottom()),
+                    (content.left(), content.top(), content.right(), content.bottom()),
+                    (orect.left(), orect.top(), orect.right(), orect.bottom()))
+                nrect = QRectF(kept[0], kept[1], kept[2] - kept[0], kept[3] - kept[1])
+                nrect = nrect.intersected(orect)
+
+            # set selection to new values. Moving the box clears any old memory.
             nrect = sel.mapRectFromImage(nrect)
             sel.setBoundingRect(nrect.topLeft(), nrect.bottomRight())
+            sel._trim_memory = {
+                "content": QRectF(content),
+                "pad": (dtop, dright, dbottom, dleft),
+                "copier": copier,
+                "dust": dust,
+                "pages": tuple(pages),
+                "rotation": rots,
+            }
+            log = getattr(self, "_trim_log", None)
+            if isinstance(log, list):
+                log.append({
+                    "page": int(self.viewer.currentPageIndex) + 1,
+                    "detection": mode,
+                    "orientation": "adjusted" if oriented else "unchanged",
+                })
         finally:
             QApplication.restoreOverrideCursor()
 
     def resizeEvent(self, event):
         self.slotFitInView(self.ui.actionFitInView.isChecked())
 
+    def startAnalysis(self, path):
+        self.cancelAnalysis()
+        if not path or not getattr(self, "analyzeOnOpen", True):
+            return
+        from krop.analyzepanel import AnalyzeJob
+        start = 0 if self.viewer.isEmpty() else self.viewer.currentPageIndex
+        job = AnalyzeJob(path, start, self.analysisPanel.error_threshold())
+        job.counted.connect(self.analysisPanel.begin)
+        job.page_ready.connect(self.analysisPanel.add_page)
+        job.image_ready.connect(self.analysisPanel.show_shared_image)
+        job.done.connect(self._onAnalysis)
+        job.yield_to = self.analysisPanel.yield_to_urgent
+        self._analysis_job = job
+        self._analysis_jobs.append(job)
+        self.analysisPanel.set_running(path)
+        job.start()
+
+    def cancelAnalysis(self, wait=False):
+        job = self._analysis_job
+        if job is None:
+            return
+        self._analysis_job = None
+        try:
+            job.cancel.set()
+            for sig, slot in ((job.done, self._onAnalysis),
+                              (job.page_ready, self.analysisPanel.add_page),
+                              (job.image_ready, self.analysisPanel.show_shared_image),
+                              (job.counted, self.analysisPanel.begin)):
+                try:
+                    sig.disconnect(slot)
+                except Exception:
+                    pass
+            if wait and job.isRunning():
+                job.wait(60000)
+        except RuntimeError:
+            pass
+
+    def eventFilter(self, obj, event):
+        # Hold Alt to compare the original pixels with the target preview.
+        try:
+            press = QEvent.Type.KeyPress
+            release = QEvent.Type.KeyRelease
+            alt = Qt.Key.Key_Alt
+        except AttributeError:
+            press = QEvent.KeyPress
+            release = QEvent.KeyRelease
+            alt = Qt.Key_Alt
+        etype = event.type()
+        if etype in (press, release) and event.key() == alt and not event.isAutoRepeat():
+            hold = etype == press
+            if hold != self._preview_hold:
+                self._preview_hold = hold
+                self._updatePreview()
+        return False
+
+    def _showImageHighlight(self, xref):
+        if not xref or not self.analysisPanel.isVisible():
+            self.viewer.clearImageHighlight()
+            return
+        self.viewer.showImageHighlight(int(xref))
+
+    def _updatePreview(self, *_args):
+        viewer = getattr(self, "viewer", None)
+        panel = getattr(self, "analysisPanel", None)
+        if viewer is None or panel is None:
+            return
+        if self._preview_hold or not panel.isVisible() or not panel.preview_enabled():
+            viewer.clearPreviews()
+            return
+        path = getattr(self, "originalFileName", None) or getattr(self, "fileName", None)
+        if not path or viewer.isEmpty():
+            viewer.clearPreviews()
+            return
+        try:
+            rotation = viewer.pageGetRotation(viewer.currentPageIndex)
+        except Exception:
+            rotation = 0
+        rotation = int(rotation or 0)
+        plan = panel.preview_plan(viewer.currentPageIndex + 1)
+        viewer.setPreviewPlan(path, plan, rotation)
+        urgent = panel.urgent()
+        if urgent and urgent[1] != "keep":
+            if viewer.hasPreview(urgent[0], urgent[1], rotation):
+                viewer.clearBusy()
+            else:
+                viewer.showBusy(urgent[0], urgent[2])
+        else:
+            viewer.clearBusy()
+        for xref, target, rot in viewer.missingPreviews():
+            token = urgent[2] if urgent and urgent[0] == xref and urgent[1] == target else None
+            priority = 0 if token is not None else 10
+            panel.enqueue_preview(path, xref, target, rot, token, priority)
+
+    def _analysisDockVisibility(self, visible):
+        if not visible:
+            self.viewer.clearImageHighlight()
+            self.viewer.clearPreviews()
+        else:
+            self._updatePreview()
+
+    def _refocusAnalysis(self, page):
+        job = self._analysis_job
+        if job is not None:
+            try:
+                job.set_focus(int(page) - 1)
+            except RuntimeError:
+                pass
+
+    def _reanalyze(self, _value):
+        path = getattr(self, "originalFileName", None) or self.fileName
+        if path and not self.viewer.isEmpty():
+            self.startAnalysis(path)
+
+    def _onAnalysis(self, data):
+        self.analysisPanel.set_result(data)
+        if not data or data.get("error"):
+            if not data:
+                log("ANALYZE", "failed")
+                return
+            msg = data.get("message") or data["error"].strip().splitlines()[-1]
+            log("ANALYZE", "failed: %s" % msg)
+            for line in data["error"].splitlines():
+                log("ANALYZE", line)
+            return
+        from krop.analyze import analyze_lines
+        for line in analyze_lines(data):
+            log("ANALYZE", line)
+
+    def slotShowAnalysisPage(self, page):
+        if self.viewer.isEmpty():
+            return
+        self.viewer.currentPageIndex = max(0, int(page) - 1)
+        self.updateControls()
+        self.slotFitInView(self.ui.actionFitInView.isChecked())
+
     def closeEvent(self, event):
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+        viewer = getattr(self, "viewer", None)
+        if viewer is not None:
+            viewer._preview_gen = getattr(viewer, "_preview_gen", 0) + 1
+            for job in list(getattr(viewer, "_preview_jobs", []) or []):
+                try:
+                    job.wait(2000)
+                except Exception:
+                    pass
+        panel = getattr(self, "analysisPanel", None)
+        if panel is not None:
+            panel._ladder_gen = getattr(panel, "_ladder_gen", 0) + 1
+            stop = getattr(panel, "_work_stop", None)
+            wake = getattr(panel, "_wake", None)
+            if stop is not None:
+                stop.set()
+            if wake is not None:
+                wake.set()
+            worker = getattr(panel, "_worker", None)
+            if worker is not None:
+                try:
+                    worker.wait(3000)
+                except Exception:
+                    pass
+        if viewer is not None:
+            spinner = getattr(viewer, "_spinner", None)
+            if spinner is not None:
+                spinner.stop()
+        self.cancelAnalysis(wait=True)
         self.writeSettings()
