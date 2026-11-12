@@ -307,12 +307,22 @@ class MainWindow(QMainWindow):
         self.ui.editDistributeAspectRatio.editingFinished.connect(self.slotDistributeAspectRatioChanged)
         self.ui.splitter.splitterMoved.connect(self.slotSplitterMoved)
         self.ui.comboRotation.currentIndexChanged.connect(self._forget_trim_memory)
-        self.checkRecrop = QCheckBox(self.tr("Recrop from beginning"), self.ui.groupTrimMargins)
+        self.checkRecrop = QCheckBox(self.tr("Re-detect margins (ignore remembered crops)"), self.ui.groupTrimMargins)
         self.checkRecrop.setObjectName("checkRecropFromBeginning")
         self.checkRecrop.setToolTip(self.tr(
-            "The next trim searches the full page again and replaces the remembered content boxes, then this turns off. "
-            "Leave it off to change only Padding."))
+            "Search every page's content again instead of reusing the last trim; turns itself off after the next trim."))
         self.ui.gridLayout_3.addWidget(self.checkRecrop, 4, 0, 1, 2)
+        self.checkMaintainOrientation = QCheckBox(self.tr("Maintain orientation"), self.ui.groupTrimMargins)
+        self.checkMaintainOrientation.setObjectName("checkMaintainOrientation")
+        self.checkMaintainOrientation.setToolTip(self.tr(
+            "If a portrait page's crop comes out wider than it is tall, add white space on the more open side "
+            "(top or bottom) so it stays portrait. A landscape page that comes out taller than it is wide grows "
+            "left or right the same way."))
+        saved_orient = QSettings().value("Trim/MaintainOrientation", "false")
+        self.checkMaintainOrientation.setChecked(str(saved_orient) == "true")
+        self.checkMaintainOrientation.toggled.connect(
+            lambda on: QSettings().setValue("Trim/MaintainOrientation", "true" if on else "false"))
+        self.ui.gridLayout_3.addWidget(self.checkMaintainOrientation, 1, 2, 1, 1)
 
         self.pdfScene = QGraphicsScene(self.ui.documentView)
         self.pdfScene.setBackgroundBrush(self.pdfScene.palette().dark())
@@ -412,6 +422,9 @@ class MainWindow(QMainWindow):
                 self.ui.editAllowedChanges.text())
         settings.setValue("Trim/Sensitivity",
                 self.ui.editSensitivity.text())
+        box = getattr(self, "checkMaintainOrientation", None)
+        if box is not None:
+            settings.setValue("Trim/MaintainOrientation", "true" if box.isChecked() else "false")
 
         settings.setValue("PDF/Optimize", "gs" if
                 self.ui.checkGhostscript.isChecked() else "no")
@@ -1239,7 +1252,7 @@ class MainWindow(QMainWindow):
         return bool(getattr(self, "_trim_force_fresh", False))
 
     def _finish_trim_request(self):
-        """A one-shot Recrop checkbox turns off after the trim that honored it."""
+        """The re-detect checkbox turns off after the trim that honored it."""
         box = getattr(self, "checkRecrop", None)
         if box is not None and box.isChecked():
             box.setChecked(False)
@@ -1329,6 +1342,17 @@ class MainWindow(QMainWindow):
                     d2 = nh - h - d1
                     nrect.adjust(0, -d1, 0, d2)
 
+            orient_box = getattr(self, "checkMaintainOrientation", None)
+            oriented = False
+            if orient_box is not None and orient_box.isChecked():
+                from krop.orienttrim import keep_page_orientation
+                kept, oriented = keep_page_orientation(
+                    (nrect.left(), nrect.top(), nrect.right(), nrect.bottom()),
+                    (content.left(), content.top(), content.right(), content.bottom()),
+                    (orect.left(), orect.top(), orect.right(), orect.bottom()))
+                nrect = QRectF(kept[0], kept[1], kept[2] - kept[0], kept[3] - kept[1])
+                nrect = nrect.intersected(orect)
+
             # set selection to new values. Moving the box clears any old memory.
             nrect = sel.mapRectFromImage(nrect)
             sel.setBoundingRect(nrect.topLeft(), nrect.bottomRight())
@@ -1345,6 +1369,7 @@ class MainWindow(QMainWindow):
                 log.append({
                     "page": int(self.viewer.currentPageIndex) + 1,
                     "detection": mode,
+                    "orientation": "adjusted" if oriented else "unchanged",
                 })
         finally:
             QApplication.restoreOverrideCursor()

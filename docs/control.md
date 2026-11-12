@@ -38,6 +38,7 @@ Commands run on the GUI thread. `wait_idle` does not freeze the window: the clie
 | `set_target` | `xref`, `target` | `indexed16` and `indexed-16` are the same target |
 | `set_option` | `name`, `value` | `mean_error`, `preview`, `analyze_other_pages` |
 | `set_padding` | `value` | writes the Padding field. The next trim reads that text, not a value saved at startup |
+| `set_maintain_orientation` | `0` or `1` | portrait crops stay portrait and landscape crops stay landscape by adding the spare margin on the more open side. Shown in `state` as `maintain_orientation`. Off unless set |
 | `trim` | `scope`, optional `fresh` | `current`, `page`, or `every`. A later trim with only Padding changed reuses the content box. `fresh` (or `trim every --fresh`) searches the full page again. The result lists `pages[].detection` as `remembered` or `fresh`, and `elapsed` seconds |
 | `trim_copier` | `scope`, optional `fresh` | same scopes, with Copier trim on |
 | `recrop` | `scope` | same as `trim` with a fresh search (`recrop every`) |
@@ -62,4 +63,6 @@ kroppyctl trim every
 kroppyctl trim every --fresh
 kroppyctl recrop every
 kroppyctl trim_copier current
+kroppyctl set_maintain_orientation 1
+kroppyctl state
 ```

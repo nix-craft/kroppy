@@ -24,6 +24,7 @@ _USAGE = {
     "set_target": ["xref", "target"],
     "set_option": ["name", "value"],
     "set_padding": ["value"],
+    "set_maintain_orientation": ["value"],
     "trim": ["scope", "fresh"],
     "trim_copier": ["scope", "fresh"],
     "recrop": ["scope"],

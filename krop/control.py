@@ -404,6 +404,18 @@ class ControlServer(object):
         self.window.ui.editPadding.setText(str(text))
         return _padding_info(self.window)
 
+    def _cmd_set_maintain_orientation(self, args, sock, req_id):
+        if "value" not in args:
+            raise ControlError("set_maintain_orientation requires value")
+        box = getattr(self.window, "checkMaintainOrientation", None)
+        if box is None:
+            raise ControlError("maintain orientation is not available")
+        try:
+            box.setChecked(_as_bool(args.get("value")))
+        except ValueError as exc:
+            raise ControlError(str(exc))
+        return {"maintain_orientation": bool(box.isChecked())}
+
     def _cmd_trim(self, args, sock, req_id):
         return _run_trim(self.window, args, copier=False)
 
@@ -707,6 +719,9 @@ def _state(window):
             "analyze_other_pages": bool(panel.backgroundBox.isChecked()),
         },
         "padding": _padding_info(window),
+        "maintain_orientation": bool(
+            getattr(window, "checkMaintainOrientation", None)
+            and window.checkMaintainOrientation.isChecked()),
     }
 
 
