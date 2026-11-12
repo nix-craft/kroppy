@@ -711,15 +711,7 @@ def _export_image(window, xref, which, path):
         saved = _write_array(path, rgba[:, :, :3], rgba[:, :, 3])
         stats = _error_stats(color, rgba[:, :, :3])
     else:
-        from krop.imagetarget import encode_file_image
         from krop.imagehighlight import VIEW_DPI
-        from krop.pdfimage import cached_encoded, paired_display
-        encoded = None
-        if target != "keep":
-            encode_file_image(source, xref, target, 0, "")
-            encoded = cached_encoded(source, xref, target)
-            if not encoded:
-                raise ControlError("no display preview for xref %d" % xref)
         zoom = 1.0
         try:
             scene = viewer.scene()
@@ -728,9 +720,17 @@ def _export_image(window, xref, which, path):
         except Exception:
             zoom = 1.0
         dpi = int(round(max(72.0, min(216.0, float(VIEW_DPI) * zoom))))
-        shown, original = paired_display(source, xref, encoded, dpi=dpi)
+        metrics = display_metrics(source, xref, target, dpi)
+        if metrics.get("refused"):
+            metrics.update({"path": path, "which": which, "xref": xref, "target": target})
+            return metrics
+        shown = metrics.pop("shown")
         saved = _write_array(path, shown, None)
-        stats = _error_stats(original, shown)
+        stats = {
+            "error_mae": metrics["error_mae"],
+            "error_p995": metrics["error_p995"],
+            "error_max": metrics["error_max"],
+        }
     saved.update(stats)
     saved.update({"path": path, "which": which, "xref": xref, "target": target})
     return saved
@@ -778,6 +778,31 @@ def _write_array(path, color, alpha):
             image = Image.fromarray(rgb, "RGB")
     image.save(path, format="PNG")
     return {"width": int(image.size[0]), "height": int(image.size[1])}
+
+
+def display_metrics(path, xref, target, dpi):
+    """Error of the replaced page against the original page, same clip and dpi.
+
+    A target the encoder will not produce is ``refused`` and has no error
+    numbers. Those numbers are never zero just because the preview was skipped.
+    """
+    from krop.imagetarget import encode_file_image
+    from krop.pdfimage import cached_encoded, paired_display
+    encoded = None
+    if str(target) != "keep":
+        entry = encode_file_image(path, xref, target, 0, "")
+        encoded = cached_encoded(path, xref, target)
+        if not encoded:
+            return {
+                "refused": True,
+                "note": (entry or {}).get("note") or "refused: encoder left this image unchanged",
+                "target": str(target),
+            }
+    shown, original = paired_display(path, xref, encoded, dpi=dpi)
+    stats = _error_stats(original, shown)
+    stats["shown"] = shown
+    stats["target"] = str(target)
+    return stats
 
 
 def _error_stats(original, got):

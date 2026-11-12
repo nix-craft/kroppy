@@ -117,14 +117,30 @@ def _run_queued(payload):
             payload["path"], payload["xref"], payload["target"],
             payload.get("stored") or 0, payload.get("filt") or "")
     if kind == "preview":
+        from krop.imagehighlight import VIEW_DPI
         from krop.imagetarget import encode_file_image
-        from krop.pdfimage import cached_encoded
+        from krop.pdfimage import cached_encoded, cached_stages, render_page_array
+        from krop.desky import stages_format
         entry = encode_file_image(
             payload["path"], payload["xref"], payload["target"],
             payload.get("stored") or 0, payload.get("filt") or "")
+        encoded = cached_encoded(payload["path"], payload["xref"], payload["target"])
+        stages = list(cached_stages(payload["path"], payload["xref"], payload["target"]))
+        rendered = None
+        if encoded:
+            try:
+                rgb, install_s, render_s, page_i = render_page_array(
+                    payload["path"], payload["xref"], encoded, dpi=VIEW_DPI)
+                stages.append(("install", install_s))
+                stages.append(("render", render_s))
+                rendered = {"page": int(page_i), "rgb": rgb}
+            except Exception:
+                rendered = None
         return {
             "entry": entry,
-            "encoded": cached_encoded(payload["path"], payload["xref"], payload["target"]),
+            "encoded": encoded,
+            "rendered": rendered,
+            "stages": stages_format(stages),
         }
     return None
 
@@ -663,6 +679,21 @@ class AnalysisPanel(QDockWidget):
         label = "%s xref %s %s: %.1f s" % (
             kind, payload.get("xref"), str(payload.get("target")).replace("-", ""), float(elapsed or 0))
         self._log_p0(label, message.get("error"))
+        stages = ""
+        result = message.get("result")
+        if isinstance(result, dict):
+            stages = result.get("stages") or ""
+        if not stages and kind == "measure":
+            try:
+                from krop.desky import stages_format
+                from krop.pdfimage import cached_stages
+                stages = stages_format(cached_stages(
+                    payload.get("path"), payload.get("xref"), payload.get("target")))
+            except Exception:
+                stages = ""
+        if stages:
+            self._log_p0("stages xref %s %s: %s" % (
+                payload.get("xref"), str(payload.get("target")).replace("-", ""), stages), None)
         if kind == "measure":
             if message.get("error") is not None or message.get("result") is None:
                 self._fail_p0(payload, message.get("error") or RuntimeError("measurement returned nothing"))
@@ -684,16 +715,17 @@ class AnalysisPanel(QDockWidget):
             return
         viewer = getattr(self.parent(), "viewer", None)
         try:
+            if isinstance(result, dict) and result.get("entry"):
+                self._apply_measure(payload, result["entry"])
             if isinstance(result, dict) and result.get("encoded"):
-                if result.get("entry"):
-                    self._apply_measure(payload, result["entry"])
                 if viewer is None or not viewer.install_preview(
                         payload.get("path"), int(xref), target, result["encoded"], token,
-                        int(payload.get("rotation") or 0)):
+                        int(payload.get("rotation") or 0), rendered=result.get("rendered")):
                     raise RuntimeError("preview was not drawn")
             elif isinstance(result, dict):
                 # A measurement dict is not pixels. Never hand it to the image converter.
-                raise RuntimeError(result.get("entry", {}).get("note") or "preview produced no image stream")
+                note = (result.get("entry") or {}).get("note") or "preview produced no image stream"
+                raise RuntimeError(note)
             elif viewer is None or not viewer.deliverPreview({
                     "xref": xref, "target": target,
                     "rotation": payload.get("rotation") or 0, "token": token, "rgba": result}):
@@ -718,7 +750,10 @@ class AnalysisPanel(QDockWidget):
         if len(short) > 80:
             short = short[:77] + "..."
         detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else short
-        self._mark_target_note(xref, target, "failed: " + short, detail)
+        if short.startswith("refused"):
+            self._mark_target_note(xref, target, short, detail)
+        else:
+            self._mark_target_note(xref, target, "failed: " + short, detail)
         self._log_p0("failed %s xref %s %s: %s" % (payload.get("kind"), xref, target, short), exc)
 
     def _close_preview(self, xref, token):

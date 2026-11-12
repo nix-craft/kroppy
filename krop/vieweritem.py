@@ -528,8 +528,12 @@ class AbstractViewerItem(QGraphicsItem):
                 self._preview_cache[(xref, target, rot)] = True
         self.update()
 
-    def install_preview(self, path, xref, target, encoded, token, rotation=0):
-        """Store one encoded image and redraw the page from the working copy."""
+    def install_preview(self, path, xref, target, encoded, token, rotation=0, rendered=None):
+        """Store one encoded image and redraw the page from the working copy.
+
+        ``rendered`` is the page the worker already drew, so the UI thread
+        does not decode the image a second time.
+        """
         try:
             xref = int(xref)
         except (TypeError, ValueError):
@@ -542,12 +546,29 @@ class AbstractViewerItem(QGraphicsItem):
         self._ready_streams[(xref, str(target))] = encoded
         self._preview_path = path or self._preview_path
         applied = self._apply_ready_streams()
+        if rendered and rendered.get("rgb") is not None:
+            self._store_rendered_page(rendered)
         if applied:
             self._preview_cache[(xref, str(target), int(rotation or 0))] = True
             if self._busy_token is not None and token == self._busy_token and xref == self._busy_xref:
                 self.clearBusy()
         self.update()
         return applied
+
+    def _store_rendered_page(self, rendered):
+        """Keep the worker's page image so the next paint does not call MuPDF."""
+        rgb = rendered.get("rgb")
+        if rgb is None or not hasattr(rgb, "shape"):
+            return
+        try:
+            page = int(rendered.get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        if page != int(self.currentPageIndex or 0):
+            return
+        if not self._images or page < 0 or page >= len(self._images):
+            return
+        self._images[page] = _rgba_qimage(rgb)
 
     def _apply_ready_streams(self):
         plan = getattr(self, "_preview_plan", None) or []

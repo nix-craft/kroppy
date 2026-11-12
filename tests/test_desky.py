@@ -56,6 +56,48 @@ def test_display_keep_is_exact_and_rgb24_is_close(tmp_path):
     assert mae < 1, mae
 
 
+def test_gray4_display_error_is_against_the_color_original(tmp_path):
+    """A blue page converted to gray-4 cannot report a perfect match."""
+    from krop.control import display_metrics
+    arr = np.zeros((48, 64, 3), np.uint8)
+    arr[:] = (20, 40, 180)
+    arr[16:22, 8:56] = (0, 0, 0)
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=240)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, 64, 48, np.ascontiguousarray(arr).tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(20, 30, 160, 150), pixmap=pix)
+    path = str(tmp_path / "blue.pdf")
+    doc.save(path)
+    doc.close()
+    metrics = display_metrics(path, xref, "gray-4", dpi=72)
+    assert not metrics.get("refused")
+    assert metrics["error_mae"] > 10
+    assert metrics["error_max"] > 0
+    shown = metrics["shown"]
+    # The replacement is gray: the channels match. The reference is the color page.
+    assert int(np.abs(shown[:, :, 0].astype(int) - shown[:, :, 2].astype(int)).max()) < 2
+
+
+def test_refused_target_is_not_a_zero_error_preview(tmp_path):
+    from krop.control import display_metrics
+    from krop.imagetarget import encode_file_image
+    arr = np.zeros((32, 40, 3), np.uint8)
+    arr[:] = (20, 40, 180)
+    doc = pymupdf.open()
+    page = doc.new_page(width=120, height=120)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, 40, 32, np.ascontiguousarray(arr).tobytes(), False)
+    xref = page.insert_image(pymupdf.Rect(10, 10, 100, 90), pixmap=pix)
+    path = str(tmp_path / "color.pdf")
+    doc.save(path)
+    doc.close()
+    entry = encode_file_image(path, xref, "gray-jpeg-85", 1000, "Flate")
+    assert entry["refused"] is True
+    assert str(entry["note"]).startswith("refused")
+    metrics = display_metrics(path, xref, "gray-jpeg-85", dpi=72)
+    assert metrics["refused"] is True
+    assert "error_mae" not in metrics
+
+
 def test_indexed_keeps_black_text_on_blue():
     """Black type on a blue page must survive indexed-16 and indexed-8."""
     from krop.imagetarget import reconstruct

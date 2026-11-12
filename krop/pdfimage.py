@@ -42,11 +42,11 @@ def pymupdf_version():
     return tuple(parts)
 
 
-def remember(path, xref, target, encoded, entry):
+def remember(path, xref, target, encoded, entry, stages=None):
     stored = dict(encoded)
     stored.pop("recon", None)
     _CACHE[(os.path.abspath(path), int(xref), str(target))] = {
-        "encoded": stored, "entry": entry,
+        "encoded": stored, "entry": entry, "stages": list(stages or []),
     }
 
 
@@ -58,6 +58,11 @@ def cached_entry(path, xref, target):
 def cached_encoded(path, xref, target):
     item = _CACHE.get((os.path.abspath(path), int(xref), str(target)))
     return None if item is None else item.get("encoded")
+
+
+def cached_stages(path, xref, target):
+    item = _CACHE.get((os.path.abspath(path), int(xref), str(target)))
+    return [] if item is None else list(item.get("stages") or [])
 
 
 _SAVE = {}
@@ -93,7 +98,7 @@ def apply_cached_choices(output_path, dedup=False):
             enc = _SAVE.get(sha)
             if not enc:
                 continue
-            _install_pikepdf(obj, enc, name)
+            _install_pikepdf(obj, _flate_for_save(enc), name)
             n += 1
     if dedup:
         dedup_images(pdf)
@@ -101,6 +106,20 @@ def apply_cached_choices(output_path, dedup=False):
         pdf.save(output_path)
     pdf.close()
     return n
+
+
+def _flate_for_save(enc):
+    """Preview streams use zlib level 6. Save writes the same samples at level 9."""
+    raw = enc.get("flate_raw")
+    level = enc.get("flate_level")
+    if not raw or str(enc.get("keys", {}).get("Filter") or "") != "/FlateDecode":
+        return enc
+    if level is None or int(level) >= 9:
+        return enc
+    out = dict(enc)
+    out["data"] = zlib.compress(raw, 9)
+    out["flate_level"] = 9
+    return out
 
 
 def _install_pikepdf(obj, enc, name):
@@ -124,7 +143,7 @@ def _install_pikepdf(obj, enc, name):
         pass
 
 
-def encode_stream(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0):
+def encode_stream(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0, flate_level=6):
     """Full-resolution PDF image stream for target_id.
 
     Gray, indexed, gray-JPEG and 1-bit/JBIG2 candidates are the encoders from
@@ -135,7 +154,9 @@ def encode_stream(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0):
     from krop.imagetarget import _jpeg_roundtrip, _rgb
     tid = str(target_id or "keep")
     if uses_desky(tid):
-        return encode_target(arr, tid, max_err=max_err, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol)
+        return encode_target(
+            arr, tid, max_err=max_err, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol,
+            flate_level=flate_level)
     rgb = _rgb(arr)
     height, width = int(rgb.shape[0]), int(rgb.shape[1])
     if tid.startswith("jpeg-") or tid.startswith("gray-jpeg-"):
@@ -335,14 +356,18 @@ def install_image(doc, xref, encoded):
     return len(data)
 
 
-def _clip_rgb(page, dpi, rect):
+def _pixmap_rgb(pix):
+    """Own the RGB samples. A contiguous view would alias the pixmap buffer."""
     import numpy as np
+    raw = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.stride)[:, :pix.w * pix.n]
+    return np.array(raw.reshape(pix.h, pix.w, pix.n)[..., :3], dtype=np.uint8, copy=True)
+
+
+def _clip_rgb(page, dpi, rect):
     kwargs = {"alpha": False, "dpi": int(dpi)}
     if rect is not None:
         kwargs["clip"] = rect
-    pix = page.get_pixmap(**kwargs)
-    raw = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.stride)[:, :pix.w * pix.n]
-    return np.ascontiguousarray(raw.reshape(pix.h, pix.w, pix.n)[..., :3])
+    return _pixmap_rgb(page.get_pixmap(**kwargs))
 
 
 def _placement(doc, xref):
@@ -354,6 +379,28 @@ def _placement(doc, xref):
         if rects:
             return i, rects[0]
     return 0, None
+
+
+def render_page_array(path, xref, encoded, dpi=96):
+    """Install ``encoded`` and return the page RGB at ``dpi``, plus install/render seconds.
+
+    The array owns its samples. ``encoded`` None renders the original page.
+    """
+    import time
+    dpi_i = int(round(float(dpi)))
+    wc = WorkingCopy(path)
+    try:
+        started = time.perf_counter()
+        page_i, _rect = _placement(wc.doc, xref)
+        if encoded:
+            wc.rebuild({int(xref): "placed"}, {(int(xref), "placed"): encoded})
+        install_s = time.perf_counter() - started
+        started = time.perf_counter()
+        rgb = _clip_rgb(wc.doc[page_i], dpi_i, None)
+        render_s = time.perf_counter() - started
+        return rgb, install_s, render_s, page_i
+    finally:
+        wc.close()
 
 
 def paired_display(path, xref, encoded, dpi=96):
@@ -425,9 +472,6 @@ def decode_stream(encoded):
     """RGB (or gray expanded to RGB) pixels MuPDF produces from the stream."""
     import numpy as np
     import pymupdf
-    recon = encoded.get("recon")
-    height = int(recon.shape[0])
-    width = int(recon.shape[1])
     doc = pymupdf.open()
     try:
         page = doc.new_page(width=10, height=10)
@@ -438,14 +482,11 @@ def decode_stream(encoded):
         if out.colorspace and out.colorspace.n == 4:
             out = pymupdf.Pixmap(pymupdf.csRGB, out)
         if out.n == 1:
-            arr = np.frombuffer(out.samples, np.uint8).reshape(out.h, out.stride)[:, :out.w]
-            return np.repeat(np.ascontiguousarray(arr)[:, :, None], 3, axis=2)
-        raw = np.frombuffer(out.samples, np.uint8).reshape(out.h, out.stride)[:, :out.w * out.n]
-        raw = raw.reshape(out.h, out.w, out.n)
-        if raw.shape[0] != height or raw.shape[1] != width:
-            # The dictionary width/height is authoritative; pixmap follows it.
-            pass
-        return np.ascontiguousarray(raw[..., :3])
+            arr = np.array(
+                np.frombuffer(out.samples, np.uint8).reshape(out.h, out.stride)[:, :out.w],
+                dtype=np.uint8, copy=True)
+            return np.repeat(arr[:, :, None], 3, axis=2)
+        return _pixmap_rgb(out)
     finally:
         doc.close()
 

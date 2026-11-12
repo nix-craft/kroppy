@@ -531,10 +531,12 @@ def reconstruct(arr, target_id):
     import numpy as np
     tid = str(target_id or "keep")
     if _desky_target(tid) and not tid.startswith("gray-jpeg-"):
-        from krop.pdfimage import encode_stream
+        from krop.pdfimage import decode_stream, encode_stream
         blob = encode_stream(arr, tid, neutral_tol=2)
         if blob and blob.get("recon") is not None:
             return np.ascontiguousarray(blob["recon"], dtype=np.uint8)
+        if blob and blob.get("data"):
+            return decode_stream(blob)
     if tid in ("keep", "rgb-24"):
         return _rgb(arr)
     if tid in ("1bpp", "jbig2"):
@@ -597,15 +599,16 @@ def _eval_desky(viewed, tid, threshold, stored, neutral_tol=0, raw_jpeg=None):
     from krop.pdfimage import encode_stream
     blob = encode_stream(viewed, tid, max_err=threshold, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol)
     if not blob:
-        entry = _entry(tid, 255, 255, 255, True, stored, None, stored)
+        entry = _entry(tid, None, None, None, True, stored, None, stored)
         entry["gate"] = "max"
-        entry["note"] = "left unchanged"
+        entry["refused"] = True
+        entry["note"] = "refused: encoder left this image unchanged"
         return entry
-    mae, p995, mx = _error_against(viewed, blob.get("recon"))
-    mx = blob.get("max_err", mx)
+    mx = blob.get("max_err")
+    mae = blob.get("mean_err")
+    p995 = blob.get("p995", mx)
     over = bool(blob.get("over")) or (threshold is not None and mx is not None and float(mx) > float(threshold))
-    entry = _entry(tid, mae if blob.get("mean_err") is None else blob.get("mean_err"),
-                   p995, mx, over, len(blob["data"]), blob.get("codec"), stored)
+    entry = _entry(tid, mae, p995, mx, over, len(blob["data"]), blob.get("codec"), stored)
     entry["gate"] = "max"
     return entry
 
@@ -885,46 +888,41 @@ def encode_file_image(path, xref, target_id, stored_bytes, filt):
 
 
 def _encode_file_image_now(path, xref, target_id, stored, filt):
+    from krop.desky import stages_begin, stages_take
+    stages_begin()
+    try:
+        return _encode_timed(path, xref, target_id, stored, filt)
+    finally:
+        stages_take()
+
+
+def _encode_timed(path, xref, target_id, stored, filt):
     import os
+    from krop.desky import stage, stages_take
     from krop.pdfimage import encode_stream, remember
     arr = _load_xref_array(path, xref)
+    stage("decode")
     raw_jpeg = None
     neutral_tol = 0
-    try:
-        from krop.desky import source_stream
-        src = source_stream(path, xref)
-        if "/DCTDecode" in (src.get("filters") or []):
-            raw_jpeg = src.get("raw")
-            neutral_tol = 2
-    except Exception:
-        src = None
+    src = cached_source_stream(path, xref)
+    if src and "/DCTDecode" in (src.get("filters") or []):
+        raw_jpeg = src.get("raw")
+        neutral_tol = 2
     threshold, max_ok = _limit(DEFAULT_ERROR_MAE)
     encoded = encode_stream(
-        arr, target_id, max_err=threshold, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol)
+        arr, target_id, max_err=threshold, raw_jpeg=raw_jpeg, neutral_tol=neutral_tol,
+        flate_level=6)
     if not encoded:
-        entry = _entry(target_id, 255, 255, 255, True, stored, filt or None, stored)
+        stages_take()
+        entry = _entry(target_id, None, None, None, True, stored, filt or None, stored)
         entry["gate"] = "max"
-        entry["note"] = "left unchanged"
+        entry["refused"] = True
+        entry["note"] = "refused: encoder left this image unchanged"
         return entry
-    recon = encoded.get("recon")
-    if recon is None:
-        from krop.pdfimage import decode_stream
-        try:
-            recon = decode_stream(encoded)
-        except Exception:
-            recon = None
-    if recon is None:
-        mae, p995, mx = 0.0, 0.0, 0
-    else:
-        # Percentile on a stride. The max-error gate already used every pixel.
-        step = 1
-        n = recon.shape[0] * recon.shape[1]
-        if n > 200000:
-            step = int(round((n / 200000.0) ** 0.5)) or 1
-        mae, p995, mx = _error_against(_rgb(arr)[::step, ::step], recon[::step, ::step])
+    mae = encoded.get("mean_err", 0.0)
+    mx = encoded.get("max_err", 0)
+    p995 = encoded.get("p995", mx)
     if encoded.get("gate") == "max":
-        mx = encoded.get("max_err", mx)
-        mae = encoded.get("mean_err", mae)
         over = bool(encoded.get("over")) or float(mx) > threshold
     else:
         over = mae > threshold or p995 > max_ok
@@ -935,13 +933,23 @@ def _encode_file_image_now(path, xref, target_id, stored, filt):
         entry["gate"] = encoded["gate"]
     if src and src.get("sha"):
         encoded["source_sha"] = src["sha"]
-    remember(os.path.abspath(path), int(xref), target_id, encoded, entry)
+    remember(os.path.abspath(path), int(xref), target_id, encoded, entry, stages_take())
     return entry
 
 
+_PIXELS = {}
+_STREAMS = {}
+
+
 def _load_xref_array(path, xref):
+    """Decoded samples for this xref. Kept so the next target does not decode the JPEG again."""
+    import os
     import numpy as np
     import pymupdf
+    key = (os.path.abspath(path), int(xref))
+    hit = _PIXELS.get(key)
+    if hit is not None:
+        return hit
     doc = pymupdf.open(path)
     try:
         pix = pymupdf.Pixmap(doc, int(xref))
@@ -951,9 +959,25 @@ def _load_xref_array(path, xref):
             pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
         n = pix.n
         arr = np.frombuffer(pix.samples, np.uint8)
-        arr = arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n).copy()
+        arr = np.array(arr.reshape(pix.h, pix.stride)[:, :pix.w * n].reshape(pix.h, pix.w, n), dtype=np.uint8, copy=True)
         if n == 1:
             arr = arr[:, :, 0]
+        _PIXELS[key] = arr
         return arr
     finally:
         doc.close()
+
+
+def cached_source_stream(path, xref):
+    """Raw image stream, decoded once per xref. None if it cannot be read."""
+    import os
+    key = (os.path.abspath(path), int(xref))
+    if key in _STREAMS:
+        return _STREAMS[key]
+    try:
+        from krop.desky import source_stream
+        src = source_stream(path, xref)
+    except Exception:
+        src = None
+    _STREAMS[key] = src
+    return src

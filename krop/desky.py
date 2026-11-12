@@ -13,6 +13,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import zlib
 
 import numpy as np
@@ -66,24 +68,58 @@ def pack4(q):
     return (q[:, 0::2] << 4) | q[:, 1::2]
 
 
-def flate_best(rows, bpc, w):
+_STAGES = threading.local()
+
+
+def stages_begin():
+    """Start a per-thread timing list. Nested encodes leave it alone."""
+    if getattr(_STAGES, "on", False):
+        return
+    _STAGES.on = True
+    _STAGES.parts = []
+    _STAGES.t = time.perf_counter()
+
+
+def stage(name):
+    """Record the time since the previous mark. No-op outside stages_begin."""
+    if not getattr(_STAGES, "on", False):
+        return
+    now = time.perf_counter()
+    _STAGES.parts.append((str(name), now - _STAGES.t))
+    _STAGES.t = now
+
+
+def stages_take():
+    """Return the recorded (name, seconds) pairs and stop timing."""
+    parts = list(getattr(_STAGES, "parts", []) or [])
+    _STAGES.on = False
+    _STAGES.parts = []
+    return parts
+
+
+def stages_format(parts):
+    return " ".join("%s %.2fs" % (name, seconds) for name, seconds in (parts or []))
+
+
+def flate_best(rows, bpc, w, level=9):
     """Smallest of raw Flate and PNG predictor 15 (Sub or Up), as in pdf-to-gray.py.
 
-    On a large image the three level-9 compressions dominate the encode.
-    The predictor is chosen at level 1, then only the winner is compressed
-    at level 9.
+    Preview passes a lower zlib level. The uncompressed winner is returned
+    so save can compress it at level 9. On a large image the predictor is
+    chosen at level 1, then only that candidate is compressed.
     """
     rows = np.ascontiguousarray(rows)
+    level = int(level)
     raws = [rows.tobytes()]
     parms = [None]
     for f in (1, 2):
         raws.append(png_predict(rows, f))
         parms.append({"Predictor": 15, "Colors": 1, "BitsPerComponent": int(bpc), "Columns": int(w)})
     if len(raws[0]) < 2_000_000:
-        cands = [(zlib.compress(raw, 9), parm) for raw, parm in zip(raws, parms)]
-        return min(cands, key=lambda c: len(c[0]))
+        packed = [(zlib.compress(raw, level), parm, raw) for raw, parm in zip(raws, parms)]
+        return min(packed, key=lambda c: len(c[0]))
     pick = min(range(len(raws)), key=lambda i: len(zlib.compress(raws[i], 1)))
-    return zlib.compress(raws[pick], 9), parms[pick]
+    return zlib.compress(raws[pick], level), parms[pick], raws[pick]
 
 
 def _pin_extreme_codes(keep, limit):
@@ -213,7 +249,75 @@ def _gray_recon(q, bits, shape):
     return np.repeat(plane.reshape(shape)[:, :, None], 3, axis=2)
 
 
-def encode_gray_flate(arr, bits, max_err=None, neutral_tol=0):
+def _chunk_error(diff_rows):
+    """Exact max, mean, and a strided p99.5. ``diff_rows`` yields int16 abs diffs."""
+    total = 0
+    count = 0
+    mx = 0
+    samples = []
+    for diff in diff_rows:
+        if not diff.size:
+            continue
+        mx = max(mx, int(diff.max()))
+        total += int(diff.sum())
+        count += int(diff.size)
+        # About 200k samples is enough for a stable 99.5th percentile.
+        need = 200000
+        if count <= need:
+            samples.append(np.ascontiguousarray(diff).ravel())
+        else:
+            step = max(1, int(round((count / float(need)) ** 0.5)))
+            samples.append(np.ascontiguousarray(diff[::step, ::step]).ravel())
+    if not count:
+        return 0, 0.0, 0.0
+    stacked = np.concatenate(samples) if samples else np.zeros(1)
+    p995 = float(np.percentile(stacked, 99.5)) if stacked.size else 0.0
+    return mx, float(total) / float(count), p995
+
+
+def _luma_and_chroma(rgb):
+    """Integer luma and the peak channel gap. Chunked so a 17MP image stays in uint16."""
+    rgb = np.ascontiguousarray(rgb[..., :3], dtype=np.uint8)
+    g = np.empty(rgb.shape[:2], np.uint8)
+    chroma = 0
+    for y0 in range(0, rgb.shape[0], 128):
+        sl = rgb[y0:y0 + 128]
+        r = sl[..., 0].astype(np.uint32)
+        gg = sl[..., 1].astype(np.uint32)
+        b = sl[..., 2].astype(np.uint32)
+        chroma = max(
+            chroma,
+            int(np.abs(r.astype(np.int16) - gg.astype(np.int16)).max()),
+            int(np.abs(gg.astype(np.int16) - b.astype(np.int16)).max()))
+        g[y0:y0 + 128] = ((r * 299 + gg * 587 + b * 114 + 500) // 1000).astype(np.uint8)
+    return g, chroma
+
+
+def _gray_against_color(plane, rgb):
+    """Error of a gray plane repeated to RGB, against the color original."""
+    plane = np.ascontiguousarray(plane, dtype=np.uint8)
+    rgb = np.ascontiguousarray(rgb[..., :3], dtype=np.uint8)
+    def rows():
+        for y0 in range(0, plane.shape[0], 64):
+            g = plane[y0:y0 + 64].astype(np.int16)
+            src = rgb[y0:y0 + 64].astype(np.int16)
+            yield np.maximum(
+                np.maximum(np.abs(g - src[..., 0]), np.abs(g - src[..., 1])),
+                np.abs(g - src[..., 2]))
+    return _chunk_error(rows())
+
+
+def _palette_against_color(idx, pal, rgb):
+    pal_i = np.ascontiguousarray(pal, dtype=np.int16)
+    rgb = np.ascontiguousarray(rgb[..., :3], dtype=np.uint8)
+    def rows():
+        for y0 in range(0, idx.shape[0], 64):
+            block = pal_i[idx[y0:y0 + 64]]
+            yield np.abs(block - rgb[y0:y0 + 64].astype(np.int16))
+    return _chunk_error(rows())
+
+
+def encode_gray_flate(arr, bits, max_err=None, neutral_tol=0, level=9):
     """4- or 8- or 2-bit DeviceGray Flate, using pdf-to-gray.py's predictor search.
 
     Returns None when the image is real color (chroma above neutral_tol) or,
@@ -224,63 +328,55 @@ def encode_gray_flate(arr, bits, max_err=None, neutral_tol=0):
     height, width = rgb.shape[:2]
     # Luma, even when the image is real color. pdf-to-gray.py would skip a
     # color image; a chosen gray target still has to produce a preview.
-    if rgb.shape[2] == 3:
-        chroma = int(max(
-            np.abs(rgb[..., 0].astype(np.int16) - rgb[..., 1].astype(np.int16)).max(),
-            np.abs(rgb[..., 1].astype(np.int16) - rgb[..., 2].astype(np.int16)).max()))
-        g = np.clip(np.rint(
-            0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]), 0, 255).astype(np.uint8)
-    else:
-        chroma = 0
-        g = rgb[..., 0]
-    q, _level_err = quantize_bits(g, bits)
+    g, chroma = _luma_and_chroma(rgb)
+    q, level_err = quantize_bits(g, bits)
+    stage("quantize")
     bpc = 8 if int(bits) >= 8 else int(bits)
     rows = pack_indexed(q, bpc)
-    data, parms = flate_best(np.ascontiguousarray(rows), bpc, width)
+    data, parms, raw = flate_best(np.ascontiguousarray(rows), bpc, width, level=level)
+    stage("flate")
     keys = _image_keys(width, height, bpc, "/DeviceGray", "/FlateDecode")
     if parms:
         keys["DecodeParms"] = _parms_pdf(parms)
-    recon = _gray_recon(q, bits, (height, width))
-    per = np.abs(recon.astype(np.int16) - rgb.astype(np.int16))
-    mx = int(per.max()) if per.size else 0
-    mean = float(per.mean()) if per.size else 0.0
-    # Neutral images use the quantizer error. Color images are over the gate
-    # when the gray version is far from the original, same --max-err rule.
+    plane = q if int(bits) >= 8 else (q.astype(np.uint16) * (255 // ((1 << int(bits)) - 1))).astype(np.uint8)
+    # Color error is the gray plane against the original RGB, not gray-vs-gray.
+    mx, mean, p995 = _gray_against_color(plane, rgb)
     if chroma <= int(neutral_tol):
-        _q, level_err = quantize_bits(g, bits)
         mx = int(level_err.max()) if level_err.size else 0
         mean = float(level_err.mean()) if level_err.size else 0.0
+        p995 = float(np.percentile(level_err, 99.5)) if level_err.size else 0.0
+    stage("compare")
     over = max_err is not None and mx > int(max_err)
-    return _blob(data, keys, "Flate", recon, mx, mean, over, chroma=chroma, decode_parms=parms)
+    return _blob(
+        data, keys, "Flate", None, mx, mean, over, chroma=chroma, decode_parms=parms,
+        p995=p995, flate_raw=raw, flate_level=int(level))
 
 
-def encode_indexed(arr, n, min_frac=1e-4, max_err=None):
+def encode_indexed(arr, n, min_frac=1e-4, max_err=None, level=9):
     """Indexed DeviceRGB via pdf-to-gray.py palettize (x17 grid)."""
     rgb = _as_rgb(arr)
     height, width = rgb.shape[:2]
     src = np.ascontiguousarray(rgb[..., :3])
-    idx, pal, st = palettize(src, min_frac, max_colors=int(n))
+    idx, pal, _st = palettize(src, min_frac, max_colors=int(n))
     idx, pal = _claim_extremes(idx, pal, src)
-    st = dict(st)
-    st["max_err"] = int(np.abs(pal[idx].astype(np.int16) - src.astype(np.int16)).max()) if src.size else 0
+    stage("quantize")
     bpc = 4 if len(pal) <= 16 else 8
     rows = np.ascontiguousarray(pack_indexed(idx, bpc))
-    data, parms = flate_best(rows, bpc, width)
+    data, parms, raw = flate_best(rows, bpc, width, level=level)
+    stage("flate")
     hexpal = pal.astype(np.uint8).tobytes().hex().upper()
     last = max(0, int(len(pal)) - 1)
     space = "[/Indexed /DeviceRGB %d <%s>]" % (last, hexpal)
     keys = _image_keys(width, height, bpc, space, "/FlateDecode")
     if parms:
         keys["DecodeParms"] = _parms_pdf(parms)
-    recon = pal[idx].astype(np.uint8)
-    if recon.ndim == 2:
-        recon = np.repeat(recon[:, :, None], 3, axis=2)
-    mx = int(st["max_err"])
+    mx, mean, p995 = _palette_against_color(idx, pal, src)
+    stage("compare")
     over = max_err is not None and mx > int(max_err)
-    err = np.abs(recon.astype(np.int16) - rgb[..., :3].astype(np.int16))
     return _blob(
-        data, keys, "Flate", recon, mx, float(err.mean()) if err.size else 0.0, over,
-        decode_parms=parms, palette=pal.astype(np.uint8).tobytes(), palette_last=last)
+        data, keys, "Flate", None, mx, mean, over,
+        decode_parms=parms, palette=pal.astype(np.uint8).tobytes(), palette_last=last,
+        p995=p995, flate_raw=raw, flate_level=int(level))
 
 
 def jpegtran_grayscale(raw):
@@ -380,7 +476,7 @@ def encode_bilevel(arr, prefer_jbig2=False, despeckle_n=0, fixed_thresh=None, ma
     """Otsu (pdf-to-jbig2.py) then JBIG2 or CCITT group 4 (pdf-hardcrop.ccitt_encode)."""
     from PIL import Image
     rgb = _as_rgb(arr)
-    g = rgb[..., 1] if rgb.shape[2] == 3 else rgb[..., 0]
+    g, _chroma = _luma_and_chroma(rgb)
     t = fixed_thresh if fixed_thresh is not None else otsu(g)
     ink = despeckle(g <= t, despeckle_n)
     bw = Image.fromarray(((~ink) * 255).astype(np.uint8)).convert("1")
@@ -388,18 +484,22 @@ def encode_bilevel(arr, prefer_jbig2=False, despeckle_n=0, fixed_thresh=None, ma
     white = np.array(bw.convert("L"), dtype=np.uint8)
     if white.shape != (height, width):
         white = white.reshape(height, width)
-    recon = np.repeat(white[:, :, None], 3, axis=2)
-    diff = np.abs(white.astype(np.int16) - g.astype(np.int16))
-    mx = int(diff.max()) if diff.size else 0
+    stage("quantize")
+    mx, mean, p995 = _gray_against_color(white, rgb)
+    stage("compare")
     over = max_err is not None and mx > int(max_err)
+    recon = np.repeat(white[:, :, None], 3, axis=2)
     if prefer_jbig2:
         data = jbig2_encode_bw(bw)
+        stage("jbig2")
         if data:
             keys = _image_keys(width, height, 1, "/DeviceGray", "/JBIG2Decode")
-            return _blob(data, keys, "JBIG2", recon, mx, float(diff.mean()), over, thresh=t)
+            return _blob(data, keys, "JBIG2", recon, mx, mean, over, thresh=t, p995=p995)
     tmp = tempfile.mkdtemp()
     try:
-        data = ccitt_encode((np.array(bw) * 255).astype(np.uint8), -1, False, tmp)
+        # Pillow's Group 4 is min-is-white. PDF's default fax decode is the
+        # other way, so the samples passed in are inverted.
+        data = ccitt_encode((255 - white).astype(np.uint8), -1, False, tmp)
     except Exception:
         data = None
     finally:
@@ -415,10 +515,10 @@ def encode_bilevel(arr, prefer_jbig2=False, despeckle_n=0, fixed_thresh=None, ma
         raw = np.packbits(np.array(bw) == 0, axis=1).tobytes()
         data = zlib.compress(raw, 9)
         keys = _image_keys(width, height, 1, "/DeviceGray", "/FlateDecode")
-        return _blob(data, keys, "Flate", recon, mx, float(diff.mean()), over, thresh=t)
+        return _blob(data, keys, "Flate", recon, mx, mean, over, thresh=t, p995=p995)
     parms = "<< /K -1 /Columns %d /Rows %d >>" % (width, height)
     keys = _image_keys(width, height, 1, "/DeviceGray", "/CCITTFaxDecode", {"DecodeParms": parms})
-    return _blob(data, keys, "CCITT", recon, mx, float(diff.mean()), over, thresh=t)
+    return _blob(data, keys, "CCITT", recon, mx, mean, over, thresh=t, p995=p995)
 
 
 # --- pdf-hardcrop.py encode path ------------------------------------------
@@ -750,11 +850,13 @@ def uses_desky(target_id):
             or tid.startswith("indexed-") or tid.startswith("gray-jpeg-"))
 
 
-def encode_target(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0):
+def encode_target(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0, flate_level=9):
     """One candidate, using the desky-scan-tools encoders. None if not applicable."""
     tid = str(target_id or "")
     if tid in ("gray-2", "gray-4", "gray-8"):
-        return encode_gray_flate(arr, int(tid.split("-")[1]), max_err=max_err, neutral_tol=neutral_tol)
+        return encode_gray_flate(
+            arr, int(tid.split("-")[1]), max_err=max_err, neutral_tol=neutral_tol,
+            level=flate_level)
     if tid.startswith("gray-jpeg-"):
         return encode_gray_jpeg(arr, raw_jpeg=raw_jpeg, dct_tol=2, max_err=max_err)
     if tid.startswith("indexed-"):
@@ -767,7 +869,7 @@ def encode_target(arr, target_id, max_err=None, raw_jpeg=None, neutral_tol=0):
             n = int(body)
         except ValueError:
             return None
-        return encode_indexed(arr, n, max_err=max_err)
+        return encode_indexed(arr, n, max_err=max_err, level=flate_level)
     if tid == "jbig2":
         return encode_bilevel(arr, prefer_jbig2=True, max_err=max_err)
     if tid == "1bpp":

@@ -845,8 +845,10 @@ def test_indexed_target_for_two_colors(tmp_path):
     assert im["target"] == im["recommended_target"] == im["chosen_target"] == smallest["id"]
     assert im["error_mae"] <= 4
     assert "rgb-24" not in ids or im["filter_name"] not in ("Flate", "LZW")
-    assert all(c.get("error_mae") is not None and c.get("est_bytes") is not None
-               for c in im["candidates"] if c["id"] != "keep")
+    assert all(
+        (c.get("refused") or str(c.get("note") or "").startswith("refused") or c.get("error_mae") is not None)
+        and c.get("est_bytes") is not None
+        for c in im["candidates"] if c["id"] != "keep")
     blob = __import__("json").dumps(data)
     assert '"chosen_target"' in blob and '"candidates"' in blob
 
