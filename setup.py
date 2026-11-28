@@ -38,11 +38,22 @@ setup(
         license = 'GPL-3.0-or-later',
         keywords = 'pdf crop ereader',
         packages = ['krop'],
+        # PyQt6 is the GUI. pymupdf crops, renders, and analyzes.
+        # pikepdf and numpy are required by analysis and by hard-crop.
+        # Pillow is required by hard-crop (CCITT and JPEG pixels).
+        install_requires = [
+            'PyQt6',
+            'pymupdf',
+            'pikepdf',
+            'numpy',
+            'Pillow>=8',
+        ],
         entry_points = {
             'console_scripts': [
                 'kroppy = krop.__main__:main',
                 'krop = krop.__main__:main',
                 'krop-trimall = krop.__main__:main',
+                'kroppyctl = krop.ctl:main',
             ]
         },
         data_files = [

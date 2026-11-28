@@ -46,6 +46,27 @@ def user_log_dir():
     return os.path.join(base, "kroppy")
 
 
+def tail(n=50):
+    """The last n activity-log lines, oldest first. Empty when logging is off."""
+    try:
+        count = int(n)
+    except (TypeError, ValueError):
+        count = 50
+    if count < 0:
+        count = 0
+    lines = []
+    path = _path
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            lines = []
+    if not lines:
+        lines = list(_buf)
+    return [line.rstrip("\n") for line in lines[-count:]]
+
+
 def log(kind, msg):
     global _errors
     if _mode == "off":
