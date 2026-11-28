@@ -92,3 +92,6 @@ mean absolute error, on a 0\-255 scale, allowed when recommending a smaller imag
 .TP
 .B \-\-go
 output PDF without opening the kroppy window (using the choices supplied on the command line); if used in a script without X server access, you can run kroppy using xvfb\-run
+.TP
+.B \-\-qt\-file\-dialog
+use the Qt file dialog even on macOS, including the recover-crop-boxes checkbox in Open. The native Open dialog is used only on macOS with the Cocoa Qt platform, and then uses the last-saved value of that option (default: on). $KROPPY_QT_FILE_DIALOG=1 does the same

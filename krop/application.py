@@ -146,6 +146,7 @@ def main():
     parser.add_argument('--control', nargs='?', const='default', default=None, metavar='PATH', help='listen for kroppyctl on a user-only local socket. With no PATH, uses $XDG_RUNTIME_DIR/kroppy-<pid>.sock or /tmp/kroppy-$USER.sock. KROPPY_CONTROL=PATH enables the same socket. Off unless set')
 
     parser.add_argument('--no-recover-crops', action='store_true', help='open an already-cropped PDF as it is, instead of at full page size with its crop boxes as editable selections')
+    parser.add_argument('--qt-file-dialog', action='store_true', help='use the Qt file dialog even on macOS, including the recover-crop-boxes checkbox in Open. The native Open dialog is used only on macOS with the Cocoa Qt platform, and then uses the last-saved value of that option (default: on). $KROPPY_QT_FILE_DIALOG=1 does the same')
     parser.add_argument('--use-qt5', action='store_true', help='use PyQt5 instead of PyQt6 (default: use PyQt6 if available)')
     parser.add_argument('--use-pymupdf', action='store_true', help='use PyMuPDF for rendering and cropping (default)')
     parser.add_argument('--use-pikepdf', action='store_true', help='use pikepdf for cropping (PyQt5 only, default: use PyMuPDF)')
@@ -175,7 +176,9 @@ def main():
     _explicit_log = _logPath and str(_logPath).lower() not in ("off", "0", "no", "false")
     patch_classes("off" if args.log_keep == "never" and not _explicit_log else _logPath)
     from krop.mainwindow import MainWindow
+    from krop.filedialog import qt_file_dialog_requested
     window=MainWindow()
+    window.forceQtFileDialog = bool(args.qt_file_dialog) or qt_file_dialog_requested()
     _installLog(window, _logPath, keep=args.log_keep, location=args.log_location)
 
     # After the window and the log exist, and before the file opens, so a

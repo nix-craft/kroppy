@@ -32,6 +32,7 @@ from krop.autotrim import autoTrimMargins
 from krop.copiertrim import copierTrimMargins
 from krop.activitylog import log
 from krop.skipregion import skip_rect, EDGES
+from krop.filedialog import qt_file_dialog_requested, use_native_file_dialog
 
 
 class AspectRatioType:
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         QMainWindow.__init__(self)
+        self.forceQtFileDialog = False
 
         self.selAspectRatioTypes = SelAspectRatioTypeManager()
         self.deviceTypes = DeviceTypeManager()
@@ -580,7 +582,21 @@ class MainWindow(QMainWindow):
         return QSettings().value("Open/RecoverCrops", "true") != "false"
 
     def slotOpenFile(self):
-        # non-native dialog so we can add the "recover crop boxes" checkbox
+        force_qt = self.forceQtFileDialog or qt_file_dialog_requested()
+        app = QApplication.instance()
+        platform_name = app.platformName() if app is not None else ""
+        if use_native_file_dialog(platform_name, sys.platform, force_qt):
+            # Native dialogs cannot host the recover-crop-boxes checkbox,
+            # so use the last-saved preference (default: on).
+            fileName = QFileDialog.getOpenFileName(self,
+                    self.tr("Open PDF"), "",
+                    self.tr("PDF Files (*.pdf *.PDF);;All Files (*)"))
+            if isinstance(fileName, (tuple, list)):
+                fileName = fileName[0] if fileName else ""
+            if fileName:
+                self.openFile(fileName, self.recoverCrops)
+            return
+        # Qt dialog so we can add the "recover crop boxes" checkbox
         dlg = QFileDialog(self, self.tr("Open PDF"), "",
                 self.tr("PDF Files (*.pdf *.PDF);;All Files (*)"))
         dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
